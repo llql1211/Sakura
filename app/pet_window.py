@@ -22,13 +22,14 @@ from PySide6.QtWidgets import (
 from app.api_client import OpenAICompatibleClient
 from app.api_settings_dialog import ApiSettingsDialog
 from app.chat_history import ChatHistoryStore
-from app.chat_reply import ChatReply
+from app.chat_reply import ChatReply, ChatSegment
 from app.chat_worker import ChatWorker
 from app.history_window import HistoryWindow
 from app.tts import TTSProvider
 
 
 SPEECH_TYPING_INTERVAL_MS = 35
+REPLY_SEGMENT_PAUSE_MS = 2000
 
 
 class PetWindow(QWidget):
@@ -56,6 +57,8 @@ class PetWindow(QWidget):
         self.stage_size = (860, 640)
         self.speech_text = ""
         self.speech_index = 0
+        self.pending_reply_segments: list[ChatSegment] = []
+        self.reply_sequence_id = 0
         self.speech_timer = QTimer(self)
         self.speech_timer.setInterval(SPEECH_TYPING_INTERVAL_MS)
         self.speech_timer.timeout.connect(self._show_next_speech_char)
@@ -340,6 +343,8 @@ class PetWindow(QWidget):
             return
 
         self.input_edit.clear()
+        self.reply_sequence_id += 1
+        self.pending_reply_segments = []
         self.set_speech("......")
         next_messages = [*self.messages, {"role": "user", "content": text}]
         self.messages = next_messages
@@ -361,8 +366,7 @@ class PetWindow(QWidget):
     def _handle_reply(self, reply: ChatReply) -> None:
         self.messages.append({"role": "assistant", "content": reply.text})
         self._record_history("assistant", reply.text)
-        self.set_speech(reply.text)
-        self.tts_provider.speak(reply.text, reply.tone)
+        self._show_reply_segments(reply.segments)
 
     @Slot(str)
     def _handle_error(self, message: str) -> None:
@@ -407,6 +411,12 @@ class PetWindow(QWidget):
         self.speech_label.setText(self.speech_text[: self.speech_index])
         if self.speech_index >= len(self.speech_text):
             self.speech_timer.stop()
+            if self.pending_reply_segments:
+                sequence_id = self.reply_sequence_id
+                QTimer.singleShot(
+                    REPLY_SEGMENT_PAUSE_MS,
+                    lambda: self._show_next_reply_segment(sequence_id),
+                )
 
     def toggle_visible(self) -> None:
         if self.isVisible():
@@ -444,6 +454,19 @@ class PetWindow(QWidget):
             self.history_store.append(role, content)
         except OSError as exc:
             print(f"[History] 写入失败：{exc}")
+
+    def _show_reply_segments(self, segments: list[ChatSegment]) -> None:
+        self.reply_sequence_id += 1
+        self.pending_reply_segments = [segment for segment in segments if segment.text.strip()]
+        self._show_next_reply_segment(self.reply_sequence_id)
+
+    def _show_next_reply_segment(self, sequence_id: int) -> None:
+        if sequence_id != self.reply_sequence_id or not self.pending_reply_segments:
+            return
+
+        segment = self.pending_reply_segments.pop(0)
+        self.set_speech(segment.text)
+        self.tts_provider.speak(segment.text, segment.tone)
 
 
 def _rounded_japanese_font(point_size: int, weight: QFont.Weight) -> QFont:

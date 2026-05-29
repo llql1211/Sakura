@@ -20,7 +20,7 @@ class ChatReply:
 
     @property
     def text(self) -> str:
-        return "".join(segment.text for segment in self.segments).strip()
+        return "\n".join(segment.text for segment in self.segments if segment.text.strip()).strip()
 
     @property
     def tone(self) -> str:
