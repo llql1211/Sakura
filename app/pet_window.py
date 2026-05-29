@@ -38,7 +38,7 @@ from app.character_loader import (
 )
 from app.chat_history import ChatHistoryStore
 from app.chat_reply import ChatReply, ChatSegment
-from app.chat_worker import ChatWorker
+from app.chat_worker import ChatWorker, EventWorker
 from app.env_config import load_env_file, save_env_values
 from app.history_window import HistoryWindow
 from app.settings_dialog import SettingsDialog
@@ -110,6 +110,8 @@ class PetWindow(QWidget):
         self.current_segment_tts_done = True
         self.reply_advance_scheduled = False
         self.pending_tool_action: PendingToolAction | None = None
+        self.active_reminder_id: str | None = None
+        self.active_reminder_text = ""
         self.speech_timer = QTimer(self)
         self.speech_timer.setInterval(SPEECH_TYPING_INTERVAL_MS)
         self.speech_timer.timeout.connect(self._show_next_speech_char)
@@ -537,7 +539,14 @@ class PetWindow(QWidget):
 
     @Slot(object)
     def _handle_action_reply(self, result: AgentResult) -> None:
-        self._show_reply_segments(result.reply.segments)
+        self._consume_agent_result(result)
+
+    def _consume_agent_result(self, result: AgentResult, record_history: bool = True) -> None:
+        reply = result.reply
+        if record_history:
+            self.messages.append({"role": "assistant", "content": reply.text})
+            self._record_history("assistant", reply.text, reply.translation)
+        self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
 
     def _apply_pending_action_from_result(self, result: AgentResult) -> None:
@@ -556,6 +565,66 @@ class PetWindow(QWidget):
         has_action = action is not None
         self.confirm_action_button.setVisible(has_action)
         self.cancel_action_button.setVisible(has_action)
+
+    def _run_event_worker(self, event: AgentEvent, reminder_id: str) -> None:
+        if self.thread is not None or self.active_reminder_id is not None:
+            return
+
+        self.active_reminder_id = reminder_id
+        self.active_reminder_text = str(event.payload.get("text", ""))
+        self._set_busy(True)
+        self.thread = QThread(self)
+        self.worker = EventWorker(
+            self.agent_runtime,
+            event,
+        )
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self._handle_event_reply)
+        self.worker.failed.connect(self._handle_event_error)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self._cleanup_worker)
+        self.thread.start()
+
+    @Slot(object)
+    def _handle_event_reply(self, result: AgentResult) -> None:
+        reminder_id = self.active_reminder_id
+        self._clear_active_reminder()
+        self._consume_agent_result(result)
+        if reminder_id is not None:
+            self._mark_reminder_completed(reminder_id)
+
+    @Slot(str)
+    def _handle_event_error(self, message: str) -> None:
+        reminder_id = self.active_reminder_id
+        reminder_text = self.active_reminder_text
+        self._clear_active_reminder()
+        print(f"[Reminder] 生成提醒失败：{message}")
+        result = AgentResult(
+            reply=ChatReply(
+                [
+                    ChatSegment(
+                        text=f"時間だよ。{reminder_text}",
+                        tone="提醒",
+                        translation=f"到时间了：{reminder_text}",
+                    )
+                ]
+            )
+        )
+        self._consume_agent_result(result)
+        if reminder_id is not None:
+            self._mark_reminder_completed(reminder_id)
+
+    def _clear_active_reminder(self) -> None:
+        self.active_reminder_id = None
+        self.active_reminder_text = ""
+
+    def _mark_reminder_completed(self, reminder_id: str) -> None:
+        try:
+            self.reminder_store.mark_completed(reminder_id)
+        except ValueError as exc:
+            print(f"[Reminder] 标记完成失败：{exc}")
 
     @Slot(str)
     def _handle_error(self, message: str) -> None:
@@ -744,7 +813,7 @@ class PetWindow(QWidget):
 
     @Slot()
     def _check_due_reminders(self) -> None:
-        if self.thread is not None:
+        if self.thread is not None or self.active_reminder_id is not None:
             return
         try:
             due_reminders = self.reminder_store.due_reminders()
@@ -758,37 +827,19 @@ class PetWindow(QWidget):
         reminder_id = str(reminder.get("id", ""))
         reminder_text = str(reminder.get("text", ""))
         reminder_trigger_at = str(reminder.get("trigger_at", ""))
-        try:
-            result = self.agent_runtime.handle_event(
-                AgentEvent(
-                    type="reminder_due",
-                    payload={
-                        "id": reminder_id,
-                        "text": reminder_text,
-                        "trigger_at": reminder_trigger_at,
-                    },
-                )
-            )
-        except Exception as exc:
-            print(f"[Reminder] 生成提醒失败：{exc}")
-            result = AgentResult(
-                reply=ChatReply(
-                    [
-                        ChatSegment(
-                            text=f"時間だよ。{reminder_text}",
-                            tone="提醒",
-                            translation=f"到时间了：{reminder_text}",
-                        )
-                    ]
-                )
-            )
-
-        try:
-            self.reminder_store.mark_completed(reminder_id)
-        except ValueError as exc:
-            print(f"[Reminder] 标记完成失败：{exc}")
+        if not reminder_id:
             return
-        self._show_reply_segments(result.reply.segments)
+        self._run_event_worker(
+            AgentEvent(
+                type="reminder_due",
+                payload={
+                    "id": reminder_id,
+                    "text": reminder_text,
+                    "trigger_at": reminder_trigger_at,
+                },
+            ),
+            reminder_id,
+        )
 
     def _show_reply_segments(self, segments: list[ChatSegment]) -> None:
         self.reply_sequence_id += 1
