@@ -21,6 +21,7 @@ class Tool:
     confirmation_risk: str = "normal"
     group: str = "default"
     risk: str = "low"
+    capability: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,8 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
-    def describe_tools(self) -> list[dict[str, Any]]:
+    def describe_tools(self, allowed_capabilities: set[str] | None = None) -> list[dict[str, Any]]:
+        """返回可暴露给模型的工具描述；可按能力开关隐藏敏感工具。"""
         return [
             {
                 "name": tool.name,
@@ -72,6 +74,9 @@ class ToolRegistry:
                 "risk": tool.risk,
             }
             for tool in self.all()
+            if allowed_capabilities is None
+            or tool.capability is None
+            or tool.capability in allowed_capabilities
         ]
 
     def set_free_access_enabled(self, enabled: bool) -> None:

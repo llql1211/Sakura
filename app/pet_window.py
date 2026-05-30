@@ -41,6 +41,7 @@ from app.agent import (
     ReminderStore,
     create_builtin_tool_registry,
 )
+from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.api_client import OpenAICompatibleClient
 from app.browser_controller import BrowserController, BrowserToolBridge
 from app.character_loader import (
@@ -81,7 +82,6 @@ SUBTITLE_LANGUAGE_KEY = "SUBTITLE_LANGUAGE"
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 SCREEN_OBSERVATION_ENABLED_KEY = "SCREEN_OBSERVATION_ENABLED"
-SCREEN_OBSERVATION_REQUEST_ACTION = "screen_observation_request"
 
 
 class PetWindow(QWidget):

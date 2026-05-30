@@ -10,6 +10,7 @@ from app.agent.browser_tools import BrowserToolExecutor, BrowserTools
 from app.agent.desktop_tools import NotesStore, open_local_folder, open_url
 from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
+from app.agent.screen_tools import create_screen_observation_tool
 from app.agent.tool_registry import Tool, ToolRegistry
 
 
@@ -26,6 +27,7 @@ def create_builtin_tool_registry(
     browser = BrowserTools(browser_executor)
     return ToolRegistry(
         [
+            create_screen_observation_tool(),
             Tool(
                 name="get_current_time",
                 description="获取当前本机时间和时区。",

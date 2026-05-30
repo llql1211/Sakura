@@ -6,6 +6,12 @@ from typing import Any
 
 from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate, PendingToolAction
 from app.agent.memory import MemoryStore
+from app.agent.screen_tools import (
+    OBSERVE_SCREEN_TOOL_NAME,
+    SCREEN_OBSERVATION_CAPABILITY,
+    SCREEN_OBSERVATION_DISABLED_ERROR,
+    SCREEN_OBSERVATION_REQUEST_ACTION,
+)
 from app.agent.tool_registry import ToolExecutionResult, ToolRegistry
 from app.api_client import (
     ApiRequestError,
@@ -19,8 +25,6 @@ from app.chat_reply import ChatReply, parse_chat_reply
 
 MAX_TOOL_CALLS_PER_TURN = 3
 MAX_TOOL_RESULT_CHARS = 6000
-OBSERVE_SCREEN_TOOL_NAME = "observe_screen"
-SCREEN_OBSERVATION_REQUEST_ACTION = "screen_observation_request"
 
 
 class AgentRuntime:
@@ -51,12 +55,10 @@ class AgentRuntime:
         self.model_vision_enabled = enabled
 
     def handle_user_message(self, messages: list[ChatMessage]) -> AgentResult:
+        allow_screen_observation = self.model_vision_enabled and not messages_contain_image(messages)
         try:
             first_content = self.api_client.complete_raw(
-                self._build_tool_planning_prompt(
-                    allow_screen_observation=self.model_vision_enabled
-                    and not messages_contain_image(messages)
-                ),
+                self._build_tool_planning_prompt(allow_screen_observation=allow_screen_observation),
                 messages,
                 temperature=0.8,
             )
@@ -75,26 +77,6 @@ class AgentRuntime:
         execution_results: list[ToolExecutionResult] = []
         pending_actions: list[PendingToolAction] = []
         for call in tool_calls[:MAX_TOOL_CALLS_PER_TURN]:
-            if call["name"] == OBSERVE_SCREEN_TOOL_NAME:
-                if self.model_vision_enabled and not messages_contain_image(messages):
-                    return AgentResult(
-                        reply=_build_screen_observation_request_reply(),
-                        actions=[
-                            AgentAction(
-                                type=SCREEN_OBSERVATION_REQUEST_ACTION,
-                                payload={"reason": call.get("reason", "")},
-                            )
-                        ],
-                    )
-                execution_results.append(
-                    ToolExecutionResult(
-                        tool_name=OBSERVE_SCREEN_TOOL_NAME,
-                        success=False,
-                        content="",
-                        error="模型视觉未启用，或本轮已经提供过屏幕截图。",
-                    )
-                )
-                continue
             prepared = self.tools.prepare_or_execute(
                 call["name"],
                 call["arguments"],
@@ -103,6 +85,26 @@ class AgentRuntime:
             if isinstance(prepared, PendingToolAction):
                 pending_actions.append(prepared)
             else:
+                if _is_screen_observation_request(prepared):
+                    if allow_screen_observation:
+                        return AgentResult(
+                            reply=_build_screen_observation_request_reply(),
+                            actions=[
+                                AgentAction(
+                                    type=SCREEN_OBSERVATION_REQUEST_ACTION,
+                                    payload={"reason": call.get("reason", "")},
+                                )
+                            ],
+                        )
+                    execution_results.append(
+                        ToolExecutionResult(
+                            tool_name=OBSERVE_SCREEN_TOOL_NAME,
+                            success=False,
+                            content="",
+                            error=SCREEN_OBSERVATION_DISABLED_ERROR,
+                        )
+                    )
+                    continue
                 execution_results.append(prepared)
         if len(tool_calls) > MAX_TOOL_CALLS_PER_TURN:
             execution_results.append(
@@ -233,9 +235,8 @@ class AgentRuntime:
         )
 
     def _build_tool_planning_prompt(self, allow_screen_observation: bool = False) -> str:
-        tools = self.tools.describe_tools()
-        if allow_screen_observation:
-            tools.append(_describe_screen_observation_tool())
+        allowed_capabilities = {SCREEN_OBSERVATION_CAPABILITY} if allow_screen_observation else set()
+        tools = self.tools.describe_tools(allowed_capabilities=allowed_capabilities)
         tool_descriptions = json.dumps(
             tools,
             ensure_ascii=False,
@@ -244,6 +245,11 @@ class AgentRuntime:
         tones = "、".join(tone for tone in self.reply_tones if tone.strip()) or "中性"
         memory_summary = self._memory_summary()
         current_time = datetime.now().astimezone().isoformat(timespec="seconds")
+        screen_observation_instruction = (
+            "- observe_screen 只在确实需要当前屏幕内容时调用；如果文字信息已经足够回答，不要截图。"
+            if allow_screen_observation
+            else "- 当前没有可用的屏幕观察工具；不要请求截图，也不要臆造当前屏幕内容。"
+        )
         return f"""
 {self.system_prompt.strip()}
 
@@ -288,7 +294,7 @@ class AgentRuntime:
 - requires_confirmation 为 true 的工具只会在用户确认后执行；你仍然可以发起 tool_calls，但必须说明原因。
 - 需要读取网页内容时，优先使用 browser_get_content；需要打开网页时使用 browser_open_url。
 - 需要网页交互时，只能基于当前页面真实内容选择 browser_scroll 或 browser_click，不要臆造 selector 或页面内容。
-- observe_screen 只在确实需要当前屏幕内容时调用；如果文字信息已经足够回答，不要截图。
+{screen_observation_instruction}
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
 - 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
 - 不要静默写入长期记忆；只有用户明确要求记住时，才使用 propose_memory_update。
@@ -372,6 +378,14 @@ def _parse_agent_reply(agent_data: dict[str, Any], fallback_content: str) -> Cha
     if isinstance(reply_data, dict):
         return parse_chat_reply(json.dumps(reply_data, ensure_ascii=False))
     return parse_chat_reply(fallback_content)
+
+
+def _is_screen_observation_request(result: ToolExecutionResult) -> bool:
+    if result.tool_name != OBSERVE_SCREEN_TOOL_NAME or not result.success:
+        return False
+    if not isinstance(result.content, dict):
+        return False
+    return result.content.get("action") == SCREEN_OBSERVATION_REQUEST_ACTION
 
 
 def _build_tool_results_message(
@@ -514,18 +528,6 @@ def _describe_pending_action(action: PendingToolAction) -> str:
     if action.tool_name == "open_local_folder":
         return f"打开文件夹 {action.arguments.get('path', '')}"
     return f"执行 {action.tool_name}"
-
-
-def _describe_screen_observation_tool() -> dict[str, Any]:
-    return {
-        "name": OBSERVE_SCREEN_TOOL_NAME,
-        "description": "请求获取当前屏幕截图。仅当用户问题需要当前界面、窗口内容或视觉状态时使用。",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-        },
-        "requires_confirmation": False,
-    }
 
 
 def _build_screen_observation_request_reply() -> ChatReply:

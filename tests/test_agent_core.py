@@ -10,8 +10,14 @@ from app.agent.actions import PendingToolAction
 from app.agent.builtin_tools import create_builtin_tool_registry
 from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
-from app.agent.runtime import AgentRuntime, SCREEN_OBSERVATION_REQUEST_ACTION, _build_tool_results_message
+from app.agent.runtime import AgentRuntime, _build_tool_results_message
 from app.agent.runtime import _redact_tool_result_for_model
+from app.agent.screen_tools import (
+    OBSERVE_SCREEN_TOOL_NAME,
+    SCREEN_OBSERVATION_DISABLED_ERROR,
+    SCREEN_OBSERVATION_REQUEST_ACTION,
+    create_screen_observation_tool,
+)
 from app.agent.tool_registry import Tool, ToolExecutionResult, ToolRegistry
 from app.api_client import ApiRequestError, is_vision_unsupported_error, messages_contain_image
 from app.context_trimming import MAX_MODEL_CONTEXT_MESSAGES, trim_messages_for_model
@@ -205,6 +211,24 @@ def test_tool_registry_describes_group_and_risk_metadata() -> None:
     assert description["risk"] == "low"
 
 
+def test_tool_registry_filters_tools_by_capability() -> None:
+    registry = ToolRegistry(
+        [
+            Tool(name="plain_tool", description="普通工具"),
+            create_screen_observation_tool(),
+        ]
+    )
+
+    visible_without_capability = {tool["name"] for tool in registry.describe_tools(set())}
+    visible_with_capability = {
+        tool["name"]
+        for tool in registry.describe_tools({"screen_observation"})
+    }
+
+    assert OBSERVE_SCREEN_TOOL_NAME not in visible_without_capability
+    assert OBSERVE_SCREEN_TOOL_NAME in visible_with_capability
+
+
 def test_builtin_registry_includes_browser_tools() -> None:
     registry = create_builtin_tool_registry(Path(__file__).resolve().parents[1])
 
@@ -217,6 +241,7 @@ def test_builtin_registry_includes_browser_tools() -> None:
         "browser_click",
         "browser_get_state",
     }.issubset(names)
+    assert OBSERVE_SCREEN_TOOL_NAME in names
 
 
 def test_browser_open_url_rejects_non_http_url() -> None:
@@ -381,7 +406,7 @@ def test_model_vision_enabled_allows_model_to_request_screen_observation() -> No
     runtime = AgentRuntime(
         api_client=client,  # type: ignore[arg-type]
         system_prompt="你是 Sakura。",
-        tools=ToolRegistry(),
+        tools=ToolRegistry([create_screen_observation_tool()]),
     )
     runtime.set_model_vision_enabled(True)
 
@@ -390,6 +415,89 @@ def test_model_vision_enabled_allows_model_to_request_screen_observation() -> No
     assert "observe_screen" in client.prompts[0]
     assert result.actions
     assert result.actions[0].type == SCREEN_OBSERVATION_REQUEST_ACTION
+
+
+def test_model_vision_disabled_hides_screen_observation_tool() -> None:
+    class PromptCaptureClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete_raw(self, system_prompt, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            self.prompts.append(system_prompt)
+            return '{"reply":{"segments":[{"ja":"見えないよ。","zh":"我看不到哦。","tone":"中性"}]}}'
+
+    client = PromptCaptureClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=ToolRegistry([create_screen_observation_tool()]),
+    )
+
+    runtime.handle_user_message([{"role": "user", "content": "普通聊天"}])
+
+    assert OBSERVE_SCREEN_TOOL_NAME not in client.prompts[0]
+
+
+def test_screen_observation_tool_hidden_after_image_is_attached() -> None:
+    class PromptCaptureClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete_raw(self, system_prompt, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            self.prompts.append(system_prompt)
+            return '{"reply":{"segments":[{"ja":"見るよ。","zh":"我看看。","tone":"中性"}]}}'
+
+    client = PromptCaptureClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=ToolRegistry([create_screen_observation_tool()]),
+    )
+    runtime.set_model_vision_enabled(True)
+
+    runtime.handle_user_message(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "已经有图了"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64,abc123"},
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert OBSERVE_SCREEN_TOOL_NAME not in client.prompts[0]
+
+
+def test_hidden_screen_observation_call_returns_failure_without_action() -> None:
+    class HiddenScreenRequestClient:
+        def complete_raw(self, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            return (
+                '{"reply":{"segments":[{"ja":"見るね。","zh":"我看看。","tone":"提醒"}]},'
+                '"tool_calls":[{"name":"observe_screen","arguments":{},"reason":"需要当前画面"}]}'
+            )
+
+        def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            from app.chat_reply import parse_chat_reply
+
+            return parse_chat_reply(
+                '{"segments":[{"ja":"今は見えないよ。","zh":"现在看不到哦。","tone":"中性"}]}'
+            )
+
+    runtime = AgentRuntime(
+        api_client=HiddenScreenRequestClient(),  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=ToolRegistry([create_screen_observation_tool()]),
+    )
+
+    result = runtime.handle_user_message([{"role": "user", "content": "普通聊天"}])
+
+    assert not any(action.type == SCREEN_OBSERVATION_REQUEST_ACTION for action in result.actions)
+    assert result.actions[0].payload["error"] == SCREEN_OBSERVATION_DISABLED_ERROR
 
 
 def test_screen_observation_message_uses_openai_image_url_format() -> None:
