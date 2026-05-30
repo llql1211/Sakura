@@ -622,9 +622,9 @@ class PetWindow(QWidget):
     def _build_menu(self) -> QMenu:
         menu = QMenu(self)
 
-        toggle_action = QAction("隐藏/显示立绘", self)
-        toggle_action.triggered.connect(self.toggle_visible)
-        menu.addAction(toggle_action)
+        hide_action = QAction("隐藏至托盘", self)
+        hide_action.triggered.connect(self.hide)
+        menu.addAction(hide_action)
 
         menu.addSeparator()
 
@@ -634,21 +634,7 @@ class PetWindow(QWidget):
         subtitle_action.triggered.connect(self._toggle_chinese_subtitles)
         menu.addAction(subtitle_action)
 
-        vision_action = QAction("启用模型视觉", self)
-        vision_action.setCheckable(True)
-        vision_action.setChecked(self.model_vision_enabled)
-        vision_action.setEnabled(self.screen_observation_enabled)
-        vision_action.triggered.connect(self._toggle_model_vision)
-        menu.addAction(vision_action)
-
-        autonomous_screen_action = QAction("允许自主看屏幕", self)
-        autonomous_screen_action.setCheckable(True)
-        autonomous_screen_action.setChecked(self.autonomous_screen_observation_enabled)
-        autonomous_screen_action.setEnabled(self.screen_observation_enabled and self.model_vision_enabled)
-        autonomous_screen_action.triggered.connect(self._toggle_autonomous_screen_observation)
-        menu.addAction(autonomous_screen_action)
-
-        free_access_action = QAction("自由访问权限", self)
+        free_access_action = QAction("完整访问权限", self)
         free_access_action.setCheckable(True)
         free_access_action.setChecked(self.free_access_enabled)
         free_access_action.triggered.connect(self._toggle_free_access)
@@ -962,17 +948,14 @@ class PetWindow(QWidget):
         if event is None or event.type != "proactive_check":
             self._consume_agent_result(_build_screen_observation_failed_result("缺少可关联的主动事件。"))
             return True
-        if (
-            not self.screen_observation_enabled
-            or not self.model_vision_enabled
-            or not self.autonomous_screen_observation_enabled
-        ):
+        if not self._proactive_screen_context_allowed():
             self._log_interaction_stage(
                 "event_screen_observation_disabled",
                 {
-                    "screen_observation_enabled": self.screen_observation_enabled,
-                    "model_vision_enabled": self.model_vision_enabled,
-                    "autonomous_screen_observation_enabled": self.autonomous_screen_observation_enabled,
+                    "proactive_care_enabled": self.proactive_care_settings.enabled,
+                    "proactive_screen_context_enabled": (
+                        self.proactive_care_settings.screen_context_enabled
+                    ),
                 },
             )
             self._consume_agent_result(_build_screen_observation_disabled_result())
@@ -1205,10 +1188,7 @@ class PetWindow(QWidget):
         return AgentEvent(type="proactive_check", payload=payload)
 
     def _proactive_screen_context_allowed(self) -> bool:
-        return self.proactive_care_settings.allows_screen_context(
-            screen_observation_enabled=self.screen_observation_enabled,
-            model_vision_enabled=self.model_vision_enabled,
-        )
+        return self.proactive_care_settings.allows_screen_context()
 
     def _sync_proactive_care_timer(self) -> None:
         if self.proactive_care_settings.enabled:
@@ -1442,8 +1422,6 @@ class PetWindow(QWidget):
             self.base_dir,
             self.character_registry,
             self.character_profile,
-            self.screen_observation_enabled,
-            self.autonomous_screen_observation_enabled,
             self.proactive_care_settings,
             self,
         )
@@ -1452,8 +1430,6 @@ class PetWindow(QWidget):
             or dialog.result_api_settings is None
             or dialog.result_tts_settings is None
             or dialog.result_character_id is None
-            or dialog.result_screen_observation_enabled is None
-            or dialog.result_autonomous_screen_observation_enabled is None
             or dialog.result_proactive_care_settings is None
         ):
             return
@@ -1473,31 +1449,12 @@ class PetWindow(QWidget):
             dialog.result_tts_settings.save(self.env_path, self.base_dir)
             self.character_registry.save_current_id(self.env_path, selected_profile.id)
             dialog.result_proactive_care_settings.save(self.env_path)
-            save_env_values(
-                self.env_path,
-                {
-                    SCREEN_OBSERVATION_ENABLED_KEY: _format_bool(dialog.result_screen_observation_enabled),
-                    AUTONOMOUS_SCREEN_OBSERVATION_ENABLED_KEY: _format_bool(
-                        dialog.result_autonomous_screen_observation_enabled
-                    ),
-                },
-            )
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
             return
 
         self.api_client.update_settings(dialog.result_api_settings)
-        previous_screen_observation_enabled = self.screen_observation_enabled
-        self.screen_observation_enabled = dialog.result_screen_observation_enabled
-        self.autonomous_screen_observation_enabled = dialog.result_autonomous_screen_observation_enabled
         self.proactive_care_settings = dialog.result_proactive_care_settings
-        self.agent_runtime.set_autonomous_screen_observation_enabled(
-            self.autonomous_screen_observation_enabled
-        )
-        if not self.screen_observation_enabled:
-            self._set_model_vision_enabled(False)
-        elif not previous_screen_observation_enabled:
-            self._set_model_vision_enabled(True)
         self._sync_proactive_care_timer()
         self._discard_prepared_next_tts()
         self.retired_tts_providers.append(self.tts_provider)
@@ -1971,7 +1928,7 @@ def _build_screen_observation_disabled_result() -> AgentResult:
                 ChatSegment(
                     text="画面を見る設定がオフになっているよ。設定で許可してから、もう一度試して。",
                     tone="提醒",
-                    translation="屏幕观察或自主看屏幕现在是关闭的。请在设置里允许后再试。",
+                    translation="获取屏幕信息现在是关闭的。请在设置里允许后再试。",
                     portrait="伸手命令",
                 )
             ]

@@ -8,7 +8,7 @@ from app.agent.tool_registry import Tool
 OBSERVE_SCREEN_TOOL_NAME = "observe_screen"
 SCREEN_OBSERVATION_REQUEST_ACTION = "screen_observation_request"
 SCREEN_OBSERVATION_CAPABILITY = "screen_observation"
-SCREEN_OBSERVATION_DISABLED_ERROR = "自主屏幕观察未启用、模型视觉未启用，或本轮已经提供过屏幕截图。"
+SCREEN_OBSERVATION_DISABLED_ERROR = "当前未允许获取屏幕信息，或本轮已经提供过屏幕截图。"
 
 
 def create_screen_observation_tool() -> Tool:

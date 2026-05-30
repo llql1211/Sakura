@@ -422,9 +422,9 @@ class AgentRuntime:
             },
         )
         if event.type == "proactive_check":
+            screen_context_allowed = bool(event.payload.get("screen_context_allowed"))
             allow_screen_observation = (
-                self.model_vision_enabled
-                and self.autonomous_screen_observation_enabled
+                screen_context_allowed
                 and not messages_contain_image(event_messages)
             )
             return self._run_tool_loop(

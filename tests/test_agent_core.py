@@ -167,25 +167,26 @@ def test_proactive_care_settings_save_writes_cooldown() -> None:
     assert f"{PROACTIVE_COOLDOWN_MINUTES_KEY}=7" in text
 
 
-def test_proactive_care_screen_context_requires_screen_observation_and_vision() -> None:
-    settings = ProactiveCareSettings(
+def test_proactive_care_screen_context_requires_active_care_and_screen_context() -> None:
+    enabled_settings = ProactiveCareSettings(
         enabled=True,
         screen_context_enabled=True,
         check_interval_minutes=20,
     )
+    care_disabled_settings = ProactiveCareSettings(
+        enabled=False,
+        screen_context_enabled=True,
+        check_interval_minutes=20,
+    )
+    screen_disabled_settings = ProactiveCareSettings(
+        enabled=True,
+        screen_context_enabled=False,
+        check_interval_minutes=20,
+    )
 
-    assert settings.allows_screen_context(
-        screen_observation_enabled=True,
-        model_vision_enabled=True,
-    )
-    assert not settings.allows_screen_context(
-        screen_observation_enabled=False,
-        model_vision_enabled=True,
-    )
-    assert not settings.allows_screen_context(
-        screen_observation_enabled=True,
-        model_vision_enabled=False,
-    )
+    assert enabled_settings.allows_screen_context()
+    assert not care_disabled_settings.allows_screen_context()
+    assert not screen_disabled_settings.allows_screen_context()
 
 
 def test_memory_propose_update_only_creates_pending_record() -> None:
@@ -1143,7 +1144,7 @@ def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> No
     assert "不要为了显得主动而循环调用工具" in client.prompts[0]
 
 
-def test_proactive_check_can_request_autonomous_screen_observation() -> None:
+def test_proactive_check_can_request_screen_when_screen_context_allowed() -> None:
     class ProactiveScreenClient:
         def __init__(self) -> None:
             self.prompts: list[str] = []
@@ -1154,6 +1155,38 @@ def test_proactive_check_can_request_autonomous_screen_observation() -> None:
                 '{"reply":{"segments":[{"ja":"ちょっと見てみるね。","zh":"我稍微看一下。","tone":"中性"}]},'
                 '"tool_calls":[{"name":"observe_screen","arguments":{},"reason":"想看看主人现在在做什么"}]}'
             )
+
+    client = ProactiveScreenClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=ToolRegistry([create_screen_observation_tool()]),
+    )
+
+    result = runtime.handle_event(
+        AgentEvent(
+            type="proactive_check",
+            payload={
+                "seconds_since_pet_interaction": 1800,
+                "screen_context_allowed": True,
+            },
+        )
+    )
+
+    assert "observe_screen" in client.prompts[0]
+    assert result.actions[0].type == "event"
+    assert result.actions[1].type == SCREEN_OBSERVATION_REQUEST_ACTION
+    assert result.actions[1].payload["reason"] == "想看看主人现在在做什么"
+
+
+def test_proactive_check_hides_screen_tool_when_screen_context_disallowed() -> None:
+    class ProactiveScreenClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete_raw(self, system_prompt, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.prompts.append(system_prompt)
+            return '{"reply":{"segments":[{"ja":"声をかけるね。","zh":"我轻轻叫你一下。","tone":"中性"}]}}'
 
     client = ProactiveScreenClient()
     runtime = AgentRuntime(
@@ -1173,10 +1206,9 @@ def test_proactive_check_can_request_autonomous_screen_observation() -> None:
         )
     )
 
-    assert "observe_screen" in client.prompts[0]
+    assert f'"name": "{OBSERVE_SCREEN_TOOL_NAME}"' not in client.prompts[0]
     assert result.actions[0].type == "event"
-    assert result.actions[1].type == SCREEN_OBSERVATION_REQUEST_ACTION
-    assert result.actions[1].payload["reason"] == "想看看主人现在在做什么"
+    assert not any(action.type == SCREEN_OBSERVATION_REQUEST_ACTION for action in result.actions)
 
 
 def test_proactive_check_vision_unsupported_uses_safe_fallback() -> None:

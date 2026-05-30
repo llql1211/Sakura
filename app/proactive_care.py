@@ -71,18 +71,9 @@ class ProactiveCareSettings:
             ),
         )
 
-    def allows_screen_context(
-        self,
-        *,
-        screen_observation_enabled: bool,
-        model_vision_enabled: bool,
-    ) -> bool:
-        """只有三个开关都允许时，主动关怀才可以附加屏幕上下文。"""
-        return (
-            self.screen_context_enabled
-            and screen_observation_enabled
-            and model_vision_enabled
-        )
+    def allows_screen_context(self) -> bool:
+        """主动关怀开启且允许主动获取屏幕信息时，才附加屏幕上下文。"""
+        return self.enabled and self.screen_context_enabled
 
     def save(self, env_path: Path) -> None:
         settings = self.normalized()
