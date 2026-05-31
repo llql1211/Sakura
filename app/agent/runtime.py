@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate, PendingToolAction
+from app.agent.actions import AgentAction, AgentEvent, AgentResult, PendingToolAction
 from app.agent.memory import MemoryStore
 from app.agent.screen_tools import (
     OBSERVE_SCREEN_TOOL_NAME,
@@ -154,7 +154,6 @@ class AgentRuntime:
                 return AgentResult(
                     reply=parse_chat_reply(model_content),
                     actions=emitted_actions,
-                    memory_updates=_extract_memory_updates(execution_results),
                 )
 
             tool_calls = _parse_tool_calls(agent_data.get("tool_calls"))
@@ -181,7 +180,6 @@ class AgentRuntime:
                 return AgentResult(
                     reply=_parse_agent_reply(agent_data, model_content),
                     actions=emitted_actions,
-                    memory_updates=_extract_memory_updates(execution_results),
                 )
 
             step_results: list[ToolExecutionResult] = []
@@ -223,7 +221,6 @@ class AgentRuntime:
                         return AgentResult(
                             reply=_build_screen_observation_request_reply(),
                             actions=[*emitted_actions, screen_action],
-                            memory_updates=_extract_memory_updates(execution_results),
                         )
                     prepared = ToolExecutionResult(
                         tool_name=OBSERVE_SCREEN_TOOL_NAME,
@@ -299,7 +296,6 @@ class AgentRuntime:
                             for action in pending_actions
                         ],
                     ],
-                    memory_updates=_extract_memory_updates(execution_results),
                 )
 
             if not step_results:
@@ -342,7 +338,6 @@ class AgentRuntime:
         return AgentResult(
             reply=final_reply,
             actions=emitted_actions,
-            memory_updates=_extract_memory_updates(execution_results),
         )
 
     def handle_confirmed_action(self, action: PendingToolAction) -> AgentResult:
@@ -531,11 +526,9 @@ class AgentRuntime:
 {extra_instructions.strip()}
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
 - 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
-- 不要静默写入长期记忆；只有用户明确要求记住时，才使用 propose_memory_update。
-- 只有用户明确确认候选记忆时，才使用 confirm_memory_update。
+- 长期记忆由后台整理器自动维护；你不要尝试写入记忆。
 - 只有用户明确要求忘掉信息时，才使用 forget_memory。
 """.strip()
-
     def _build_final_reply_prompt(self) -> str:
         return f"""
 {self.system_prompt.strip()}
@@ -884,12 +877,9 @@ def _summarize_tool_results(results: list[ToolExecutionResult]) -> str:
             elif isinstance(result.content.get("task"), dict):
                 task = result.content["task"]
                 parts.append(f"待办「{task.get('text', '')}」已更新。")
-            elif isinstance(result.content.get("pending_update"), dict):
-                update = result.content["pending_update"]
-                parts.append(f"候选记忆「{update.get('content', '')}」已记录，等待确认。")
             elif isinstance(result.content.get("memory"), dict):
                 memory = result.content["memory"]
-                parts.append(f"记忆「{memory.get('content', '')}」已确认。")
+                parts.append(f"记忆「{memory.get('content', '')}」已更新。")
             elif result.tool_name == "open_url":
                 parts.append(f"网页已打开：{result.content.get('url', '')}。")
             elif result.tool_name == "browser_open_url":
@@ -1015,30 +1005,3 @@ def _build_proactive_tool_loop_rules() -> str:
 - 如果事件已经附加 screen_context.image_attached，优先基于画面判断；不要再请求 observe_screen。
 - 最终回复只说给用户听的自然搭话、提问或轻提醒，不要提及内部事件、工具循环或工具协议。
 """.strip()
-
-
-def _extract_memory_updates(results: list[ToolExecutionResult]) -> list[MemoryUpdate]:
-    updates: list[MemoryUpdate] = []
-    for result in results:
-        if result.tool_name != "propose_memory_update" or not result.success:
-            continue
-        if not isinstance(result.content, dict):
-            continue
-        raw_update = result.content.get("pending_update")
-        if not isinstance(raw_update, dict):
-            continue
-        update_id = raw_update.get("id")
-        category = raw_update.get("category")
-        content = raw_update.get("content")
-        reason = raw_update.get("reason", "")
-        if not all(isinstance(value, str) and value.strip() for value in (update_id, category, content)):
-            continue
-        updates.append(
-            MemoryUpdate(
-                id=update_id.strip(),
-                category=category.strip(),
-                content=content.strip(),
-                reason=reason.strip() if isinstance(reason, str) else "",
-            )
-        )
-    return updates

@@ -3,22 +3,30 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFormLayout,
+    QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from app.agent.memory import MEMORY_CATEGORIES, MemoryStore
 from app.api_client import ApiSettings, OpenAICompatibleClient
 from app.character_loader import CharacterProfile, CharacterRegistry
 from app.proactive_care import (
@@ -61,6 +69,7 @@ class SettingsDialog(QDialog):
         character_registry: CharacterRegistry | None = None,
         current_character: CharacterProfile | None = None,
         proactive_care_settings: ProactiveCareSettings | None = None,
+        memory_store: MemoryStore | None = None,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
         super().__init__(parent)
@@ -68,6 +77,8 @@ class SettingsDialog(QDialog):
         self.tts_settings = tts_settings
         self.character_registry = character_registry
         self.current_character = current_character
+        self.memory_store = memory_store
+        self._visible_memories: list[dict[str, object]] = []
         self.result_api_settings: ApiSettings | None = None
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
         self.result_character_id: str | None = None
@@ -89,6 +100,8 @@ class SettingsDialog(QDialog):
             ),
             "隐私",
         )
+        if memory_store is not None:
+            tabs.addTab(self._build_memory_tab(memory_store), "记忆")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel,
@@ -128,7 +141,7 @@ class SettingsDialog(QDialog):
                 color: #27616d;
                 font-weight: 700;
             }
-            QLineEdit, QSpinBox {
+            QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget {
                 background: rgba(255, 255, 255, 0.92);
                 border: 1px solid rgba(120, 176, 188, 0.50);
                 border-radius: 7px;
@@ -268,6 +281,205 @@ class SettingsDialog(QDialog):
         form_layout.addRow("主动打扰冷却", self.proactive_cooldown_spin)
         tab.setLayout(form_layout)
         return tab
+
+    def _build_memory_tab(self, memory_store: MemoryStore) -> QWidget:
+        tab = QWidget(self)
+        _ = memory_store
+
+        self.memory_search_edit = QLineEdit(tab)
+        self.memory_search_edit.setPlaceholderText("搜索记忆内容、分类或 ID")
+        self.memory_search_edit.textChanged.connect(self._refresh_memory_table)
+
+        self.memory_category_filter = QComboBox(tab)
+        self.memory_category_filter.addItem("全部分类", "")
+        for category in sorted(MEMORY_CATEGORIES):
+            self.memory_category_filter.addItem(category, category)
+        self.memory_category_filter.currentIndexChanged.connect(self._refresh_memory_table)
+
+        self.memory_table = QTableWidget(0, 6, tab)
+        self.memory_table.setHorizontalHeaderLabels(["分类", "内容", "重要度", "置信度", "最近出现", "来源"])
+        self.memory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.memory_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.memory_table.verticalHeader().setVisible(False)
+        self.memory_table.itemSelectionChanged.connect(self._handle_memory_selection)
+
+        self.memory_category_edit = QComboBox(tab)
+        for category in sorted(MEMORY_CATEGORIES):
+            self.memory_category_edit.addItem(category, category)
+
+        self.memory_content_edit = QTextEdit(tab)
+        self.memory_content_edit.setPlaceholderText("长期记忆内容")
+        self.memory_content_edit.setFixedHeight(92)
+
+        self.memory_importance_spin = QDoubleSpinBox(tab)
+        self.memory_importance_spin.setRange(0.0, 1.0)
+        self.memory_importance_spin.setSingleStep(0.05)
+        self.memory_importance_spin.setValue(0.7)
+
+        self.memory_confidence_spin = QDoubleSpinBox(tab)
+        self.memory_confidence_spin.setRange(0.0, 1.0)
+        self.memory_confidence_spin.setSingleStep(0.05)
+        self.memory_confidence_spin.setValue(0.9)
+
+        self.memory_new_button = QPushButton("新增", tab)
+        self.memory_new_button.clicked.connect(self._clear_memory_editor)
+        self.memory_save_button = QPushButton("保存", tab)
+        self.memory_save_button.clicked.connect(self._save_memory_entry)
+        self.memory_delete_button = QPushButton("删除", tab)
+        self.memory_delete_button.clicked.connect(self._delete_memory_entry)
+        self.memory_refresh_button = QPushButton("刷新", tab)
+        self.memory_refresh_button.clicked.connect(self._refresh_memory_table)
+
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(self.memory_search_edit, 1)
+        filter_layout.addWidget(self.memory_category_filter)
+
+        editor_layout = QFormLayout()
+        editor_layout.setSpacing(8)
+        editor_layout.addRow("分类", self.memory_category_edit)
+        editor_layout.addRow("内容", self.memory_content_edit)
+        editor_layout.addRow("重要度", self.memory_importance_spin)
+        editor_layout.addRow("置信度", self.memory_confidence_spin)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.memory_new_button)
+        button_layout.addWidget(self.memory_save_button)
+        button_layout.addWidget(self.memory_delete_button)
+        button_layout.addStretch(1)
+        button_layout.addWidget(self.memory_refresh_button)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 18, 16, 16)
+        layout.setSpacing(10)
+        layout.addLayout(filter_layout)
+        layout.addWidget(self.memory_table, 1)
+        layout.addWidget(QLabel("编辑记忆", tab))
+        layout.addLayout(editor_layout)
+        layout.addLayout(button_layout)
+        tab.setLayout(layout)
+
+        self._refresh_memory_table()
+        self._clear_memory_editor()
+        return tab
+
+    def _refresh_memory_table(self) -> None:
+        if self.memory_store is None or not hasattr(self, "memory_table"):
+            return
+        keyword = self.memory_search_edit.text().strip()
+        category = self.memory_category_filter.currentData()
+        arguments = {
+            "keyword": keyword,
+            "category": category if isinstance(category, str) else "",
+            "include_archived": False,
+        }
+        try:
+            self._visible_memories = self.memory_store.search_memory(arguments)["memories"]
+        except ValueError as exc:
+            QMessageBox.warning(self, "读取失败", str(exc))
+            self._visible_memories = []
+        self.memory_table.setRowCount(len(self._visible_memories))
+        for row, memory in enumerate(self._visible_memories):
+            values = [
+                str(memory.get("category", "")),
+                str(memory.get("content", "")),
+                f"{float(memory.get('importance', 0.0)):.2f}",
+                f"{float(memory.get('confidence', 0.0)):.2f}",
+                _format_memory_time(str(memory.get("last_seen_at", ""))),
+                str(memory.get("source", "")),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, str(memory.get("id", "")))
+                self.memory_table.setItem(row, column, item)
+        self.memory_table.resizeColumnsToContents()
+
+    def _handle_memory_selection(self) -> None:
+        memory = self._selected_memory()
+        if memory is None:
+            return
+        category = str(memory.get("category", "fact"))
+        index = self.memory_category_edit.findData(category)
+        self.memory_category_edit.setCurrentIndex(max(0, index))
+        self.memory_content_edit.setPlainText(str(memory.get("content", "")))
+        self.memory_importance_spin.setValue(float(memory.get("importance", 0.7)))
+        self.memory_confidence_spin.setValue(float(memory.get("confidence", 0.9)))
+
+    def _clear_memory_editor(self) -> None:
+        if not hasattr(self, "memory_content_edit"):
+            return
+        self.memory_table.clearSelection()
+        index = self.memory_category_edit.findData("fact")
+        self.memory_category_edit.setCurrentIndex(max(0, index))
+        self.memory_content_edit.clear()
+        self.memory_importance_spin.setValue(0.7)
+        self.memory_confidence_spin.setValue(0.9)
+
+    def _save_memory_entry(self) -> None:
+        if self.memory_store is None:
+            return
+        content = self.memory_content_edit.toPlainText().strip()
+        if not content:
+            QMessageBox.warning(self, "内容为空", "记忆内容不能为空。")
+            return
+        category = self.memory_category_edit.currentData()
+        payload = {
+            "category": category if isinstance(category, str) else "fact",
+            "content": content,
+            "importance": self.memory_importance_spin.value(),
+            "confidence": self.memory_confidence_spin.value(),
+            "source": "manual",
+        }
+        memory = self._selected_memory()
+        try:
+            if memory is None:
+                self.memory_store.create_memory(payload, allow_sensitive=True)
+            else:
+                self.memory_store.update_memory(
+                    {"id": str(memory.get("id", "")), **payload},
+                    allow_sensitive=True,
+                )
+        except ValueError as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self._refresh_memory_table()
+        QMessageBox.information(self, "保存成功", "记忆已保存。")
+
+    def _delete_memory_entry(self) -> None:
+        if self.memory_store is None:
+            return
+        memory = self._selected_memory()
+        if memory is None:
+            QMessageBox.information(self, "未选择", "请先选择一条记忆。")
+            return
+        result = QMessageBox.question(
+            self,
+            "删除记忆",
+            "确定要删除选中的长期记忆吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.memory_store.delete_memory({"id": str(memory.get("id", ""))})
+        except ValueError as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self._refresh_memory_table()
+        self._clear_memory_editor()
+
+    def _selected_memory(self) -> dict[str, object] | None:
+        if not hasattr(self, "memory_table"):
+            return None
+        selected_rows = self.memory_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return None
+        row = selected_rows[0].row()
+        if row < 0 or row >= len(self._visible_memories):
+            return None
+        return self._visible_memories[row]
 
     def accept(self) -> None:
         if self._api_test_thread is not None:
@@ -419,3 +631,10 @@ class SettingsDialog(QDialog):
 def _is_http_url(url: str) -> bool:
     parsed_url = urlparse(url)
     return parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
+
+
+def _format_memory_time(value: str) -> str:
+    text = value.replace("T", " ").replace("Z", "")
+    for separator in ("+", "."):
+        text = text.split(separator, 1)[0]
+    return text

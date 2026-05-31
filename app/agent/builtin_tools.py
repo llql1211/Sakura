@@ -239,40 +239,11 @@ def create_builtin_tool_registry(
                         "keyword": {"type": "string", "description": "搜索关键词，可为空。"},
                         "category": {
                             "type": "string",
-                            "description": "可选分类：preference、project、habit、fact。",
+                            "description": "可选分类：preference、project、habit、fact、relationship。",
                         },
                     },
                 },
                 handler=memory.search_memory,
-            ),
-            Tool(
-                name="propose_memory_update",
-                description="提出一条候选长期记忆。只在用户明确要求记住长期偏好、习惯、项目状态或事实时使用；不会直接写入正式记忆。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "category": {
-                            "type": "string",
-                            "description": "分类：preference、project、habit、fact。",
-                        },
-                        "content": {"type": "string", "description": "要记住的内容。"},
-                        "reason": {"type": "string", "description": "为什么这条信息值得长期记住。"},
-                    },
-                    "required": ["category", "content"],
-                },
-                handler=memory.propose_memory_update,
-            ),
-            Tool(
-                name="confirm_memory_update",
-                description="在用户明确确认后，将候选记忆写入正式长期记忆。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "候选记忆 id。"},
-                    },
-                    "required": ["id"],
-                },
-                handler=memory.confirm_memory_update,
             ),
             Tool(
                 name="forget_memory",

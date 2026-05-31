@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import uuid
 
@@ -189,36 +190,80 @@ def test_proactive_care_screen_context_requires_active_care_and_screen_context()
     assert not screen_disabled_settings.allows_screen_context()
 
 
-def test_memory_propose_update_only_creates_pending_record() -> None:
+def test_memory_store_reads_legacy_memory_without_pending_updates() -> None:
     store = MemoryStore(_runtime_json_path("memory"))
-
-    result = store.propose_memory_update(
-        {
-            "category": "preference",
-            "content": "主人喜欢中文回复",
-            "reason": "长期偏好",
-        }
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "memories": [
+                    {
+                        "id": "abc123",
+                        "category": "fact",
+                        "content": "主人是 Sakura 的开发者",
+                        "created_at": "2026-05-30T17:13:44+08:00",
+                        "updated_at": "2026-05-30T17:14:16+08:00",
+                    }
+                ],
+                "pending_updates": [
+                    {
+                        "id": "pending",
+                        "category": "preference",
+                        "content": "旧候选记忆会被忽略",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
     snapshot = store.snapshot()
-    assert snapshot["memories"] == []
-    assert snapshot["pending_updates"] == [result["pending_update"]]
+
+    assert len(snapshot["memories"]) == 1
+    assert snapshot["memories"][0]["source"] == "legacy"
+    assert "pending_updates" not in snapshot
 
 
-def test_memory_confirm_update_moves_pending_to_memories() -> None:
+def test_memory_store_create_update_search_and_delete() -> None:
     store = MemoryStore(_runtime_json_path("memory"))
-    pending = store.propose_memory_update(
+    created = store.create_memory(
         {
             "category": "project",
-            "content": "Sakura 正在稳定 Agent 内核",
+            "content": "Sakura 正在实现自动记忆整理",
+            "importance": 0.8,
+            "confidence": 0.9,
         }
-    )["pending_update"]
+    )["memory"]
 
-    result = store.confirm_memory_update({"id": pending["id"]})
+    updated = store.update_memory(
+        {
+            "id": created["id"],
+            "content": "Sakura 正在实现自动记忆整理和管理页",
+            "importance": 0.95,
+        }
+    )["memory"]
 
-    snapshot = store.snapshot()
-    assert snapshot["pending_updates"] == []
-    assert snapshot["memories"] == [result["memory"]]
+    search_result = store.search_memory({"keyword": "管理页", "category": "project"})
+    assert search_result["memories"] == [updated]
+
+    removed = store.delete_memory({"id": created["id"]})["memory"]
+    assert removed["content"] == "Sakura 正在实现自动记忆整理和管理页"
+    assert store.snapshot()["memories"] == []
+
+
+def test_memory_store_rejects_sensitive_auto_memory() -> None:
+    store = MemoryStore(_runtime_json_path("memory"))
+
+    result = store.upsert_auto_memory(
+        {
+            "category": "fact",
+            "content": "API_KEY=sk-1234567890abcdef1234567890abcdef",
+        }
+    )
+
+    assert result["reason"] == "包含敏感凭据或隐私字段"
+    assert store.snapshot()["memories"] == []
 
 
 def test_tool_registry_requires_confirmation_returns_pending_action() -> None:

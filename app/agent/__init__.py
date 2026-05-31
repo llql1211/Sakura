@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate, PendingToolAction
+from app.agent.actions import AgentAction, AgentEvent, AgentResult, PendingToolAction
 from app.agent.builtin_tools import create_builtin_tool_registry
 from app.agent.memory import MemoryStore
 from app.agent.mcp import MCPToolProvider, register_mcp_tools_from_config
@@ -14,7 +14,6 @@ __all__ = [
     "AgentResult",
     "AgentRuntime",
     "MemoryStore",
-    "MemoryUpdate",
     "MCPToolProvider",
     "PendingToolAction",
     "ReminderStore",

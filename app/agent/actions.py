@@ -17,16 +17,6 @@ class AgentAction:
 
 
 @dataclass(frozen=True)
-class MemoryUpdate:
-    """候选长期记忆更新，用于 UI 或调用方决定是否提示用户。"""
-
-    id: str
-    category: str
-    content: str
-    reason: str = ""
-
-
-@dataclass(frozen=True)
 class AgentEvent:
     """运行时主动事件，例如提醒到期。"""
 
@@ -96,8 +86,7 @@ class PendingToolAction:
 
 @dataclass(frozen=True)
 class AgentResult:
-    """Agent Runtime 的统一输出，供 UI 根据回复、动作和记忆更新分别处理。"""
+    """Agent Runtime 的统一输出，供 UI 根据回复和动作分别处理。"""
 
     reply: ChatReply
     actions: list[AgentAction] = field(default_factory=list)
-    memory_updates: list[MemoryUpdate] = field(default_factory=list)

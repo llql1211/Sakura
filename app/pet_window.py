@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import (
+    QObject,
     QEasingCurve,
     QEvent,
     QParallelAnimationGroup,
     QPoint,
     QPropertyAnimation,
     QRect,
+    Signal,
     Qt,
     QThread,
     QTimer,
@@ -43,6 +45,12 @@ from app.agent import (
     ReminderStore,
     create_builtin_tool_registry,
 )
+from app.agent.memory_curator import (
+    MemoryCurator,
+    MemoryCurationResult,
+    MemoryCurationSettings,
+    MemoryCurationState,
+)
 from app.agent.mcp import MCPToolProvider, register_mcp_tools_from_config
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.api_client import OpenAICompatibleClient
@@ -54,7 +62,7 @@ from app.character_loader import (
     CharacterRegistry,
     load_character_system_prompt,
 )
-from app.chat_history import ChatHistoryStore
+from app.chat_history import ChatHistoryEntry, ChatHistoryStore
 from app.chat_reply import ChatReply, ChatSegment
 from app.context_trimming import trim_messages_for_model
 from app.chat_worker import ChatWorker, EventWorker
@@ -93,6 +101,29 @@ SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 SCREEN_OBSERVATION_ENABLED_KEY = "SCREEN_OBSERVATION_ENABLED"
 AUTONOMOUS_SCREEN_OBSERVATION_ENABLED_KEY = "AUTONOMOUS_SCREEN_OBSERVATION_ENABLED"
+
+
+class MemoryCurationWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        curator: MemoryCurator,
+        entries: list[ChatHistoryEntry],
+    ) -> None:
+        super().__init__()
+        self.curator = curator
+        self.entries = entries
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self.curator.curate_entries(self.entries)
+        except Exception as exc:  # 后台整理失败不能影响主聊天。
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(result)
 
 
 class PetWindow(QWidget):
@@ -137,6 +168,11 @@ class PetWindow(QWidget):
         self.tts_provider = tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = self._create_history_store(character_profile)
+        self.memory_curation_settings = MemoryCurationSettings.load(self.env_path)
+        self.memory_curation_state = MemoryCurationState(
+            base_dir / "data" / "memory_curation_state.json"
+        )
+        self.memory_curator = MemoryCurator(api_client, self.memory_store)
         self.subtitle_language = self._load_subtitle_language()
         self.screen_observation_enabled = self._load_screen_observation_enabled()
         self.autonomous_screen_observation_enabled = self._load_autonomous_screen_observation_enabled()
@@ -152,6 +188,11 @@ class PetWindow(QWidget):
         self.portrait_pixmap_cache: dict[Path, QPixmap] = {}
         self.worker_thread: QThread | None = None
         self.worker: ChatWorker | EventWorker | None = None
+        self.memory_curation_thread: QThread | None = None
+        self.memory_curation_worker: MemoryCurationWorker | None = None
+        self.memory_curation_mode = ""
+        self.memory_curation_target_history_count = 0
+        self.memory_curation_consumed_turns = 0
         self.drag_offset: QPoint | None = None
         self.stage_size = (860, 640)
         self.speech_text = ""
@@ -194,6 +235,7 @@ class PetWindow(QWidget):
         self.proactive_care_timer.setInterval(PROACTIVE_TIMER_POLL_INTERVAL_MS)
         self.proactive_care_timer.timeout.connect(self._check_proactive_care)
         self._sync_proactive_care_timer()
+        QTimer.singleShot(0, self._maybe_start_memory_backfill)
         debug_log(
             "PetWindow",
             "窗口运行状态初始化",
@@ -207,6 +249,7 @@ class PetWindow(QWidget):
                 "screen_observation_enabled": self.screen_observation_enabled,
                 "autonomous_screen_observation_enabled": self.autonomous_screen_observation_enabled,
                 "proactive_care": self.proactive_care_settings,
+                "auto_memory": self.memory_curation_settings,
             },
         )
 
@@ -840,7 +883,6 @@ class PetWindow(QWidget):
             {
                 "segments": len(result.reply.segments),
                 "actions": [action.type for action in result.actions],
-                "memory_updates": len(result.memory_updates),
             },
         )
         debug_log(
@@ -849,7 +891,6 @@ class PetWindow(QWidget):
             {
                 "segments": len(result.reply.segments),
                 "actions": [action.type for action in result.actions],
-                "memory_updates": len(result.memory_updates),
             },
         )
         if self._queue_screen_observation_followup(result):
@@ -858,6 +899,7 @@ class PetWindow(QWidget):
         reply = result.reply
         self.messages.append({"role": "assistant", "content": reply.text})
         self._record_history("assistant", reply.text, reply.translation)
+        self._record_completed_memory_turn()
         self._log_interaction_stage("assistant_message_recorded")
         self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
@@ -1349,6 +1391,156 @@ class PetWindow(QWidget):
             return
         self._set_busy(False)
         self._log_interaction_stage("ui_busy_disabled")
+        self._maybe_start_auto_memory_curation()
+
+    def _record_completed_memory_turn(self) -> None:
+        if not self.memory_curation_settings.enabled:
+            return
+        pending_turns = self.memory_curation_state.increment_pending_turns()
+        debug_log("Memory", "自动记忆轮次已累计", {"pending_turns": pending_turns})
+        if pending_turns >= self.memory_curation_settings.trigger_turns:
+            QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+
+    def _maybe_start_auto_memory_curation(self) -> None:
+        if not self.memory_curation_settings.enabled:
+            return
+        if self.memory_curation_state.pending_turns() < self.memory_curation_settings.trigger_turns:
+            return
+        if not self._memory_curation_can_start():
+            return
+        entries = self.memory_curation_state.unprocessed_entries(self.history_store.load())
+        if not entries:
+            return
+        self._start_memory_curation(
+            entries,
+            mode="auto",
+            target_history_count=len(self.history_store.load()),
+            consumed_turns=self.memory_curation_state.pending_turns(),
+        )
+
+    def _maybe_start_memory_backfill(self) -> None:
+        if not self.memory_curation_settings.enabled:
+            return
+        state = self.memory_curation_state.snapshot()
+        if state.get("backfill_completed"):
+            return
+        if not self._memory_curation_can_start():
+            QTimer.singleShot(1000, self._maybe_start_memory_backfill)
+            return
+        entries = self.history_store.load()
+        if not entries:
+            self.memory_curation_state.mark_processed(0, backfill_completed=True)
+            return
+        limited_entries = entries[-self.memory_curation_settings.backfill_limit :]
+        self._start_memory_curation(
+            limited_entries,
+            mode="backfill",
+            target_history_count=len(entries),
+            consumed_turns=0,
+        )
+
+    def _memory_curation_can_start(self) -> bool:
+        return (
+            self.worker_thread is None
+            and self.memory_curation_thread is None
+            and self.pending_tool_action is None
+            and self.pending_screen_observation_messages is None
+            and self.pending_screen_observation_event is None
+            and not self.screen_observation_followup_in_progress
+        )
+
+    def _start_memory_curation(
+        self,
+        entries: list[ChatHistoryEntry],
+        *,
+        mode: str,
+        target_history_count: int,
+        consumed_turns: int,
+    ) -> None:
+        if not entries or self.memory_curation_thread is not None:
+            return
+        debug_log(
+            "Memory",
+            "启动记忆整理",
+            {
+                "mode": mode,
+                "entry_count": len(entries),
+                "target_history_count": target_history_count,
+                "consumed_turns": consumed_turns,
+            },
+        )
+        self.memory_curation_mode = mode
+        self.memory_curation_target_history_count = target_history_count
+        self.memory_curation_consumed_turns = consumed_turns
+        self.memory_curation_thread = QThread(self)
+        self.memory_curation_worker = MemoryCurationWorker(self.memory_curator, entries)
+        self.memory_curation_worker.moveToThread(self.memory_curation_thread)
+        self.memory_curation_thread.started.connect(self.memory_curation_worker.run)
+        self.memory_curation_worker.finished.connect(self._handle_memory_curation_finished)
+        self.memory_curation_worker.failed.connect(self._handle_memory_curation_failed)
+        self.memory_curation_worker.finished.connect(self.memory_curation_thread.quit)
+        self.memory_curation_worker.failed.connect(self.memory_curation_thread.quit)
+        self.memory_curation_thread.finished.connect(self._cleanup_memory_curation_worker)
+        self.memory_curation_thread.start()
+
+    @Slot(object)
+    def _handle_memory_curation_finished(self, result: MemoryCurationResult) -> None:
+        mode = self.memory_curation_mode
+        debug_log(
+            "Memory",
+            "记忆整理完成",
+            {
+                "mode": mode,
+                "result": result,
+                "target_history_count": self.memory_curation_target_history_count,
+                "consumed_turns": self.memory_curation_consumed_turns,
+            },
+        )
+        if mode == "history_clear":
+            try:
+                self.history_store.clear()
+                self.memory_curation_state.mark_history_cleared()
+            except OSError as exc:
+                QMessageBox.warning(self, "清空失败", f"记忆已整理，但清空历史失败：{exc}")
+            else:
+                if self.history_window is not None:
+                    self.history_window.refresh()
+                QMessageBox.information(self, "整理完成", result.summary())
+            return
+
+        self.memory_curation_state.mark_processed(
+            self.memory_curation_target_history_count,
+            consumed_turns=self.memory_curation_consumed_turns,
+            backfill_completed=True if mode == "backfill" else None,
+        )
+
+    @Slot(str)
+    def _handle_memory_curation_failed(self, message: str) -> None:
+        debug_log(
+            "Memory",
+            "记忆整理失败",
+            {
+                "mode": self.memory_curation_mode,
+                "error": message,
+            },
+        )
+        if self.memory_curation_mode == "history_clear":
+            QMessageBox.warning(self, "整理失败", f"历史没有清空，原因：{message}")
+
+    @Slot()
+    def _cleanup_memory_curation_worker(self) -> None:
+        if self.memory_curation_worker is not None:
+            self.memory_curation_worker.deleteLater()
+        if self.memory_curation_thread is not None:
+            self.memory_curation_thread.deleteLater()
+        self.memory_curation_worker = None
+        self.memory_curation_thread = None
+        self.memory_curation_mode = ""
+        self.memory_curation_target_history_count = 0
+        self.memory_curation_consumed_turns = 0
+        if self.history_window is not None:
+            self.history_window.set_memory_save_busy(False)
+        QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
     def _set_busy(self, busy: bool) -> None:
         self.input_edit.setEnabled(not busy)
@@ -1395,6 +1587,7 @@ class PetWindow(QWidget):
             self.history_window = HistoryWindow(
                 self.history_store,
                 self.subtitle_language,
+                self._save_history_to_memory_and_clear,
                 self,
             )
         self.history_window.set_subtitle_language(self.subtitle_language)
@@ -1402,6 +1595,30 @@ class PetWindow(QWidget):
         self.history_window.show()
         self.history_window.raise_()
         self.history_window.activateWindow()
+
+    def _save_history_to_memory_and_clear(self) -> None:
+        if self.memory_curation_thread is not None:
+            QMessageBox.information(self, "整理中", "记忆整理已经在进行中，请稍后再试。")
+            if self.history_window is not None:
+                self.history_window.set_memory_save_busy(False)
+            return
+        if self.worker_thread is not None:
+            QMessageBox.information(self, "正在回复", "当前聊天还没处理完，稍后再整理历史。")
+            if self.history_window is not None:
+                self.history_window.set_memory_save_busy(False)
+            return
+        entries = self.history_store.load()
+        if not entries:
+            if self.history_window is not None:
+                self.history_window.set_memory_save_busy(False)
+                self.history_window.refresh()
+            return
+        self._start_memory_curation(
+            entries,
+            mode="history_clear",
+            target_history_count=len(entries),
+            consumed_turns=self.memory_curation_state.pending_turns(),
+        )
 
     @Slot()
     def show_settings(self) -> None:
@@ -1423,6 +1640,7 @@ class PetWindow(QWidget):
             self.character_registry,
             self.character_profile,
             self.proactive_care_settings,
+            self.memory_store,
             self,
         )
         if (
