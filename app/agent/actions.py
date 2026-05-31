@@ -25,6 +25,15 @@ class AgentEvent:
 
 
 @dataclass(frozen=True)
+class AgentProgress:
+    """Agent 运行中的中间回复，用于前台展示工具调用进度。"""
+
+    reply: ChatReply
+    stage: str = "tool_planning"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PendingToolAction:
     """等待用户确认后才执行的工具动作。"""
 

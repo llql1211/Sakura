@@ -10,6 +10,7 @@ env/
 
 .pytest_cache/
 .pytest_tmp/
+.pytest_tmp*/
 .mypy_cache/
 .ruff_cache/
 
@@ -19,5 +20,7 @@ data/chat_history/sakura.jsonl
 data/memory.json
 data/memory_curation_state.json
 data/reminders.json
+data/visual_observations/
 data/notes/
 task.md
+log.txt

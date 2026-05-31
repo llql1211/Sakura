@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
+import uuid
 
 import pytest
 
@@ -10,6 +12,7 @@ from app.portrait_utils import portrait_kind_key, should_crossfade_portrait
 from app.proactive_care import ProactiveCareSettings
 from app.screen_observation import ScreenObservation
 from app.tts import GPTSoVITSTTSSettings
+from app.visual_observation import VisualObservationRecord, VisualObservationStore
 
 
 def test_portrait_kind_key_uses_filename_suffix_group() -> None:
@@ -386,8 +389,49 @@ def test_manual_screenshot_text_input_records_marker_without_image_data() -> Non
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,manual"
     assert window.messages[-1]["content"].startswith("帮我看这里")
     assert "已附加手动框选截图" in window.messages[-1]["content"]
+    assert "visual_id=vis_" in window.messages[-1]["content"]
+    assert window.pending_visual_observation_jobs[0].source == "manual_screenshot"
     assert "data:image/jpeg;base64" not in window.messages[-1]["content"]
     assert "data:image/jpeg;base64" not in history[0][1]
+
+
+def test_visual_context_is_injected_for_screenshot_followup() -> None:
+    from app.pet_window import _add_visual_context_to_messages
+
+    path = Path("data") / f"test_visual_context_{uuid.uuid4().hex}.jsonl"
+    try:
+        store = VisualObservationStore(path)
+        store.append(
+            VisualObservationRecord(
+                id="vis_recent",
+                created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                source="manual_screenshot",
+                user_text="帮我看这里",
+                screen_name="manual-selection",
+                width=320,
+                height=180,
+                summary="截图里是聊天气泡。",
+                visible_texts=["屏幕上的那句台词"],
+                uncertain_texts=[],
+                notable_elements=["聊天窗口"],
+                confidence=0.9,
+            )
+        )
+
+        messages = _add_visual_context_to_messages(
+            [{"role": "user", "content": "刚才截图里有什么台词？"}],
+            user_text="刚才截图里有什么台词？",
+            store=store,
+            has_current_image=False,
+        )
+
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert "visual_id=vis_recent" in messages[0]["content"]
+        assert "屏幕上的那句台词" in messages[0]["content"]
+        assert messages[1]["content"] == "刚才截图里有什么台词？"
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_set_busy_disables_manual_screenshot_button() -> None:
@@ -409,6 +453,128 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
 
     window._set_busy(False)
     assert window.screenshot_button.enabled
+
+
+def test_progress_reply_displays_and_records_assistant_message() -> None:
+    from app.agent import AgentProgress
+    from app.chat_reply import parse_chat_reply
+    from app.pet_window import PetWindow
+
+    class MinimalProgressWindow:
+        _handle_progress_reply = PetWindow._handle_progress_reply
+
+    window = MinimalProgressWindow()
+    history = []
+    shown = []
+    window.messages = [{"role": "user", "content": "查一下"}]
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._record_history = lambda *args: history.append(args)
+    window._show_reply_segments = lambda segments: shown.append(segments)
+
+    window._handle_progress_reply(
+        AgentProgress(
+            reply=parse_chat_reply(
+                '{"segments":[{"ja":"調べるね。","zh":"我查一下。","tone":"中性"}]}'
+            )
+        )
+    )
+
+    assert window.messages[-1] == {"role": "assistant", "content": "調べるね。"}
+    assert history[-1] == ("assistant", "調べるね。", "我查一下。")
+    assert shown and shown[0][0].translation == "我查一下。"
+
+
+def test_screen_observation_followup_uses_last_user_message_after_progress(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.agent import AgentAction, AgentResult
+    from app.chat_reply import parse_chat_reply
+    import app.pet_window as pet_window_module
+    from app.pet_window import PetWindow
+
+    class MinimalScreenFollowupWindow:
+        _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
+
+    window = MinimalScreenFollowupWindow()
+    history = []
+    window.messages = [
+        {"role": "user", "content": "早上好"},
+        {"role": "assistant", "content": "少し見るね。"},
+    ]
+    window.screen_observation_enabled = True
+    window.model_vision_enabled = True
+    window.autonomous_screen_observation_enabled = True
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._record_history = lambda *args: history.append(args)
+    window._consume_agent_result = lambda _result: None
+    observation = ScreenObservation(
+        data_url="data:image/jpeg;base64,screen",
+        width=640,
+        height=360,
+        captured_at="2026-05-31T12:00:00+08:00",
+        screen_name="DISPLAY1",
+    )
+    monkeypatch.setattr(pet_window_module, "capture_screen_observation", lambda _window: observation)
+
+    queued = window._queue_screen_observation_followup(
+        AgentResult(
+            reply=parse_chat_reply(
+                '{"segments":[{"ja":"見るね。","zh":"我看看。","tone":"中性"}]}'
+            ),
+            actions=[AgentAction(type="screen_observation_request", payload={"reason": "看屏幕"})],
+        )
+    )
+
+    assert queued
+    assert "已自主观察屏幕" in window.messages[0]["content"]
+    assert window.messages[1]["content"] == "少し見るね。"
+    assert window.pending_screen_observation_messages[-1]["role"] == "user"
+    assert isinstance(window.pending_screen_observation_messages[-1]["content"], list)
+    assert len(window.pending_screen_observation_messages) == 1
+    assert history[-1][0] == "system"
+
+
+def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.agent import AgentAction, AgentResult
+    from app.chat_reply import parse_chat_reply
+    import app.pet_window as pet_window_module
+    from app.pet_window import PetWindow
+
+    class MinimalScreenFollowupWindow:
+        _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
+
+    window = MinimalScreenFollowupWindow()
+    window.messages = [
+        {"role": "user", "content": "下午好"},
+        {"role": "assistant", "content": "少し見るね。"},
+    ]
+    window.screen_observation_enabled = True
+    window.model_vision_enabled = True
+    window.autonomous_screen_observation_enabled = True
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._record_history = lambda *_args: None
+    window._consume_agent_result = lambda _result: None
+    observation = ScreenObservation(
+        data_url=f"data:image/jpeg;base64,{'a' * 50000}",
+        width=640,
+        height=360,
+        captured_at="2026-05-31T12:00:00+08:00",
+        screen_name="DISPLAY1",
+    )
+    monkeypatch.setattr(pet_window_module, "capture_screen_observation", lambda _window: observation)
+
+    queued = window._queue_screen_observation_followup(
+        AgentResult(
+            reply=parse_chat_reply(
+                '{"segments":[{"ja":"見るね。","zh":"我看看。","tone":"中性"}]}'
+            ),
+            actions=[AgentAction(type="screen_observation_request", payload={"reason": "看屏幕"})],
+        )
+    )
+
+    assert queued
+    assert len(window.pending_screen_observation_messages) == 1
+    content = window.pending_screen_observation_messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[1]["type"] == "image_url"
 
 
 def _build_minimal_manual_screenshot_window(text: str):

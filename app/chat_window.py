@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.agent import AgentResult, AgentRuntime, MemoryStore, ReminderStore, create_builtin_tool_registry
+from app.agent import AgentProgress, AgentResult, AgentRuntime, MemoryStore, ReminderStore, create_builtin_tool_registry
 from app.api_client import OpenAICompatibleClient
 from app.chat_worker import ChatWorker
 from app.debug_log import debug_log, summarize_messages
@@ -213,6 +213,7 @@ class ChatWindow(QWidget):
         self.worker = ChatWorker(self.agent_runtime, next_messages)
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self._handle_progress_reply)
         self.worker.finished.connect(self._handle_reply)
         self.worker.failed.connect(self._handle_error)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -220,6 +221,25 @@ class ChatWindow(QWidget):
         self.worker_thread.finished.connect(self._cleanup_worker)
         self.worker_thread.start()
         self._log_interaction_stage("chat_worker_started")
+
+    @Slot(object)
+    def _handle_progress_reply(self, progress: AgentProgress) -> None:
+        reply = progress.reply
+        reply_text = reply.text
+        if not reply_text.strip():
+            return
+        self._log_interaction_stage(
+            "agent_progress_received",
+            {
+                "stage": progress.stage,
+                "segments": len(reply.segments),
+                "metadata": progress.metadata,
+            },
+        )
+        self.messages.append({"role": "assistant", "content": reply_text})
+        self._append_message("桜", reply_text)
+        self.assistant_replied.emit(reply_text)
+        self.tts_provider.speak(reply_text, reply.tone)
 
     @Slot(object)
     def _handle_reply(self, result: AgentResult) -> None:

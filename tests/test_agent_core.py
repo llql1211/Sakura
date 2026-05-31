@@ -797,10 +797,18 @@ def test_agent_runtime_can_continue_tool_loop_after_tool_results() -> None:
         system_prompt="你是 Sakura。",
         tools=registry,
     )
+    progress_replies = []
 
-    result = runtime.handle_user_message([{"role": "user", "content": "连续处理这个任务"}])
+    result = runtime.handle_user_message(
+        [{"role": "user", "content": "连续处理这个任务"}],
+        progress_callback=progress_replies.append,
+    )
 
     assert result.reply.translation == "两步都确认好了。"
+    assert [progress.reply.translation for progress in progress_replies] == [
+        "我先确认一下。",
+        "我再看下一步。",
+    ]
     assert [action.payload["tool_name"] for action in result.actions] == ["first_tool", "second_tool"]
     assert len(client.prompts) == 3
     assert not client.final_chat_called
@@ -856,6 +864,87 @@ def test_agent_runtime_stops_tool_loop_at_turn_limit() -> None:
     assert "已跳过" in str(client.chat_messages)
 
 
+def test_agent_runtime_emits_progress_before_pending_confirmation() -> None:
+    class ConfirmToolClient:
+        def complete_raw(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return (
+                '{"reply":{"segments":[{"ja":"開く前に確認するね。","zh":"打开前我先确认一下。","tone":"中性"}]},'
+                '"tool_calls":[{"name":"open_tool","arguments":{"url":"https://example.com"},"reason":"需要打开网页"}]}'
+            )
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="open_tool",
+                description="需要确认的工具",
+                handler=lambda arguments: {"opened": arguments["url"]},
+                requires_confirmation=True,
+                risk="high",
+            )
+        ]
+    )
+    runtime = AgentRuntime(
+        api_client=ConfirmToolClient(),  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+    progress_replies = []
+
+    result = runtime.handle_user_message(
+        [{"role": "user", "content": "打开这个网页"}],
+        progress_callback=progress_replies.append,
+    )
+
+    assert [progress.reply.translation for progress in progress_replies] == ["打开前我先确认一下。"]
+    assert any(action.type == "pending_action" for action in result.actions)
+
+
+def test_agent_runtime_extracts_planner_json_from_mixed_output() -> None:
+    class MixedPlannerClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete_raw(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                return (
+                    "（先说一句自然话，然后错误地贴了工具规划）\n"
+                    "`observe_screen` 获取上下文\n"
+                    '{'
+                    '"reply":{"segments":[{"ja":"少し確認するね。","zh":"我先确认一下。","tone":"中性"}]},'
+                    '"tool_calls":[{"name":"echo_tool","arguments":{"value":"ok"},"reason":"补充上下文"}]'
+                    "}"
+                )
+            return '{"reply":{"segments":[{"ja":"確認できたよ。","zh":"确认好了。","tone":"中性"}]},"tool_calls":[]}'
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="echo_tool",
+                description="回显工具",
+                handler=lambda arguments: {"value": arguments["value"]},
+            )
+        ]
+    )
+    client = MixedPlannerClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+    progress_replies = []
+
+    result = runtime.handle_user_message(
+        [{"role": "user", "content": "下午好"}],
+        progress_callback=progress_replies.append,
+    )
+
+    assert [progress.reply.translation for progress in progress_replies] == ["我先确认一下。"]
+    assert result.reply.translation == "确认好了。"
+    assert "tool_calls" not in result.reply.text
+    assert [action.payload["tool_name"] for action in result.actions] == ["echo_tool"]
+
+
 def test_trim_messages_for_model_keeps_recent_messages_without_mutating_history() -> None:
     messages = [
         {"role": "user", "content": f"message {index}"}
@@ -888,12 +977,17 @@ def test_autonomous_screen_observation_can_request_screen_without_explicit_user_
         tools=ToolRegistry([create_screen_observation_tool()]),
     )
     runtime.set_autonomous_screen_observation_enabled(True)
-    result = runtime.handle_user_message([{"role": "user", "content": "你觉得我现在是不是卡住了？"}])
+    progress_replies = []
+    result = runtime.handle_user_message(
+        [{"role": "user", "content": "你觉得我现在是不是卡住了？"}],
+        progress_callback=progress_replies.append,
+    )
 
     assert "observe_screen" in client.prompts[0]
     assert "主动获取上下文策略" in client.prompts[0]
     assert "用户输入很短、模糊、寒暄、状态化" in client.prompts[0]
     assert "优先调用 observe_screen 获取当前屏幕" in client.prompts[0]
+    assert [progress.reply.translation for progress in progress_replies] == ["我看看。"]
     assert result.actions
     assert result.actions[0].type == SCREEN_OBSERVATION_REQUEST_ACTION
 
@@ -950,6 +1044,52 @@ def test_autonomous_screen_observation_disabled_hides_screen_tool() -> None:
 
     assert OBSERVE_SCREEN_TOOL_NAME not in client.prompts[0]
     assert "当前没有可用的自主屏幕观察工具" in client.prompts[0]
+
+
+def test_screen_observation_tool_hidden_without_user_message() -> None:
+    class PromptCaptureClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete_raw(self, system_prompt, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            self.prompts.append(system_prompt)
+            return '{"reply":{"segments":[{"ja":"うん。","zh":"嗯。","tone":"中性"}]}}'
+
+    client = PromptCaptureClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=ToolRegistry([create_screen_observation_tool()]),
+    )
+    runtime.set_autonomous_screen_observation_enabled(True)
+
+    runtime.handle_user_message([{"role": "assistant", "content": "少し見るね。"}])
+
+    assert OBSERVE_SCREEN_TOOL_NAME not in client.prompts[0]
+
+
+def test_screen_observation_tool_hidden_after_observation_marker() -> None:
+    class PromptCaptureClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete_raw(self, system_prompt, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
+            self.prompts.append(system_prompt)
+            return '{"reply":{"segments":[{"ja":"見たよ。","zh":"我看过了。","tone":"中性"}]}}'
+
+    client = PromptCaptureClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=ToolRegistry([create_screen_observation_tool()]),
+    )
+    runtime.set_autonomous_screen_observation_enabled(True)
+
+    runtime.handle_user_message(
+        [{"role": "user", "content": f"下午好\n{SCREEN_OBSERVATION_HISTORY_MARKER}"}]
+    )
+
+    assert OBSERVE_SCREEN_TOOL_NAME not in client.prompts[0]
 
 
 def test_model_vision_disabled_hides_screen_observation_tool() -> None:

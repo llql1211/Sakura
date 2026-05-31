@@ -17,8 +17,8 @@ SCREEN_OBSERVATION_TRIGGER_KEYWORDS = (
     "看看当前画面",
     "帮我看这个",
 )
-SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已自主观察屏幕，仅用于本轮判断]"
-MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已附加手动框选截图，仅用于本轮判断]"
+SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已自主观察屏幕]"
+MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已附加手动框选截图]"
 SCREEN_OBSERVATION_MAX_EDGE = 1280
 SCREEN_OBSERVATION_JPEG_QUALITY = 70
 
@@ -40,16 +40,24 @@ def should_observe_screen(text: str) -> bool:
     return any(keyword in normalized for keyword in SCREEN_OBSERVATION_TRIGGER_KEYWORDS)
 
 
-def append_observation_marker(text: str, observation: ScreenObservation) -> str:
+def append_observation_marker(
+    text: str,
+    observation: ScreenObservation,
+    visual_id: str | None = None,
+) -> str:
     """给历史记录追加观察标记，避免保存 base64 图片。"""
     _ = observation
-    return f"{text.rstrip()}\n{SCREEN_OBSERVATION_HISTORY_MARKER}"
+    return f"{text.rstrip()}\n{_marker_with_visual_id(SCREEN_OBSERVATION_HISTORY_MARKER, visual_id)}"
 
 
-def append_manual_observation_marker(text: str, observation: ScreenObservation) -> str:
+def append_manual_observation_marker(
+    text: str,
+    observation: ScreenObservation,
+    visual_id: str | None = None,
+) -> str:
     """给手动框选截图追加历史标记，避免保存 base64 图片。"""
     _ = observation
-    return f"{text.rstrip()}\n{MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER}"
+    return f"{text.rstrip()}\n{_marker_with_visual_id(MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER, visual_id)}"
 
 
 def build_screen_observation_user_message(
@@ -154,3 +162,11 @@ def _encode_pixmap_to_data_url(pixmap: QPixmap) -> str:
     image_bytes = bytes(buffer.data())
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
+
+
+def _marker_with_visual_id(marker: str, visual_id: str | None) -> str:
+    if not visual_id:
+        return marker
+    if marker.endswith("]"):
+        return f"{marker[:-1]}，视觉记录 visual_id={visual_id}]"
+    return f"{marker}，视觉记录 visual_id={visual_id}"

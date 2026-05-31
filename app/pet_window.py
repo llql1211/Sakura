@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
 
 from app.agent import (
     AgentEvent,
+    AgentProgress,
     AgentResult,
     AgentRuntime,
     MemoryStore,
@@ -109,6 +110,14 @@ from app.tts import (
     TTSConfigError,
     TTSPreparedAudio,
     TTSProvider,
+)
+from app.visual_observation import (
+    VISUAL_OBSERVATION_RECENT_MINUTES,
+    VisualObservationJob,
+    VisualObservationStore,
+    build_visual_context_message,
+    generate_visual_observation_id,
+    should_inject_visual_context,
 )
 
 
@@ -313,6 +322,7 @@ class PetWindow(QWidget):
         self.tts_provider = tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = self._create_history_store(character_profile)
+        self.visual_observation_store = self._create_visual_observation_store(character_profile)
         self.memory_curation_settings = MemoryCurationSettings.load(self.env_path)
         self.memory_curation_state = MemoryCurationState(
             base_dir / "data" / "memory_curation_state.json"
@@ -358,6 +368,8 @@ class PetWindow(QWidget):
         self.pending_screen_observation_messages: list[dict[str, Any]] | None = None
         self.pending_screen_observation_event: AgentEvent | None = None
         self.pending_screen_observation_event_reminder_id: str | None = None
+        self.pending_visual_observation_jobs: list[VisualObservationJob] = []
+        self.pending_event_visual_observation_jobs: list[VisualObservationJob] = []
         self.screen_observation_followup_in_progress = False
         self.active_reminder_id: str | None = None
         self.active_reminder_text = ""
@@ -1161,14 +1173,30 @@ class PetWindow(QWidget):
         self.set_speech("......")
         self._log_interaction_stage("placeholder_reply_shown")
 
+        visual_observation_jobs: list[VisualObservationJob] = []
         if manual_observation is not None:
+            visual_id = generate_visual_observation_id()
             request_user_message = build_screen_observation_user_message(text, manual_observation)
-            recorded_user_text = append_manual_observation_marker(text, manual_observation)
+            recorded_user_text = append_manual_observation_marker(text, manual_observation, visual_id)
+            visual_observation_jobs.append(
+                VisualObservationJob(
+                    id=visual_id,
+                    source="manual_screenshot",
+                    user_text=text,
+                    observation=manual_observation,
+                )
+            )
         else:
             request_user_message: dict[str, Any] = {"role": "user", "content": text}
             recorded_user_text = text
 
-        request_messages = trim_messages_for_model([*self.messages, request_user_message])
+        request_messages = _add_visual_context_to_messages(
+            [*self.messages, request_user_message],
+            user_text=text,
+            store=getattr(self, "visual_observation_store", None),
+            has_current_image=manual_observation is not None,
+        )
+        request_messages = trim_messages_for_model(request_messages)
         debug_log(
             "PetWindow",
             "用户消息入队",
@@ -1191,10 +1219,17 @@ class PetWindow(QWidget):
         if manual_observation is not None:
             self.pending_manual_screen_observation = None
             self._update_manual_screenshot_button()
+        if visual_observation_jobs:
+            self.pending_visual_observation_jobs = [
+                *getattr(self, "pending_visual_observation_jobs", []),
+                *visual_observation_jobs,
+            ]
         self._log_interaction_stage("user_message_recorded")
         self._start_chat_worker(request_messages)
 
     def _start_chat_worker(self, request_messages: list[dict[str, Any]]) -> None:
+        visual_observation_jobs = getattr(self, "pending_visual_observation_jobs", [])
+        self.pending_visual_observation_jobs = []
         self._set_busy(True)
         self._log_interaction_stage("ui_busy_enabled")
         debug_log(
@@ -1209,9 +1244,12 @@ class PetWindow(QWidget):
         self.worker = ChatWorker(
             self.agent_runtime,
             request_messages,
+            visual_observation_store=getattr(self, "visual_observation_store", None),
+            visual_observation_jobs=visual_observation_jobs,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self._handle_progress_reply)
         self.worker.finished.connect(self._handle_reply)
         self.worker.failed.connect(self._handle_error)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -1219,6 +1257,32 @@ class PetWindow(QWidget):
         self.worker_thread.finished.connect(self._cleanup_worker)
         self.worker_thread.start()
         self._log_interaction_stage("chat_worker_started")
+
+    @Slot(object)
+    def _handle_progress_reply(self, progress: AgentProgress) -> None:
+        reply = progress.reply
+        if not reply.text.strip():
+            return
+        self._log_interaction_stage(
+            "agent_progress_received",
+            {
+                "stage": progress.stage,
+                "segments": len(reply.segments),
+                "metadata": progress.metadata,
+            },
+        )
+        debug_log(
+            "PetWindow",
+            "收到 Agent 中间回复",
+            {
+                "stage": progress.stage,
+                "segments": len(reply.segments),
+                "metadata": progress.metadata,
+            },
+        )
+        self.messages.append({"role": "assistant", "content": reply.text})
+        self._record_history("assistant", reply.text, reply.translation)
+        self._show_reply_segments(reply.segments)
 
     @Slot(object)
     def _handle_reply(self, result: AgentResult) -> None:
@@ -1275,13 +1339,14 @@ class PetWindow(QWidget):
             )
             self._consume_agent_result(_build_screen_observation_disabled_result())
             return True
-        if not self.messages or self.messages[-1].get("role") != "user":
+        user_message_index = _last_user_message_index(self.messages)
+        if user_message_index is None:
             self._log_interaction_stage("screen_observation_missing_user_message")
             debug_log("PetWindow", "屏幕观察缺少可关联用户消息")
             self._consume_agent_result(_build_screen_observation_failed_result("缺少可关联的用户消息。"))
             return True
 
-        text = str(self.messages[-1].get("content", ""))
+        text = str(self.messages[user_message_index].get("content", ""))
         self.screen_observation_followup_in_progress = True
         try:
             observation = capture_screen_observation(self)
@@ -1292,11 +1357,26 @@ class PetWindow(QWidget):
             self._consume_agent_result(_build_screen_observation_failed_result(str(exc)))
             return True
 
+        visual_id = generate_visual_observation_id()
         observed_message = build_screen_observation_user_message(text, observation)
-        self.messages[-1] = {"role": "user", "content": append_observation_marker(text, observation)}
-        self._record_history("system", SCREEN_OBSERVATION_HISTORY_MARKER)
+        self.messages[user_message_index] = {
+            "role": "user",
+            "content": append_observation_marker(text, observation, visual_id),
+        }
+        self._record_history("system", append_observation_marker("", observation, visual_id).strip())
+        self.pending_visual_observation_jobs = [
+            *getattr(self, "pending_visual_observation_jobs", []),
+            VisualObservationJob(
+                id=visual_id,
+                source="autonomous_screen",
+                user_text=text,
+                observation=observation,
+            ),
+        ]
+        # 截图消息包含 base64，必须作为本次 follow-up 的最后一条消息保留。
+        # 中间进度回复已经展示给用户，不再放入这次入模上下文，避免字符裁剪丢掉截图。
         self.pending_screen_observation_messages = trim_messages_for_model(
-            [*self.messages[:-1], observed_message]
+            [*self.messages[:user_message_index], observed_message]
         )
         self.screen_observation_followup_in_progress = False
         debug_log(
@@ -1376,7 +1456,17 @@ class PetWindow(QWidget):
         self.pending_screen_observation_event = AgentEvent(type=event.type, payload=payload)
         self.pending_screen_observation_event_reminder_id = reminder_id
         self.screen_observation_followup_in_progress = False
-        self._record_history("system", SCREEN_OBSERVATION_HISTORY_MARKER)
+        visual_id = generate_visual_observation_id()
+        self.pending_event_visual_observation_jobs = [
+            *getattr(self, "pending_event_visual_observation_jobs", []),
+            VisualObservationJob(
+                id=visual_id,
+                source="autonomous_screen",
+                user_text=reason,
+                observation=observation,
+            ),
+        ]
+        self._record_history("system", append_observation_marker("", observation, visual_id).strip())
         debug_log(
             "PetWindow",
             "主动事件屏幕观察 follow-up 已排队",
@@ -1447,6 +1537,7 @@ class PetWindow(QWidget):
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self._handle_progress_reply)
         self.worker.finished.connect(self._handle_action_reply)
         self.worker.failed.connect(self._handle_error)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -1511,6 +1602,10 @@ class PetWindow(QWidget):
             return
 
         event = self._build_proactive_care_event(now)
+        self.pending_event_visual_observation_jobs = [
+            *getattr(self, "pending_event_visual_observation_jobs", []),
+            *_build_proactive_visual_observation_jobs(event),
+        ]
         self.last_proactive_care_at = now
         self._record_history("system", PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER)
         self._clear_proactive_screen_context_batch("sent")
@@ -1668,8 +1763,12 @@ class PetWindow(QWidget):
             self.agent_runtime,
             event,
         )
+        self.worker.visual_observation_store = getattr(self, "visual_observation_store", None)
+        self.worker.visual_observation_jobs = getattr(self, "pending_event_visual_observation_jobs", [])
+        self.pending_event_visual_observation_jobs = []
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self._handle_progress_reply)
         self.worker.finished.connect(self._handle_event_reply)
         self.worker.failed.connect(self._handle_event_error)
         self.worker.finished.connect(self.worker_thread.quit)
@@ -2519,6 +2618,7 @@ class PetWindow(QWidget):
             self.tray_icon.setIcon(QIcon(self.pixmap) if not self.pixmap.isNull() else QIcon())
 
         self.history_store = self._create_history_store(profile)
+        self.visual_observation_store = self._create_visual_observation_store(profile)
         if self.history_window is not None:
             self.history_window.set_history_store(self.history_store, profile.display_name)
 
@@ -2533,6 +2633,10 @@ class PetWindow(QWidget):
         history_path = self.base_dir / "data" / "chat_history" / f"{profile.id}.jsonl"
         self._migrate_legacy_history(profile, history_path)
         return ChatHistoryStore(history_path, profile.display_name)
+
+    def _create_visual_observation_store(self, profile: CharacterProfile) -> VisualObservationStore:
+        visual_path = self.base_dir / "data" / "visual_observations" / f"{profile.id}.jsonl"
+        return VisualObservationStore(visual_path)
 
     def _migrate_legacy_history(self, profile: CharacterProfile, history_path: Path) -> None:
         if profile.id != DEFAULT_CHARACTER_ID or history_path.exists():
@@ -2581,6 +2685,52 @@ def _first_screen_observation_request(result: AgentResult) -> AgentAction | None
     for action in result.actions:
         if action.type == SCREEN_OBSERVATION_REQUEST_ACTION:
             return action
+    return None
+
+
+def _add_visual_context_to_messages(
+    messages: list[dict[str, Any]],
+    *,
+    user_text: str,
+    store: VisualObservationStore | None,
+    has_current_image: bool,
+) -> list[dict[str, Any]]:
+    if store is None or has_current_image:
+        return messages
+
+    if should_inject_visual_context(user_text):
+        records = store.recent(limit=3)
+    else:
+        records = store.recent(limit=1, since_minutes=VISUAL_OBSERVATION_RECENT_MINUTES)
+    context_message = build_visual_context_message(user_text, records)
+    if context_message is None:
+        return messages
+
+    return [*messages[:-1], context_message, messages[-1]]
+
+
+def _build_proactive_visual_observation_jobs(event: AgentEvent) -> list[VisualObservationJob]:
+    screen_contexts = event.payload.get("screen_contexts")
+    if not isinstance(screen_contexts, list) or not screen_contexts:
+        return []
+    return [
+        VisualObservationJob(
+            id=generate_visual_observation_id(),
+            source="proactive_screen_context",
+            user_text="主动关怀屏幕上下文批次",
+            screen_contexts=[
+                dict(context)
+                for context in screen_contexts
+                if isinstance(context, dict)
+            ],
+        )
+    ]
+
+
+def _last_user_message_index(messages: list[dict[str, Any]]) -> int | None:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            return index
     return None
 
 

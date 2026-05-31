@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
-from app.agent.actions import AgentAction, AgentEvent, AgentResult, PendingToolAction
+from app.agent.actions import AgentAction, AgentEvent, AgentProgress, AgentResult, PendingToolAction
 from app.agent.memory import MemoryStore
 from app.agent.screen_tools import (
     OBSERVE_SCREEN_TOOL_NAME,
@@ -29,12 +29,17 @@ from app.prompt_templates import (
     build_event_reply_protocol,
     build_proactive_rules,
 )
+from app.screen_observation import (
+    MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER,
+    SCREEN_OBSERVATION_HISTORY_MARKER,
+)
 
 
 MAX_AGENT_STEPS_PER_TURN = 4
 MAX_TOOL_CALLS_PER_STEP = 3
 MAX_TOOL_CALLS_PER_TURN = 8
 MAX_TOOL_RESULT_CHARS = 6000
+ProgressCallback = Callable[[AgentProgress], None]
 
 
 class AgentRuntime:
@@ -77,12 +82,17 @@ class AgentRuntime:
         """允许模型在对话或主动事件中自主决定是否观察屏幕。"""
         self.autonomous_screen_observation_enabled = enabled
 
-    def handle_user_message(self, messages: list[ChatMessage]) -> AgentResult:
+    def handle_user_message(
+        self,
+        messages: list[ChatMessage],
+        progress_callback: ProgressCallback | None = None,
+    ) -> AgentResult:
         turn_started_at = time.perf_counter()
         allow_screen_observation = (
             self.model_vision_enabled
             and self.autonomous_screen_observation_enabled
             and not messages_contain_image(messages)
+            and _should_offer_screen_observation(messages)
         )
         debug_log(
             "AgentRuntime",
@@ -100,6 +110,7 @@ class AgentRuntime:
             allow_screen_observation=allow_screen_observation,
             turn_started_at=turn_started_at,
             vision_unsupported_reply=_build_vision_unsupported_reply(),
+            progress_callback=progress_callback,
         )
 
     def _run_tool_loop(
@@ -111,6 +122,7 @@ class AgentRuntime:
         planning_extra_instructions: str = "",
         initial_actions: list[AgentAction] | None = None,
         vision_unsupported_reply: ChatReply | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> AgentResult:
         """执行受限 Agent 循环：规划工具、执行、回填结果，并允许继续规划。"""
         working_messages: list[ChatMessage] = [*messages]
@@ -188,6 +200,16 @@ class AgentRuntime:
                     actions=emitted_actions,
                 )
 
+            _emit_progress(
+                progress_callback,
+                agent_data,
+                stage="tool_planning",
+                metadata={
+                    "step_index": step_index,
+                    "tool_names": [call["name"] for call in tool_calls],
+                    "tool_call_count": len(tool_calls),
+                },
+            )
             step_results: list[ToolExecutionResult] = []
             pending_actions: list[PendingToolAction] = []
             tools_started_at = time.perf_counter()
@@ -346,7 +368,12 @@ class AgentRuntime:
             actions=emitted_actions,
         )
 
-    def handle_confirmed_action(self, action: PendingToolAction) -> AgentResult:
+    def handle_confirmed_action(
+        self,
+        action: PendingToolAction,
+        progress_callback: ProgressCallback | None = None,
+    ) -> AgentResult:
+        _ = progress_callback
         debug_log("AgentRuntime", "执行已确认动作", action.to_dict())
         result = self.tools.execute(action.tool_name, action.arguments)
         try:
@@ -409,7 +436,11 @@ class AgentRuntime:
             ],
         )
 
-    def handle_event(self, event: AgentEvent) -> AgentResult:
+    def handle_event(
+        self,
+        event: AgentEvent,
+        progress_callback: ProgressCallback | None = None,
+    ) -> AgentResult:
         if event.type not in {"reminder_due", "proactive_check"}:
             return AgentResult(reply=parse_chat_reply("未対応のイベントだよ。"))
 
@@ -435,6 +466,7 @@ class AgentRuntime:
                 planning_extra_instructions=_build_proactive_tool_loop_rules(),
                 initial_actions=[event_action],
                 vision_unsupported_reply=_build_proactive_vision_unsupported_reply(),
+                progress_callback=progress_callback,
             )
 
         try:
@@ -479,6 +511,7 @@ class AgentRuntime:
 
 你现在可以作为桌面陪伴型 Agent 判断是否需要调用内部工具。
 如果需要工具，返回 reply 和 tool_calls；如果不需要工具，tool_calls 返回空数组或省略。
+输出必须是单个 JSON object；不要添加 Markdown、代码块、反引号、工具名伪代码或 JSON 外的解释文字。
 
 长期记忆摘要：
 {memory_summary}
@@ -500,6 +533,7 @@ class AgentRuntime:
 {context_strategy}
 
 工具要求：
+- 如果需要调用工具，reply 只写执行前可以直接说给用户听的短句，例如“我先查一下”“我看一下屏幕”；不要提前给最终结论。
 - 如果工具可以帮助完成用户请求，优先用 tool_calls 表达要执行的动作。
 - 不要臆造工具名；只能使用上面列出的工具。
 - requires_confirmation 为 true 的工具只会在用户确认后执行；你仍然可以发起 tool_calls，但必须说明原因。
@@ -551,8 +585,58 @@ def _load_json_object(content: str) -> dict[str, Any] | None:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+        data = None
+    if isinstance(data, dict):
+        return data
+
+    fallback: dict[str, Any] | None = None
+    for candidate in _iter_json_object_candidates(content):
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if fallback is None:
+            fallback = data
+        if _looks_like_agent_payload(data):
+            return data
+    return fallback
+
+
+def _looks_like_agent_payload(data: dict[str, Any]) -> bool:
+    return "reply" in data or "tool_calls" in data
+
+
+def _iter_json_object_candidates(content: str):
+    """从混杂模型输出中抽取可能的 JSON object，避免泄露规划协议到前台。"""
+    text = _strip_code_fence(content.strip())
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            current = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    in_string = False
+                continue
+
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    yield text[start : index + 1]
+                    break
 
 
 def _strip_code_fence(content: str) -> str:
@@ -592,12 +676,67 @@ def _parse_agent_reply(agent_data: dict[str, Any], fallback_content: str) -> Cha
     return parse_chat_reply(fallback_content)
 
 
+def _parse_progress_reply(agent_data: dict[str, Any]) -> ChatReply | None:
+    reply_data = agent_data.get("reply")
+    if not isinstance(reply_data, dict):
+        return None
+    reply = parse_chat_reply(json.dumps(reply_data, ensure_ascii=False))
+    return reply if reply.text.strip() else None
+
+
+def _emit_progress(
+    progress_callback: ProgressCallback | None,
+    agent_data: dict[str, Any],
+    *,
+    stage: str,
+    metadata: dict[str, Any],
+) -> None:
+    if progress_callback is None:
+        return
+    reply = _parse_progress_reply(agent_data)
+    if reply is None:
+        return
+    try:
+        progress_callback(AgentProgress(reply=reply, stage=stage, metadata=metadata))
+    except Exception as exc:
+        debug_log("AgentRuntime", "中间回复回调失败，已忽略", {"error": str(exc), "stage": stage})
+
+
 def _is_screen_observation_request(result: ToolExecutionResult) -> bool:
     if result.tool_name != OBSERVE_SCREEN_TOOL_NAME or not result.success:
         return False
     if not isinstance(result.content, dict):
         return False
     return result.content.get("action") == SCREEN_OBSERVATION_REQUEST_ACTION
+
+
+def _should_offer_screen_observation(messages: list[ChatMessage]) -> bool:
+    """只在当前轮仍有可关联用户消息时开放自主屏幕观察。"""
+    text = _latest_user_text(messages)
+    if text is None:
+        return False
+    return (
+        SCREEN_OBSERVATION_HISTORY_MARKER not in text
+        and MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER not in text
+    )
+
+
+def _latest_user_text(messages: list[ChatMessage]) -> str | None:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            return "\n".join(parts)
+        return ""
+    return None
 
 
 def _build_tool_results_message(
