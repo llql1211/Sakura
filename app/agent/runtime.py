@@ -57,8 +57,8 @@ BROWSER_DOM_TOOL_NAMES = {
     "browser__browser_snapshot",
     "browser__browser_click",
     "browser__browser_type",
-    "browser__browser_scroll",
     "browser__browser_wait_for",
+    "browser__browser_mouse_wheel",
 }
 WEB_BACKGROUND_TOOL_NAMES = {
     "web__web_search",
@@ -646,11 +646,14 @@ class AgentRuntime:
 {context_strategy}
 
 工具要求：
-- 如果需要调用工具，reply 只写执行前可以直接说给用户听的短句，例如“我先查一下”“我看一下屏幕”；不要提前给最终结论。
+- 如果需要调用工具，reply 只写执行前可以直接说给用户听的短句，例如“我打开搜索页”“我看一下结果”；不要提前给最终结论。连续多步工具链里避免每一步都播报，除非卡住、失败或需要用户处理。
 - 如果工具可以帮助完成用户请求，优先用 tool_calls 表达要执行的动作。
 - 不要臆造工具名；只能使用上面列出的工具。
 - requires_confirmation 为 true 的工具只会在用户确认后执行；你仍然可以发起 tool_calls，但必须说明原因。
-- 浏览器内部任务优先使用 browser__ 前缀的 Playwright MCP 工具；先用 browser__browser_snapshot 获取页面结构，再基于真实 target 调用点击、输入、表单、等待等工具。
+- 用户明确要求用浏览器、打开网页、看到搜索过程或网页操作时，必须使用 browser__ 前缀的 Playwright MCP 工具，让用户能看到浏览器页面变化；不要使用后台 web__ 搜索/抓取替代。
+- 浏览器任务优先直达：用户给出完整 URL 时直接 browser__browser_navigate；能构造搜索 URL 或目标页面 URL 时也直接 browser__browser_navigate，不要先打开搜索首页再操作输入框。
+- 只有需要读取当前页面结构、点击链接、填写页面表单、等待页面变化或滚动浏览时，才基于真实页面内容调用 browser__browser_snapshot、browser__browser_click、browser__browser_type、browser__browser_wait_for、browser__browser_mouse_wheel。
+- 用户没有要求浏览器可见过程的轻量资料搜索，可以使用 web__ 前缀工具；搜索摘要不足以回答时，再读取具体网页。
 - 桌面窗口、应用切换、鼠标坐标、快捷键等浏览器外部任务才使用 windows__ 前缀的 Windows-MCP 工具；不要用 windows__Click/Move/Type 操作普通网页内部元素。
 - 对桌面窗口执行点击、移动、输入前，必须先用 windows__Snapshot 或 windows__Screenshot 获取真实窗口状态；优先使用 Snapshot 返回的 UI label/id 作为 Click 参数。
 - 如果 Windows MCP 截图结果显示 Available Displays 有多个显示器，或 Screenshot Original Size 明显大于单屏，禁止直接基于全虚拟桌面截图里的小图标、缩小坐标或标号执行 Click/Move/Type；必须先再次调用 windows__Snapshot / windows__Screenshot 并传入 display=[0]、display=[1] 等限定到目标所在显示器后再选择 label/id。桌面左上角、回收站等桌面图标默认先检查 display=[0]，看不到再检查其他 display。
@@ -659,7 +662,7 @@ class AgentRuntime:
 {screen_observation_rule}
 {browser_page_rule}
 {visible_browser_rule}
-- 如果 browser__ 工具不可用，读取 Sakura 受控浏览器内容时再使用 browser_get_content；需要打开受控浏览器网页时使用 browser_open_url。
+- 如果 browser__ 工具不可用，说明网页自动化能力不可用；不要回退到 Sakura 内置浏览器工具。
 - 需要网页交互时，只能基于当前页面真实内容选择工具，不要臆造 selector、target 或页面内容。
 {extra_instructions.strip()}
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
@@ -815,6 +818,8 @@ def _emit_progress(
 ) -> None:
     if progress_callback is None:
         return
+    if not _should_emit_progress(metadata):
+        return
     reply = _parse_progress_reply(agent_data)
     if reply is None:
         return
@@ -822,6 +827,19 @@ def _emit_progress(
         progress_callback(AgentProgress(reply=reply, stage=stage, metadata=metadata))
     except Exception as exc:
         debug_log("AgentRuntime", "中间回复回调失败，已忽略", {"error": str(exc), "stage": stage})
+
+
+def _should_emit_progress(metadata: dict[str, Any]) -> bool:
+    """只播报关键等待点，避免工具链每一步都打断用户。"""
+    step_index = metadata.get("step_index")
+    if not isinstance(step_index, int):
+        return True
+    if step_index == 0:
+        return True
+    tool_names = metadata.get("tool_names", [])
+    if not isinstance(tool_names, list):
+        return False
+    return any(str(name).startswith("windows__") for name in tool_names)
 
 
 def _is_screen_observation_request(result: ToolExecutionResult) -> bool:
@@ -921,9 +939,10 @@ def _build_browser_page_windows_tool_block_result(call: dict[str, Any]) -> ToolE
             "blocked_tool": tool_name,
             "reason": "当前上下文是浏览器页面内部操作，已阻止 Windows-MCP 坐标/截图工具抢路由。",
             "guidance": (
-                "请先使用 browser__browser_snapshot 获取页面结构，"
-                "再基于真实 target 调用 browser__browser_click、"
-                "browser__browser_type、browser__browser_wait_for 等 Playwright/browser MCP 工具。"
+                "请使用 browser__browser_navigate 直达目标或搜索 URL；"
+                "需要页面结构后，再基于真实 target 调用 browser__browser_snapshot、"
+                "browser__browser_click、browser__browser_type、browser__browser_wait_for、"
+                "browser__browser_mouse_wheel 等 Playwright/browser MCP 工具。"
             ),
         },
         error=f"已阻止 {tool_name}：浏览器页面内部操作应优先使用 browser__ 工具。",
@@ -939,9 +958,10 @@ def _build_visible_browser_web_tool_block_result(call: dict[str, Any]) -> ToolEx
             "blocked_tool": tool_name,
             "reason": "用户明确要求打开浏览器或看到搜索过程，已阻止后台网页搜索/抓取工具。",
             "guidance": (
-                "请使用 browser__browser_navigate 打开搜索引擎或目标网址，"
-                "再用 browser__browser_snapshot 获取页面结构，并用 browser__browser_type、"
-                "browser__browser_click、browser__browser_wait_for 等工具完成可见浏览器流程。"
+                "请优先用 browser__browser_navigate 直接打开目标 URL 或搜索结果 URL，"
+                "再按需用 browser__browser_snapshot、browser__browser_click、"
+                "browser__browser_type、browser__browser_wait_for、browser__browser_mouse_wheel "
+                "完成可见浏览器流程。"
             ),
         },
         error=f"已阻止 {tool_name}：显式浏览器任务应使用 browser__ 工具，不要只做后台搜索。",
@@ -1057,7 +1077,8 @@ def _build_browser_page_mode_rule(browser_page_mode: bool) -> str:
         return ""
     return (
         "- 当前上下文已识别为浏览器页面内部操作模式：Windows-MCP 坐标、截图、输入、滚动工具已从可用工具中隐藏。"
-        "继续点击链接、输入搜索词、滚动页面或等待页面变化时，必须使用 browser__ 前缀的 Playwright MCP 工具。"
+        "能直达 URL 时先用 browser__browser_navigate；继续点击链接、输入搜索词、滚动页面或等待页面变化时，"
+        "必须使用 browser__ 前缀的 Playwright MCP 工具。"
     )
 
 
@@ -1066,7 +1087,8 @@ def _build_visible_browser_mode_rule(visible_browser_mode: bool) -> str:
         return ""
     return (
         "- 用户明确要求打开浏览器或看到搜索过程：后台 web__ 搜索/抓取工具已从可用工具中隐藏。"
-        "必须使用 browser__browser_navigate/type/click/snapshot/wait_for 等工具完成可见浏览器搜索流程。"
+        "必须优先用 browser__browser_navigate 直达目标 URL 或搜索结果 URL；需要交互时再用 "
+        "browser__browser_snapshot/type/click/wait_for/mouse_wheel 等工具完成可见浏览器流程。"
     )
 
 
@@ -1436,14 +1458,6 @@ def _build_pending_action_reply(actions: list[PendingToolAction]) -> ChatReply:
 def _describe_pending_action(action: PendingToolAction) -> str:
     if action.tool_name == "open_url":
         return f"打开网页 {action.arguments.get('url', '')}"
-    if action.tool_name == "browser_open_url":
-        return f"在受控浏览器中打开网页 {action.arguments.get('url', '')}"
-    if action.tool_name == "browser_scroll":
-        direction = action.arguments.get("direction", "")
-        amount = action.arguments.get("amount", "")
-        return f"滚动受控浏览器页面 {direction} {amount}"
-    if action.tool_name == "browser_click":
-        return f"点击受控浏览器页面元素 {action.arguments.get('selector', '')}"
     if action.tool_name == "open_local_folder":
         return f"打开文件夹 {action.arguments.get('path', '')}"
     if action.tool_name.startswith("browser__"):
@@ -1551,21 +1565,6 @@ def _summarize_tool_results(results: list[ToolExecutionResult]) -> str:
                 parts.append(f"记忆「{memory.get('content', '')}」已更新。")
             elif result.tool_name == "open_url":
                 parts.append(f"网页已打开：{result.content.get('url', '')}。")
-            elif result.tool_name == "browser_open_url":
-                parts.append(f"受控浏览器已打开：{result.content.get('url', '')}。")
-            elif result.tool_name == "browser_get_content":
-                title = result.content.get("title", "")
-                text = result.content.get("text", "")
-                parts.append(f"网页内容已读取：{title}。{str(text)[:120]}")
-            elif result.tool_name == "browser_scroll":
-                parts.append(f"页面已滚动到 Y={result.content.get('scroll_y', '')}。")
-            elif result.tool_name == "browser_click":
-                parts.append(f"页面元素已点击：{result.content.get('selector', '')}。")
-            elif result.tool_name == "browser_get_state":
-                parts.append(
-                    f"当前网页：{result.content.get('title', '')}，"
-                    f"滚动位置 Y={result.content.get('scroll_y', '')}。"
-                )
             elif result.tool_name == "open_local_folder":
                 parts.append(f"文件夹已打开：{result.content.get('path', '')}。")
             elif result.tool_name == "read_note":

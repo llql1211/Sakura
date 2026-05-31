@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.agent.memory import MEMORY_CATEGORIES, MemoryStore
+from app.agent.mcp import MCPRuntimeSettings
 from app.api_client import ApiSettings, OpenAICompatibleClient
 from app.character_loader import CharacterProfile, CharacterRegistry
 from app.proactive_care import (
@@ -71,6 +72,7 @@ class SettingsDialog(QDialog):
         character_registry: CharacterRegistry | None = None,
         current_character: CharacterProfile | None = None,
         proactive_care_settings: ProactiveCareSettings | None = None,
+        mcp_settings: MCPRuntimeSettings | None = None,
         memory_store: MemoryStore | None = None,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
@@ -85,6 +87,7 @@ class SettingsDialog(QDialog):
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
         self.result_character_id: str | None = None
         self.result_proactive_care_settings: ProactiveCareSettings | None = None
+        self.result_mcp_settings: MCPRuntimeSettings | None = None
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
 
@@ -102,6 +105,7 @@ class SettingsDialog(QDialog):
             ),
             "隐私",
         )
+        tabs.addTab(self._build_mcp_tab(mcp_settings or MCPRuntimeSettings()), "工具")
         if memory_store is not None:
             tabs.addTab(self._build_memory_tab(memory_store), "记忆")
 
@@ -294,6 +298,26 @@ class SettingsDialog(QDialog):
         form_layout.addRow("主动检查间隔", self.proactive_check_interval_spin)
         form_layout.addRow("主动打扰冷却", self.proactive_cooldown_spin)
         form_layout.addRow("单次最多发送截图", self.proactive_batch_limit_spin)
+        tab.setLayout(form_layout)
+        return tab
+
+    def _build_mcp_tab(self, settings: MCPRuntimeSettings) -> QWidget:
+        tab = QWidget(self)
+        self.windows_mcp_enabled_check = QCheckBox("启用 Windows MCP 桌面控制（高级）", tab)
+        self.windows_mcp_enabled_check.setChecked(settings.windows_enabled)
+
+        restart_hint = QLabel(
+            "保存后需要重启 Sakura 才会加载或卸载 Windows MCP 工具。",
+            tab,
+        )
+        restart_hint.setWordWrap(True)
+        restart_hint.setStyleSheet("color: #6a7f86;")
+
+        form_layout = QFormLayout()
+        form_layout.setContentsMargins(16, 18, 16, 16)
+        form_layout.setSpacing(12)
+        form_layout.addRow("", self.windows_mcp_enabled_check)
+        form_layout.addRow("生效方式", restart_hint)
         tab.setLayout(form_layout)
         return tab
 
@@ -524,6 +548,9 @@ class SettingsDialog(QDialog):
             check_interval_minutes=self.proactive_check_interval_spin.value(),
             cooldown_minutes=self.proactive_cooldown_spin.value(),
             screen_context_batch_limit=self.proactive_batch_limit_spin.value(),
+        )
+        self.result_mcp_settings = MCPRuntimeSettings(
+            windows_enabled=self.windows_mcp_enabled_check.isChecked(),
         )
         super().accept()
 

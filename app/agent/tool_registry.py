@@ -116,7 +116,7 @@ class ToolRegistry:
         )
         if tool is None or not tool.requires_confirmation:
             return self.execute(name, arguments)
-        if self.free_access_enabled and not _requires_confirmation_despite_free_access(tool):
+        if self.free_access_enabled and _can_execute_with_free_access(tool):
             debug_log("ToolRegistry", "自由访问模式直接执行确认工具", {"name": name})
             return self.execute(name, arguments)
         if not isinstance(arguments, dict):
@@ -197,8 +197,27 @@ class ToolRegistry:
         return result
 
 
+def _can_execute_with_free_access(tool: Tool) -> bool:
+    """识别完整访问权限下可直接执行的确认工具。"""
+    if _is_browser_free_access_tool(tool.name):
+        return True
+    return not _requires_confirmation_despite_free_access(tool)
+
+
+def _is_browser_free_access_tool(name: str) -> bool:
+    """浏览器 MCP 的常规前台操作在完整访问权限下可直接执行。"""
+    return name in {
+        "browser__browser_navigate",
+        "browser__browser_snapshot",
+        "browser__browser_click",
+        "browser__browser_type",
+        "browser__browser_wait_for",
+        "browser__browser_mouse_wheel",
+    }
+
+
 def _requires_confirmation_despite_free_access(tool: Tool) -> bool:
-    """识别自由访问模式也不能直接执行的高风险工具。"""
+    """识别完整访问权限也不能直接执行的高风险工具。"""
     if tool.risk == "high":
         return True
     if tool.confirmation_risk in {"delete_file", "file_delete", "destructive_file"}:

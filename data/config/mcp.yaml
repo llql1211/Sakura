@@ -24,17 +24,11 @@ servers:
     requires_confirmation: true
     include_tools:
       - browser_navigate
-      - browser_navigate_back
       - browser_snapshot
       - browser_click
       - browser_type
-      - browser_fill_form
-      - browser_select_option
-      - browser_hover
-      - browser_press_key
       - browser_wait_for
-      - browser_tabs
-      - browser_close
+      - browser_mouse_wheel
     exclude_tools:
       - browser_take_screenshot
       - browser_file_upload
@@ -49,6 +43,7 @@ servers:
         risk: medium
         requires_confirmation: false
   windows:
+    enabled: false
     transport: stdio
     command: "{uv}"
     args:
@@ -58,11 +53,11 @@ servers:
       - "windows-mcp"
       - "serve"
       - "--tools"
-      - "App,Snapshot,Screenshot,Click,Type,Scroll,Move,Shortcut,Wait"
+      - "App,Snapshot,Screenshot,Click,Type,Wait"
     env:
       ANONYMIZED_TELEMETRY: "false"
-      WINDOWS_MCP_TOOLS: "App,Snapshot,Screenshot,Click,Type,Scroll,Move,Shortcut,Wait"
-      WINDOWS_MCP_EXCLUDE_TOOLS: "PowerShell,Registry,Process,FileSystem,Clipboard,Scrape,MultiSelect,MultiEdit,Notification"
+      WINDOWS_MCP_TOOLS: "App,Snapshot,Screenshot,Click,Type,Wait"
+      WINDOWS_MCP_EXCLUDE_TOOLS: "PowerShell,Registry,Process,FileSystem,Clipboard,Scrape,MultiSelect,MultiEdit,Notification,Scroll,Move,Shortcut"
     name_prefix: windows__
     call_timeout: 30
     risk: high
@@ -73,9 +68,6 @@ servers:
       - Screenshot
       - Click
       - Type
-      - Scroll
-      - Move
-      - Shortcut
       - Wait
     exclude_tools:
       - PowerShell
@@ -87,6 +79,9 @@ servers:
       - MultiSelect
       - MultiEdit
       - Notification
+      - Scroll
+      - Move
+      - Shortcut
     tool_policies:
       Snapshot:
         risk: medium

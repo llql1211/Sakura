@@ -7,6 +7,7 @@ import uuid
 
 import pytest
 
+from app.agent.mcp import MCPRuntimeSettings
 from app.api_client import ApiSettings
 from app.chat_reply import ChatSegment
 from app.portrait_utils import portrait_kind_key, should_crossfade_portrait
@@ -126,6 +127,41 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
 
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_exposes_windows_mcp_restart_setting() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    labels = [label.text() for label in dialog.findChildren(qtwidgets.QLabel)]
+
+    assert not dialog.windows_mcp_enabled_check.isChecked()
+    assert any("重启 Sakura" in text for text in labels)
+
+    dialog.windows_mcp_enabled_check.setChecked(True)
+    dialog.accept()
+
+    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=True)
     dialog.deleteLater()
     app.processEvents()
 
@@ -299,7 +335,7 @@ def test_proactive_care_disabled_does_not_capture_or_send(monkeypatch) -> None: 
     assert window.proactive_screen_contexts == []
 
 
-def test_user_activity_clears_pending_proactive_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_user_activity_keeps_pending_proactive_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.pet_window as pet_window_module
 
     window = _build_minimal_proactive_window(
@@ -316,10 +352,37 @@ def test_user_activity_clears_pending_proactive_screenshot_batch(monkeypatch) ->
     window._mark_user_activity()
 
     assert window.last_user_activity_at == 300.0
-    assert window.proactive_screen_contexts == []
-    assert window.proactive_screen_context_batch_started_at is None
-    assert window.last_proactive_screen_context_at is None
-    assert window.proactive_screen_context_dropped_count == 0
+    assert window.proactive_screen_contexts == [{"data_url": "data:image/jpeg;base64,old"}]
+    assert window.proactive_screen_context_batch_started_at == 60
+    assert window.last_proactive_screen_context_at == 60
+    assert window.proactive_screen_context_dropped_count == 2
+
+
+def test_send_message_clears_pending_proactive_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.pet_window as pet_window_module
+
+    window = _build_minimal_manual_screenshot_window("发送这条")
+    minimal_window, requests, _history = window
+    minimal_window.pending_manual_screen_observation = None
+    minimal_window.proactive_screen_contexts = [{"data_url": "data:image/jpeg;base64,old"}]
+    minimal_window.proactive_screen_context_batch_started_at = 60
+    minimal_window.last_proactive_screen_context_at = 60
+    minimal_window.proactive_screen_context_dropped_count = 2
+    minimal_window._clear_proactive_screen_context_batch = (
+        pet_window_module.PetWindow._clear_proactive_screen_context_batch.__get__(
+            minimal_window,
+            type(minimal_window),
+        )
+    )
+    monkeypatch.setattr(pet_window_module.time, "perf_counter", lambda: 300.0)
+
+    minimal_window.send_message("test")
+
+    assert len(requests) == 1
+    assert minimal_window.proactive_screen_contexts == []
+    assert minimal_window.proactive_screen_context_batch_started_at is None
+    assert minimal_window.last_proactive_screen_context_at is None
+    assert minimal_window.proactive_screen_context_dropped_count == 0
 
 
 class _DummyTextInput:
@@ -470,6 +533,9 @@ def test_progress_reply_displays_and_records_assistant_message() -> None:
     window.messages = [{"role": "user", "content": "查一下"}]
     window._log_interaction_stage = lambda *_args, **_kwargs: None
     window._record_history = lambda *args: history.append(args)
+    window._record_assistant_reply_history = (
+        PetWindow._record_assistant_reply_history.__get__(window, type(window))
+    )
     window._show_reply_segments = lambda segments: shown.append(segments)
 
     window._handle_progress_reply(
@@ -483,6 +549,42 @@ def test_progress_reply_displays_and_records_assistant_message() -> None:
     assert window.messages[-1] == {"role": "assistant", "content": "調べるね。"}
     assert history[-1] == ("assistant", "調べるね。", "我查一下。")
     assert shown and shown[0][0].translation == "我查一下。"
+
+
+def test_progress_reply_records_segments_as_separate_history_entries() -> None:
+    from app.agent import AgentProgress
+    from app.chat_reply import parse_chat_reply
+    from app.pet_window import PetWindow
+
+    class MinimalProgressWindow:
+        _handle_progress_reply = PetWindow._handle_progress_reply
+        _record_assistant_reply_history = PetWindow._record_assistant_reply_history
+
+    window = MinimalProgressWindow()
+    history = []
+    shown = []
+    window.messages = [{"role": "user", "content": "查一下"}]
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._record_history = lambda *args: history.append(args)
+    window._show_reply_segments = lambda segments: shown.append(segments)
+
+    window._handle_progress_reply(
+        AgentProgress(
+            reply=parse_chat_reply(
+                '{"segments":['
+                '{"ja":"一つ目。","zh":"第一段。","tone":"中性"},'
+                '{"ja":"二つ目。","zh":"第二段。","tone":"中性"}'
+                "]}"
+            )
+        )
+    )
+
+    assert window.messages[-1] == {"role": "assistant", "content": "一つ目。\n二つ目。"}
+    assert history == [
+        ("assistant", "一つ目。", "第一段。"),
+        ("assistant", "二つ目。", "第二段。"),
+    ]
+    assert shown and len(shown[0]) == 2
 
 
 def test_screen_observation_followup_uses_last_user_message_after_progress(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -610,6 +712,7 @@ def _build_minimal_manual_screenshot_window(text: str):
     window._reset_current_segment_progress = lambda: None
     window.set_speech = lambda _text: None
     window._record_history = lambda *args: history.append(args)
+    window._clear_proactive_screen_context_batch = lambda _reason: None
     window._start_chat_worker = lambda request_messages: requests.append(request_messages)
     window._update_manual_screenshot_button = lambda: None
     window._clear_manual_screen_observation = lambda: setattr(

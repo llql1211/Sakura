@@ -68,10 +68,9 @@ from app.agent.memory_curator import (
     MemoryCurationSettings,
     MemoryCurationState,
 )
-from app.agent.mcp import MCPToolProvider, register_mcp_tools_from_config
+from app.agent.mcp import MCPRuntimeSettings, MCPToolProvider, register_mcp_tools_from_config
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.api_client import OpenAICompatibleClient
-from app.browser_controller import BrowserController, BrowserToolBridge
 from app.character_loader import (
     DEFAULT_CHARACTER_ID,
     CharacterConfigError,
@@ -299,13 +298,10 @@ class PetWindow(QWidget):
         self.system_prompt = load_character_system_prompt(character_profile)
         self.memory_store = MemoryStore(base_dir / "data" / "memory.json")
         self.reminder_store = ReminderStore(base_dir / "data" / "reminders.json")
-        self.browser_controller = BrowserController(self)
-        self.browser_tool_bridge = BrowserToolBridge(self.browser_controller, self)
         self.tool_registry = create_builtin_tool_registry(
             base_dir,
             self.memory_store,
             self.reminder_store,
-            browser_executor=self.browser_tool_bridge,
         )
         self.mcp_tool_provider: MCPToolProvider | None = register_mcp_tools_from_config(
             base_dir,
@@ -323,6 +319,7 @@ class PetWindow(QWidget):
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = self._create_history_store(character_profile)
         self.visual_observation_store = self._create_visual_observation_store(character_profile)
+        self.mcp_settings = MCPRuntimeSettings.load(self.env_path)
         self.memory_curation_settings = MemoryCurationSettings.load(self.env_path)
         self.memory_curation_state = MemoryCurationState(
             base_dir / "data" / "memory_curation_state.json"
@@ -408,6 +405,7 @@ class PetWindow(QWidget):
                 "character_name": character_profile.display_name,
                 "tool_count": len(self.tool_registry.all()),
                 "mcp_enabled": self.mcp_tool_provider is not None,
+                "windows_mcp_enabled": self.mcp_settings.windows_enabled,
                 "tts_provider": type(tts_provider).__name__,
                 "subtitle_language": self.subtitle_language,
                 "screen_observation_enabled": self.screen_observation_enabled,
@@ -998,7 +996,6 @@ class PetWindow(QWidget):
 
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
-        self._clear_proactive_screen_context_batch("user_activity")
 
     @Slot()
     def _handle_return_pressed(self) -> None:
@@ -1218,6 +1215,7 @@ class PetWindow(QWidget):
             },
         )
         self._record_user_message(recorded_user_text)
+        self._clear_proactive_screen_context_batch("sent_user_message")
         if manual_observation is not None:
             self.pending_manual_screen_observation = None
             self._update_manual_screenshot_button()
@@ -1283,7 +1281,7 @@ class PetWindow(QWidget):
             },
         )
         self.messages.append({"role": "assistant", "content": reply.text})
-        self._record_history("assistant", reply.text, reply.translation)
+        self._record_assistant_reply_history(reply)
         self._show_reply_segments(reply.segments)
 
     @Slot(object)
@@ -1308,7 +1306,7 @@ class PetWindow(QWidget):
             return
         reply = result.reply
         self.messages.append({"role": "assistant", "content": reply.text})
-        self._record_history("assistant", reply.text, reply.translation)
+        self._record_assistant_reply_history(reply)
         self._record_completed_memory_turn()
         self._log_interaction_stage("assistant_message_recorded")
         self._show_reply_segments(reply.segments)
@@ -1572,7 +1570,7 @@ class PetWindow(QWidget):
         )
         if record_history:
             self.messages.append({"role": "assistant", "content": reply.text})
-            self._record_history("assistant", reply.text, reply.translation)
+            self._record_assistant_reply_history(reply)
         self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
 
@@ -2178,6 +2176,7 @@ class PetWindow(QWidget):
             self.character_registry,
             self.character_profile,
             self.proactive_care_settings,
+            self.mcp_settings,
             self.memory_store,
             self,
         )
@@ -2187,6 +2186,7 @@ class PetWindow(QWidget):
             or dialog.result_tts_settings is None
             or dialog.result_character_id is None
             or dialog.result_proactive_care_settings is None
+            or dialog.result_mcp_settings is None
         ):
             return
 
@@ -2205,12 +2205,15 @@ class PetWindow(QWidget):
             dialog.result_tts_settings.save(self.env_path, self.base_dir)
             self.character_registry.save_current_id(self.env_path, selected_profile.id)
             dialog.result_proactive_care_settings.save(self.env_path)
+            dialog.result_mcp_settings.save(self.env_path)
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
             return
 
         self.api_client.update_settings(dialog.result_api_settings)
         self.proactive_care_settings = dialog.result_proactive_care_settings
+        mcp_restart_required = dialog.result_mcp_settings != self.mcp_settings
+        self.mcp_settings = dialog.result_mcp_settings
         self._sync_proactive_care_timer()
         self._discard_prepared_next_tts()
         self.retired_tts_providers.append(self.tts_provider)
@@ -2218,7 +2221,10 @@ class PetWindow(QWidget):
         self._apply_character(selected_profile)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
-        QMessageBox.information(self, "保存成功", "设置已保存，后续聊天和朗读将使用新配置。")
+        message = "设置已保存，后续聊天和朗读将使用新配置。"
+        if mcp_restart_required:
+            message += "\n\nWindows MCP 开关需要重启 Sakura 后才会生效。"
+        QMessageBox.information(self, "保存成功", message)
 
     @Slot(bool)
     def _toggle_chinese_subtitles(self, checked: bool) -> None:
@@ -2339,6 +2345,13 @@ class PetWindow(QWidget):
                     "error": str(exc),
                 },
             )
+
+    def _record_assistant_reply_history(self, reply: ChatReply) -> None:
+        clean_segments = [segment for segment in reply.segments if segment.text.strip()]
+        if not clean_segments:
+            return
+        for segment in clean_segments:
+            self._record_history("assistant", segment.text, segment.translation)
 
     @Slot()
     def _check_due_reminders(self) -> None:

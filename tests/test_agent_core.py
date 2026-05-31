@@ -13,6 +13,7 @@ from app.agent.memory import MemoryStore
 from app.agent.mcp.bridge import MCPToolSpec
 from app.agent.mcp.config import load_mcp_config
 from app.agent.mcp.provider import MCPToolProvider, register_mcp_tools_from_config
+from app.agent.mcp.settings import MCPRuntimeSettings, apply_mcp_runtime_settings
 from app.agent.reminders import ReminderStore
 from app.agent.runtime import AgentRuntime, _build_event_messages, _build_tool_results_message
 from app.agent.runtime import _redact_event_for_model, _redact_tool_result_for_model
@@ -385,6 +386,39 @@ def test_tool_registry_free_access_keeps_high_risk_confirmation() -> None:
     assert result.tool_name == "run_external_action"
 
 
+def test_tool_registry_free_access_allows_browser_mcp_actions() -> None:
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="browser__browser_navigate",
+                description="打开可见浏览器页面",
+                handler=lambda arguments: {"url": arguments["url"]},
+                requires_confirmation=True,
+                risk="high",
+            ),
+            Tool(
+                name="browser__browser_evaluate",
+                description="执行页面脚本",
+                handler=lambda _arguments: {"done": True},
+                requires_confirmation=True,
+                risk="high",
+            ),
+        ]
+    )
+    registry.set_free_access_enabled(True)
+
+    navigate_result = registry.prepare_or_execute(
+        "browser__browser_navigate",
+        {"url": "https://example.com"},
+    )
+    evaluate_result = registry.prepare_or_execute("browser__browser_evaluate", {})
+
+    assert not isinstance(navigate_result, PendingToolAction)
+    assert navigate_result.success
+    assert isinstance(evaluate_result, PendingToolAction)
+    assert evaluate_result.tool_name == "browser__browser_evaluate"
+
+
 def test_tool_registry_describes_group_and_risk_metadata() -> None:
     registry = ToolRegistry(
         [
@@ -576,6 +610,84 @@ servers:
     provider.close()
 
 
+def test_mcp_provider_skips_disabled_server() -> None:
+    root = _runtime_root_path("mcp_disabled_server")
+    registry = ToolRegistry()
+    provider = MCPToolProvider(
+        load_mcp_config(_write_mcp_config(root, "enabled: false\nname_prefix: demo_")),
+        bridge_factory=_FakeMCPBridge,
+    )
+
+    registered = provider.register_tools(registry)
+
+    assert registered == 0
+    assert registry.describe_tools() == []
+    provider.close()
+
+
+def test_mcp_runtime_settings_enable_windows_server_override() -> None:
+    config_path = _runtime_root_path("mcp_runtime_override") / "mcp.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        """
+enabled: true
+servers:
+  windows:
+    enabled: false
+    transport: stdio
+    command: python
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = apply_mcp_runtime_settings(
+        load_mcp_config(config_path),
+        MCPRuntimeSettings(windows_enabled=True),
+    )
+
+    assert config.servers[0].name == "windows"
+    assert config.servers[0].enabled
+
+
+def test_mcp_runtime_settings_save_and_load_windows_enabled() -> None:
+    env_path = _runtime_root_path("mcp_runtime_save") / ".env"
+
+    MCPRuntimeSettings(windows_enabled=True).save(env_path)
+
+    assert "WINDOWS_MCP_ENABLED=true" in env_path.read_text(encoding="utf-8")
+    assert MCPRuntimeSettings.load(env_path).windows_enabled
+
+
+def test_register_mcp_tools_uses_env_windows_mcp_override() -> None:
+    root = _runtime_root_path("mcp_register_windows_override")
+    config_dir = root / "data" / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "mcp.yaml").write_text(
+        """
+enabled: true
+servers:
+  windows:
+    enabled: false
+    transport: stdio
+    command: python
+    name_prefix: windows__
+""".strip(),
+        encoding="utf-8",
+    )
+    (root / ".env").write_text("WINDOWS_MCP_ENABLED=true\n", encoding="utf-8")
+    registry = ToolRegistry()
+
+    provider = register_mcp_tools_from_config(
+        root,
+        registry,
+        bridge_factory=_FakeMCPBridge,
+    )
+
+    assert provider is not None
+    assert registry.get("windows__echo") is not None
+    provider.close()
+
+
 def test_mcp_provider_filters_tools_and_applies_tool_policies() -> None:
     root = _runtime_root_path("mcp_tool_policy_register")
     registry = ToolRegistry()
@@ -661,7 +773,7 @@ def test_mcp_high_risk_still_requires_confirmation_with_free_access() -> None:
     provider.close()
 
 
-def test_builtin_registry_includes_browser_tools() -> None:
+def test_builtin_registry_excludes_internal_browser_tools() -> None:
     registry = create_builtin_tool_registry(Path(__file__).resolve().parents[1])
 
     names = {tool["name"] for tool in registry.describe_tools()}
@@ -672,80 +784,24 @@ def test_builtin_registry_includes_browser_tools() -> None:
         "browser_scroll",
         "browser_click",
         "browser_get_state",
-    }.issubset(names)
+    }.isdisjoint(names)
     assert OBSERVE_SCREEN_TOOL_NAME in names
+    assert "open_url" in names
 
 
-def test_browser_open_url_rejects_non_http_url() -> None:
+def test_open_url_stays_confirmation_required() -> None:
     registry = create_builtin_tool_registry(Path(__file__).resolve().parents[1])
-
-    result = registry.execute("browser_open_url", {"url": "file:///C:/secret.txt"})
-
-    assert not result.success
-    assert "URL 只支持" in result.error
-
-
-def test_browser_confirmation_tools_return_pending_actions() -> None:
-    registry = create_builtin_tool_registry(
-        Path(__file__).resolve().parents[1],
-        browser_executor=_FakeBrowserExecutor(),
-    )
     registry.set_free_access_enabled(False)
 
-    open_result = registry.prepare_or_execute("browser_open_url", {"url": "https://example.com"})
-    scroll_result = registry.prepare_or_execute("browser_scroll", {"direction": "down"})
-    click_result = registry.prepare_or_execute("browser_click", {"selector": "button"})
+    result = registry.prepare_or_execute("open_url", {"url": "https://example.com"})
 
-    assert isinstance(open_result, PendingToolAction)
-    assert isinstance(scroll_result, PendingToolAction)
-    assert isinstance(click_result, PendingToolAction)
-
-
-def test_browser_confirmation_tools_obey_free_access() -> None:
-    registry = create_builtin_tool_registry(
-        Path(__file__).resolve().parents[1],
-        browser_executor=_FakeBrowserExecutor(),
-    )
-    registry.set_free_access_enabled(True)
-
-    result = registry.prepare_or_execute("browser_scroll", {"direction": "down", "amount": 1200})
-
-    assert not isinstance(result, PendingToolAction)
-    assert result.success
-    assert result.content["scroll_y"] == 1200
-
-
-def test_browser_get_content_truncates_text_and_links() -> None:
-    registry = create_builtin_tool_registry(
-        Path(__file__).resolve().parents[1],
-        browser_executor=_FakeBrowserExecutor(),
-    )
-
-    result = registry.execute("browser_get_content", {"max_chars": 5})
-
-    assert result.success
-    assert result.content["text"] == "abcde"
-    assert len(result.content["links"]) == 20
-
-
-def test_browser_tools_validate_arguments() -> None:
-    registry = create_builtin_tool_registry(
-        Path(__file__).resolve().parents[1],
-        browser_executor=_FakeBrowserExecutor(),
-    )
-
-    bad_direction = registry.execute("browser_scroll", {"direction": "sideways"})
-    bad_selector = registry.execute("browser_click", {"selector": ""})
-
-    assert not bad_direction.success
-    assert "direction 只支持" in bad_direction.error
-    assert not bad_selector.success
-    assert "缺少必填参数" in bad_selector.error
+    assert isinstance(result, PendingToolAction)
+    assert result.tool_name == "open_url"
 
 
 def test_browser_screenshot_fallback_is_attached_as_image_url() -> None:
     result = ToolExecutionResult(
-        tool_name="browser_get_content",
+        tool_name="browser__browser_snapshot",
         success=True,
         content={
             "url": "https://example.com",
@@ -773,7 +829,7 @@ def test_browser_screenshot_fallback_is_attached_as_image_url() -> None:
 
 def test_browser_screenshot_fallback_is_not_attached_without_vision() -> None:
     result = ToolExecutionResult(
-        tool_name="browser_get_content",
+        tool_name="browser__browser_snapshot",
         success=True,
         content={
             "url": "https://example.com",
@@ -792,7 +848,7 @@ def test_browser_screenshot_fallback_is_not_attached_without_vision() -> None:
 
 def test_tool_result_for_model_truncates_large_content() -> None:
     result = ToolExecutionResult(
-        tool_name="browser_get_content",
+        tool_name="browser__browser_snapshot",
         success=True,
         content={
             "url": "https://example.com",
@@ -874,10 +930,7 @@ def test_agent_runtime_can_continue_tool_loop_after_tool_results() -> None:
     )
 
     assert result.reply.translation == "两步都确认好了。"
-    assert [progress.reply.translation for progress in progress_replies] == [
-        "我先确认一下。",
-        "我再看下一步。",
-    ]
+    assert [progress.reply.translation for progress in progress_replies] == ["我先确认一下。"]
     assert [action.payload["tool_name"] for action in result.actions] == ["first_tool", "second_tool"]
     assert len(client.prompts) == 3
     assert not client.final_chat_called
@@ -1031,6 +1084,7 @@ def test_visible_browser_request_hides_background_web_tools_from_planner() -> No
             Tool(name="browser__browser_navigate", description="打开浏览器页面", handler=lambda _arguments: {}),
             Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=lambda _arguments: {}),
             Tool(name="browser__browser_type", description="浏览器输入", handler=lambda _arguments: {}),
+            Tool(name="browser__browser_mouse_wheel", description="浏览器滚动", handler=lambda _arguments: {}),
             Tool(name="web__web_search", description="后台搜索", handler=lambda _arguments: {}),
             Tool(name="web__fetch_url", description="后台读取网页", handler=lambda _arguments: {}),
         ]
@@ -1047,8 +1101,11 @@ def test_visible_browser_request_hides_background_web_tools_from_planner() -> No
     assert '"name": "browser__browser_navigate"' in client.prompt
     assert '"name": "browser__browser_snapshot"' in client.prompt
     assert '"name": "browser__browser_type"' in client.prompt
+    assert '"name": "browser__browser_mouse_wheel"' in client.prompt
     assert '"name": "web__web_search"' not in client.prompt
     assert '"name": "web__fetch_url"' not in client.prompt
+    assert "能构造搜索 URL" in client.prompt
+    assert "不要先打开搜索首页再操作输入框" in client.prompt
 
 
 def test_visible_browser_request_blocks_background_search_and_continues_planning() -> None:
@@ -1817,7 +1874,7 @@ def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> No
             if call_index == 1:
                 return (
                     '{"reply":{"segments":[{"ja":"少し確認するね。","zh":"我稍微确认一下。","tone":"中性"}]},'
-                    '"tool_calls":[{"name":"browser_get_state","arguments":{},"reason":"看看当前受控浏览器状态"}]}'
+                    '"tool_calls":[{"name":"browser__browser_snapshot","arguments":{},"reason":"看看当前网页结构"}]}'
                 )
             assert "Example Page" in str(messages)
             return (
@@ -1828,8 +1885,8 @@ def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> No
     registry = ToolRegistry(
         [
             Tool(
-                name="browser_get_state",
-                description="读取当前浏览器状态",
+                name="browser__browser_snapshot",
+                description="读取当前网页结构",
                 handler=lambda _arguments: {
                     "url": "https://example.com",
                     "title": "Example Page",
@@ -1857,7 +1914,7 @@ def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> No
 
     assert result.reply.translation == "页面像是已经打开了。你是卡在这里了吗？"
     assert [action.type for action in result.actions] == ["event", "tool_call"]
-    assert result.actions[1].payload["tool_name"] == "browser_get_state"
+    assert result.actions[1].payload["tool_name"] == "browser__browser_snapshot"
     assert len(client.prompts) == 2
     assert "主动检查事件" in client.prompts[0]
     assert "不要为了显得主动而循环调用工具" in client.prompts[0]
@@ -1968,50 +2025,6 @@ def _runtime_json_path(name: str) -> Path:
 
 def _runtime_root_path(name: str) -> Path:
     return Path(__file__).resolve().parents[1] / "__pycache__" / "test_runtime" / name / uuid.uuid4().hex
-
-
-class _FakeBrowserExecutor:
-    def execute_browser_tool(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
-        if name == "browser_open_url":
-            return {
-                "url": arguments["url"],
-                "title": "Example Domain",
-                "opened": True,
-                "loaded": True,
-            }
-        if name == "browser_get_content":
-            return {
-                "url": "https://example.com",
-                "title": "Example Domain",
-                "text": "abcdefghijklmnopqrstuvwxyz",
-                "links": [
-                    {"text": f"Link {index}", "href": f"https://example.com/{index}"}
-                    for index in range(25)
-                ],
-            }
-        if name == "browser_scroll":
-            amount = int(arguments.get("amount", 800))
-            direction = str(arguments.get("direction", "down"))
-            return {
-                "url": "https://example.com",
-                "title": "Example Domain",
-                "scroll_y": -amount if direction == "up" else amount,
-            }
-        if name == "browser_click":
-            return {
-                "ok": True,
-                "url": "https://example.com",
-                "title": "Example Domain",
-                "selector": arguments["selector"],
-            }
-        if name == "browser_get_state":
-            return {
-                "url": "https://example.com",
-                "title": "Example Domain",
-                "scroll_y": 0,
-                "loading": False,
-            }
-        raise ValueError(name)
 
 
 def _write_mcp_config(root: Path, server_body: str) -> Path:

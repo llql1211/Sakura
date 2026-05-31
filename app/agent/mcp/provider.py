@@ -8,6 +8,7 @@ from typing import Any, Callable, Protocol
 
 from app.agent.mcp.bridge import MCPBridge, MCPToolSpec
 from app.agent.mcp.config import MCPConfig, MCPServerConfig, load_mcp_config
+from app.agent.mcp.settings import MCPRuntimeSettings, apply_mcp_runtime_settings
 from app.agent.tool_registry import Tool, ToolRegistry
 from app.debug_log import debug_log
 
@@ -137,10 +138,12 @@ def register_mcp_tools_from_config(
 ) -> MCPToolProvider | None:
     try:
         config = load_mcp_config(base_dir / "data" / "config" / "mcp.yaml")
+        mcp_settings = MCPRuntimeSettings.load(base_dir / ".env")
     except Exception as exc:
         print(f"[MCP] 配置读取失败，已跳过 MCP：{exc}")
         debug_log("MCP", "配置读取失败，已跳过 MCP", {"error": str(exc)})
         return None
+    config = apply_mcp_runtime_settings(config, mcp_settings)
     config = _resolve_runtime_tokens(config, base_dir)
     provider = MCPToolProvider(config, bridge_factory=bridge_factory)
     registered = provider.register_tools(registry)
