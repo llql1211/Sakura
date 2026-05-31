@@ -18,6 +18,7 @@ SCREEN_OBSERVATION_TRIGGER_KEYWORDS = (
     "帮我看这个",
 )
 SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已自主观察屏幕，仅用于本轮判断]"
+MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER = "[Sakura 已附加手动框选截图，仅用于本轮判断]"
 SCREEN_OBSERVATION_MAX_EDGE = 1280
 SCREEN_OBSERVATION_JPEG_QUALITY = 70
 
@@ -43,6 +44,12 @@ def append_observation_marker(text: str, observation: ScreenObservation) -> str:
     """给历史记录追加观察标记，避免保存 base64 图片。"""
     _ = observation
     return f"{text.rstrip()}\n{SCREEN_OBSERVATION_HISTORY_MARKER}"
+
+
+def append_manual_observation_marker(text: str, observation: ScreenObservation) -> str:
+    """给手动框选截图追加历史标记，避免保存 base64 图片。"""
+    _ = observation
+    return f"{text.rstrip()}\n{MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER}"
 
 
 def build_screen_observation_user_message(
@@ -102,6 +109,24 @@ def capture_screen_observation(excluded_widget: QWidget | None = None) -> Screen
         height=encoded_pixmap.height(),
         captured_at=datetime.now().astimezone().isoformat(timespec="seconds"),
         screen_name=screen.name() or "primary",
+    )
+
+
+def build_screen_observation_from_pixmap(
+    pixmap: QPixmap,
+    screen_name: str = "manual-selection",
+) -> ScreenObservation:
+    """从用户框选区域构造一次屏幕观察结果。"""
+    if pixmap.isNull():
+        raise RuntimeError("框选截图为空。")
+
+    encoded_pixmap = _scaled_pixmap(pixmap)
+    return ScreenObservation(
+        data_url=_encode_pixmap_to_data_url(encoded_pixmap),
+        width=encoded_pixmap.width(),
+        height=encoded_pixmap.height(),
+        captured_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        screen_name=screen_name,
     )
 
 

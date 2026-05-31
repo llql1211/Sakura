@@ -323,14 +323,135 @@ class _DummyTextInput:
         return ""
 
 
+class _DummyEditableInput:
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.cleared = False
+
+    def text(self) -> str:
+        return self._text
+
+    def clear(self) -> None:
+        self.cleared = True
+        self._text = ""
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+
 class _DummyTimer:
     def isActive(self) -> bool:
         return False
 
 
 class _DummyButton:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.text = ""
+
     def setVisible(self, _visible: bool) -> None:
         pass
+
+    def setEnabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def setText(self, text: str) -> None:
+        self.text = text
+
+
+def test_manual_screenshot_empty_input_sends_default_text() -> None:
+    window, requests, history = _build_minimal_manual_screenshot_window("")
+
+    window.send_message("test")
+
+    assert len(requests) == 1
+    content = requests[0][-1]["content"]
+    assert isinstance(content, list)
+    assert content[0]["text"].startswith("请根据我框选的截图继续对话。")
+    assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,manual"
+    assert window.pending_manual_screen_observation is None
+    assert history
+    assert "data:image/jpeg;base64" not in history[0][1]
+
+
+def test_manual_screenshot_text_input_records_marker_without_image_data() -> None:
+    window, requests, history = _build_minimal_manual_screenshot_window("帮我看这里")
+
+    window.send_message("test")
+
+    assert len(requests) == 1
+    content = requests[0][-1]["content"]
+    assert isinstance(content, list)
+    assert content[0]["text"].startswith("帮我看这里")
+    assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,manual"
+    assert window.messages[-1]["content"].startswith("帮我看这里")
+    assert "已附加手动框选截图" in window.messages[-1]["content"]
+    assert "data:image/jpeg;base64" not in window.messages[-1]["content"]
+    assert "data:image/jpeg;base64" not in history[0][1]
+
+
+def test_set_busy_disables_manual_screenshot_button() -> None:
+    from app.pet_window import PetWindow
+
+    class MinimalBusyWindow:
+        _set_busy = PetWindow._set_busy
+
+    window = MinimalBusyWindow()
+    window.input_edit = _DummyEditableInput("")
+    window.screenshot_button = _DummyButton()
+    window.send_button = _DummyButton()
+    window.confirm_action_button = _DummyButton()
+    window.cancel_action_button = _DummyButton()
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+
+    window._set_busy(True)
+    assert not window.screenshot_button.enabled
+
+    window._set_busy(False)
+    assert window.screenshot_button.enabled
+
+
+def _build_minimal_manual_screenshot_window(text: str):
+    from app.pet_window import PetWindow
+
+    class MinimalManualScreenshotWindow:
+        send_message = PetWindow.send_message
+        _record_user_message = PetWindow._record_user_message
+
+    window = MinimalManualScreenshotWindow()
+    requests = []
+    history = []
+    window.input_edit = _DummyEditableInput(text)
+    window.worker_thread = None
+    window.pending_manual_screen_observation = ScreenObservation(
+        data_url="data:image/jpeg;base64,manual",
+        width=320,
+        height=180,
+        captured_at="2026-05-31T12:00:00+08:00",
+        screen_name="manual-selection",
+    )
+    window.screen_observation_enabled = True
+    window.messages = []
+    window.reply_sequence_id = 0
+    window.pending_reply_segments = []
+    window.active_interaction_id = ""
+    window._mark_user_activity = lambda: None
+    window._begin_interaction = lambda _source: setattr(window, "active_interaction_id", "test")
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._end_interaction = lambda _outcome: None
+    window._set_pending_tool_action = lambda _action: None
+    window._reset_current_segment_progress = lambda: None
+    window.set_speech = lambda _text: None
+    window._record_history = lambda *args: history.append(args)
+    window._start_chat_worker = lambda request_messages: requests.append(request_messages)
+    window._update_manual_screenshot_button = lambda: None
+    window._clear_manual_screen_observation = lambda: setattr(
+        window,
+        "pending_manual_screen_observation",
+        None,
+    )
+    return window, requests, history
+
 
 
 def _build_minimal_proactive_window(

@@ -94,7 +94,10 @@ from app.proactive_care import (
 )
 from app.screen_observation import (
     SCREEN_OBSERVATION_HISTORY_MARKER,
+    ScreenObservation,
+    append_manual_observation_marker,
     append_observation_marker,
+    build_screen_observation_from_pixmap,
     build_screen_observation_user_message,
     capture_screen_observation,
 )
@@ -118,6 +121,8 @@ SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 SCREEN_OBSERVATION_ENABLED_KEY = "SCREEN_OBSERVATION_ENABLED"
 AUTONOMOUS_SCREEN_OBSERVATION_ENABLED_KEY = "AUTONOMOUS_SCREEN_OBSERVATION_ENABLED"
+MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
+MANUAL_SCREENSHOT_MIN_SIZE = 8
 
 
 class MemoryCurationWorker(QObject):
@@ -182,6 +187,88 @@ class FrostedGlassFrame(QFrame):
         painter.drawPixmap(0, 0, blurred)
         painter.fillPath(path, self._tint)
         painter.end()
+
+
+class ManualScreenshotOverlay(QWidget):
+    """全屏框选覆盖层，用于生成手动截图上下文。"""
+
+    selected = Signal(object)
+    cancelled = Signal()
+
+    def __init__(self, desktop_pixmap: QPixmap, virtual_geometry: QRect) -> None:
+        super().__init__(None)
+        self.desktop_pixmap = desktop_pixmap
+        self.virtual_geometry = QRect(virtual_geometry)
+        self.selection_start: QPoint | None = None
+        self.selection_end: QPoint | None = None
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setGeometry(self.virtual_geometry)
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        del event
+        painter = QPainter(self)
+        painter.drawPixmap(self.rect(), self.desktop_pixmap)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 95))
+
+        selection = self._selection_rect()
+        if not selection.isNull():
+            painter.drawPixmap(selection, self.desktop_pixmap, selection)
+            painter.fillRect(selection, QColor(255, 255, 255, 28))
+            painter.setPen(QColor(74, 170, 214, 245))
+            painter.drawRect(selection.adjusted(0, 0, -1, -1))
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            self._cancel()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self.selection_start = event.position().toPoint()
+        self.selection_end = self.selection_start
+        self.update()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self.selection_start is None:
+            return
+        self.selection_end = event.position().toPoint()
+        self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or self.selection_start is None:
+            return
+        self.selection_end = event.position().toPoint()
+        selection = self._selection_rect()
+        if (
+            selection.width() < MANUAL_SCREENSHOT_MIN_SIZE
+            or selection.height() < MANUAL_SCREENSHOT_MIN_SIZE
+        ):
+            self._cancel()
+            return
+        self.selected.emit(self.desktop_pixmap.copy(selection))
+        self.close()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self._cancel()
+            return
+        super().keyPressEvent(event)
+
+    def _selection_rect(self) -> QRect:
+        if self.selection_start is None or self.selection_end is None:
+            return QRect()
+        return QRect(self.selection_start, self.selection_end).normalized().intersected(self.rect())
+
+    def _cancel(self) -> None:
+        self.cancelled.emit()
+        self.close()
 
 
 class PetWindow(QWidget):
@@ -266,6 +353,8 @@ class PetWindow(QWidget):
         self.current_segment_tts_done = True
         self.reply_advance_scheduled = False
         self.pending_tool_action: PendingToolAction | None = None
+        self.pending_manual_screen_observation: ScreenObservation | None = None
+        self.manual_screenshot_overlay: ManualScreenshotOverlay | None = None
         self.pending_screen_observation_messages: list[dict[str, Any]] | None = None
         self.pending_screen_observation_event: AgentEvent | None = None
         self.pending_screen_observation_event_reminder_id: str | None = None
@@ -383,6 +472,14 @@ class PetWindow(QWidget):
         self.send_button.setFixedHeight(38)
         self.send_button.clicked.connect(self._handle_send_button_clicked)
 
+        self.screenshot_button = QPushButton("截图", self.input_bar)
+        self.screenshot_button.setObjectName("screenshotButton")
+        self.screenshot_button.setFixedHeight(38)
+        self.screenshot_button.setProperty("screenshotAttached", False)
+        self.screenshot_button.setToolTip("框选截图并附加到下一条消息；右键清除")
+        self.screenshot_button.installEventFilter(self)
+        self.screenshot_button.clicked.connect(self._handle_screenshot_button_clicked)
+
         self.confirm_action_button = QPushButton("执行", self.input_bar)
         self.confirm_action_button.setObjectName("confirmActionButton")
         self.confirm_action_button.setFixedHeight(38)
@@ -401,6 +498,7 @@ class PetWindow(QWidget):
         input_layout.addWidget(self.input_edit, 1)
         input_layout.addWidget(self.confirm_action_button)
         input_layout.addWidget(self.cancel_action_button)
+        input_layout.addWidget(self.screenshot_button)
         input_layout.addWidget(self.send_button)
         self.input_bar.setLayout(input_layout)
 
@@ -458,6 +556,28 @@ class PetWindow(QWidget):
             #sendButton:disabled {
                 background: rgba(126, 171, 193, 190);
             }
+            #screenshotButton {
+                background: rgba(255, 255, 255, 116);
+                border: 1px solid rgba(255, 255, 255, 218);
+                border-radius: 16px;
+                color: #4b3440;
+                font-size: 15px;
+                font-weight: 800;
+                min-width: 58px;
+                padding: 4px 12px;
+            }
+            #screenshotButton:hover {
+                background: rgba(255, 255, 255, 150);
+            }
+            #screenshotButton[screenshotAttached="true"] {
+                background: rgba(93, 181, 130, 225);
+                border: none;
+                color: white;
+            }
+            #screenshotButton:disabled {
+                background: rgba(176, 181, 184, 150);
+                color: rgba(75, 52, 64, 135);
+            }
             #confirmActionButton {
                 background: rgba(93, 181, 130, 225);
                 border: none;
@@ -507,6 +627,14 @@ class PetWindow(QWidget):
         if watched is self.input_edit:
             if event.type() == QEvent.Type.KeyPress:
                 self._log_input_key_event(event)
+            return super().eventFilter(watched, event)
+        if watched is self.screenshot_button and isinstance(event, QMouseEvent):
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.RightButton
+            ):
+                self._clear_manual_screen_observation()
+                return True
             return super().eventFilter(watched, event)
         if isinstance(event, QMouseEvent):
             if event.type() == QEvent.Type.MouseButtonPress:
@@ -694,6 +822,7 @@ class PetWindow(QWidget):
         self.name_label.setFont(name_font)
         self._apply_speech_font()
         self.input_edit.setFont(text_font)
+        self.screenshot_button.setFont(button_font)
         self.send_button.setFont(button_font)
 
     def _apply_speech_font(self) -> None:
@@ -869,8 +998,119 @@ class PetWindow(QWidget):
         self.send_message("send_button_clicked")
 
     @Slot()
+    def _handle_screenshot_button_clicked(self) -> None:
+        self._mark_user_activity()
+        if self.worker_thread is not None:
+            return
+        if not self.screen_observation_enabled:
+            QMessageBox.information(self, "截图已关闭", "请先在设置中开启屏幕观察权限。")
+            return
+
+        debug_log("PetWindow", "开始手动框选截图")
+        QTimer.singleShot(120, self._show_manual_screenshot_overlay)
+
+    def _show_manual_screenshot_overlay(self) -> None:
+        try:
+            desktop_pixmap, virtual_geometry = self._capture_virtual_desktop_pixmap()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "截图失败", str(exc))
+            debug_log("PetWindow", "手动框选截图启动失败", {"error": str(exc)})
+            return
+
+        overlay = ManualScreenshotOverlay(desktop_pixmap, virtual_geometry)
+        overlay.selected.connect(self._handle_manual_screenshot_selected)
+        overlay.cancelled.connect(self._handle_manual_screenshot_cancelled)
+        overlay.destroyed.connect(self._clear_manual_screenshot_overlay_ref)
+        self.manual_screenshot_overlay = overlay
+        overlay.show()
+        overlay.raise_()
+        overlay.activateWindow()
+
+    def _capture_virtual_desktop_pixmap(self) -> tuple[QPixmap, QRect]:
+        screens = QApplication.screens()
+        if not screens:
+            raise RuntimeError("无法找到可截图的屏幕。")
+
+        virtual_geometry = QRect()
+        for screen in screens:
+            virtual_geometry = virtual_geometry.united(screen.geometry())
+        if virtual_geometry.isNull():
+            raise RuntimeError("无法获取虚拟桌面区域。")
+
+        desktop_pixmap = QPixmap(virtual_geometry.size())
+        desktop_pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(desktop_pixmap)
+        captured_count = 0
+        for screen in screens:
+            screen_pixmap = screen.grabWindow(0)
+            if screen_pixmap.isNull():
+                continue
+            target_rect = QRect(
+                screen.geometry().topLeft() - virtual_geometry.topLeft(),
+                screen.geometry().size(),
+            )
+            painter.drawPixmap(target_rect, screen_pixmap)
+            captured_count += 1
+        painter.end()
+
+        if captured_count == 0:
+            raise RuntimeError("屏幕截图为空，可能被系统权限或显示环境阻止。")
+        return desktop_pixmap, virtual_geometry
+
+    @Slot(object)
+    def _handle_manual_screenshot_selected(self, pixmap: QPixmap) -> None:
+        self.show()
+        self.raise_()
+        try:
+            observation = build_screen_observation_from_pixmap(pixmap)
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "截图失败", str(exc))
+            debug_log("PetWindow", "手动框选截图编码失败", {"error": str(exc)})
+            return
+
+        self.pending_manual_screen_observation = observation
+        self._update_manual_screenshot_button()
+        debug_log(
+            "PetWindow",
+            "手动框选截图已附加到下一条消息",
+            {
+                "width": observation.width,
+                "height": observation.height,
+                "captured_at": observation.captured_at,
+                "screen_name": observation.screen_name,
+                "image": observation.data_url,
+            },
+        )
+
+    @Slot()
+    def _handle_manual_screenshot_cancelled(self) -> None:
+        self.show()
+        self.raise_()
+        debug_log("PetWindow", "手动框选截图已取消")
+
+    @Slot()
+    def _clear_manual_screenshot_overlay_ref(self) -> None:
+        self.manual_screenshot_overlay = None
+
+    def _clear_manual_screen_observation(self) -> None:
+        if self.pending_manual_screen_observation is None:
+            return
+        self.pending_manual_screen_observation = None
+        self._update_manual_screenshot_button()
+        debug_log("PetWindow", "待发送手动截图已清除")
+
+    def _update_manual_screenshot_button(self) -> None:
+        attached = self.pending_manual_screen_observation is not None
+        self.screenshot_button.setText("截图✓" if attached else "截图")
+        self.screenshot_button.setProperty("screenshotAttached", attached)
+        self.screenshot_button.style().unpolish(self.screenshot_button)
+        self.screenshot_button.style().polish(self.screenshot_button)
+        self.screenshot_button.update()
+
+    @Slot()
     def send_message(self, source: str = "direct_call") -> None:
         text = self.input_edit.text().strip()
+        manual_observation = self.pending_manual_screen_observation
         self._mark_user_activity()
         if not self.active_interaction_id:
             self._begin_interaction(source)
@@ -879,15 +1119,17 @@ class PetWindow(QWidget):
             {
                 "source": source,
                 "text": text,
+                "has_manual_screenshot": manual_observation is not None,
                 "worker_busy": self.worker_thread is not None,
             },
         )
-        if not text or self.worker_thread is not None:
+        if (not text and manual_observation is None) or self.worker_thread is not None:
             debug_log(
                 "PetWindow",
                 "发送消息被忽略",
                 {
                     "has_text": bool(text),
+                    "has_manual_screenshot": manual_observation is not None,
                     "worker_busy": self.worker_thread is not None,
                 },
             )
@@ -895,11 +1137,20 @@ class PetWindow(QWidget):
                 "send_message_ignored",
                 {
                     "has_text": bool(text),
+                    "has_manual_screenshot": manual_observation is not None,
                     "worker_busy": self.worker_thread is not None,
                 },
             )
             self._end_interaction("ignored")
             return
+        if manual_observation is not None and not self.screen_observation_enabled:
+            QMessageBox.information(self, "截图已关闭", "屏幕观察权限已关闭，本次截图不会发送。")
+            self._clear_manual_screen_observation()
+            self._end_interaction("ignored")
+            return
+
+        if not text and manual_observation is not None:
+            text = MANUAL_SCREENSHOT_DEFAULT_TEXT
 
         self._set_pending_tool_action(None)
         self.input_edit.clear()
@@ -910,7 +1161,12 @@ class PetWindow(QWidget):
         self.set_speech("......")
         self._log_interaction_stage("placeholder_reply_shown")
 
-        request_user_message: dict[str, Any] = {"role": "user", "content": text}
+        if manual_observation is not None:
+            request_user_message = build_screen_observation_user_message(text, manual_observation)
+            recorded_user_text = append_manual_observation_marker(text, manual_observation)
+        else:
+            request_user_message: dict[str, Any] = {"role": "user", "content": text}
+            recorded_user_text = text
 
         request_messages = trim_messages_for_model([*self.messages, request_user_message])
         debug_log(
@@ -918,6 +1174,7 @@ class PetWindow(QWidget):
             "用户消息入队",
             {
                 "text": text,
+                "has_manual_screenshot": manual_observation is not None,
                 "history_messages": len(self.messages),
                 "request_messages": summarize_messages(request_messages),
             },
@@ -927,9 +1184,13 @@ class PetWindow(QWidget):
             {
                 "history_messages": len(self.messages),
                 "request_message_count": len(request_messages),
+                "has_manual_screenshot": manual_observation is not None,
             },
         )
-        self._record_user_message(text)
+        self._record_user_message(recorded_user_text)
+        if manual_observation is not None:
+            self.pending_manual_screen_observation = None
+            self._update_manual_screenshot_button()
         self._log_interaction_stage("user_message_recorded")
         self._start_chat_worker(request_messages)
 
@@ -1690,6 +1951,7 @@ class PetWindow(QWidget):
 
     def _set_busy(self, busy: bool) -> None:
         self.input_edit.setEnabled(not busy)
+        self.screenshot_button.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
         self.confirm_action_button.setEnabled(not busy)
         self.cancel_action_button.setEnabled(not busy)
