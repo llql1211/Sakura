@@ -698,7 +698,7 @@ class AgentRuntime:
 {context_strategy}
 
 可用工具能力领域：
-- 网页搜索与浏览：web_search、web_fetch_text、playwright_navigate、playwright_search_web 等 playwright_* 系列
+- 网页搜索与浏览：web__web_search、web__fetch_url、playwright_navigate、playwright_search_web 等 playwright_* 系列
 - 屏幕观察：observe_screen（仅在启用时可用）
 - 桌面控制与窗口操作：windows_Snapshot、windows_Screenshot、windows_Click 等 windows_* 系列
 - 提醒与记忆：add_reminder、forget_memory

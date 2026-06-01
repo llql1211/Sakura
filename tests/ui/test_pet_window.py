@@ -305,6 +305,46 @@ def test_proactive_care_event_includes_recent_conversation() -> None:
     )
 
 
+def test_proactive_care_event_reads_recent_conversation_from_history_store() -> None:
+    from app.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
+    from app.storage.chat_history import ChatHistoryStore
+    from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
+
+    window = _build_minimal_proactive_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=2,
+    )
+    history_path = (
+        Path(__file__).resolve().parents[2]
+        / "__pycache__"
+        / "test_runtime"
+        / "proactive_history"
+        / uuid.uuid4().hex
+        / "history.jsonl"
+    )
+    store = ChatHistoryStore(history_path)
+    store.append("system", PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER)
+    store.append("user", "刚才已经提醒过我喝水了")
+    store.append("assistant", "水を飲んでって言ったばかりだよ。", "我刚提醒过你喝水。")
+    window.history_store = store
+    window.subtitle_language = "zh"
+    window.messages = []
+
+    event = window._build_proactive_care_event(300.0)
+
+    assert event.payload["recent_conversation"] == [
+        {"role": "user", "content": "刚才已经提醒过我喝水了"},
+        {"role": "assistant", "content": "我刚提醒过你喝水。"},
+    ]
+    assert event.payload["recent_conversation_summary_hint"] == (
+        PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
+    )
+    assert PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER not in str(
+        event.payload["recent_conversation"]
+    )
+
+
 def test_proactive_recent_conversation_limits_count_and_content() -> None:
     from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT
 

@@ -2375,7 +2375,8 @@ def test_proactive_check_event_prompt_reuses_segment_rules() -> None:
     assert "低打扰主动搭话" in prompt
     assert "屏幕画面和近期对话充分时，可以展开到 2-4 段" in prompt
     assert "主动搭话时不要固定使用“提醒”语气" in prompt
-    assert "先找屏幕上最确定的具体对象" in prompt
+    assert "先阅读 recent_conversation" in prompt
+    assert "把 screen_contexts/visual_contexts 和 recent_conversation 交叉对照" in prompt
     assert "只有画面确实为空、黑屏、桌面无内容" in prompt
 
 

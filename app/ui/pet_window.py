@@ -1473,9 +1473,7 @@ class PetWindow(QWidget):
             "screen_context_count": len(screen_contexts),
             "screen_context_dropped_count": self.proactive_screen_context_dropped_count,
         }
-        recent_conversation = _build_proactive_recent_conversation(
-            getattr(self, "messages", []),
-        )
+        recent_conversation = _build_proactive_recent_conversation_for_window(self)
         if recent_conversation:
             payload["recent_conversation"] = recent_conversation
             payload["recent_conversation_summary_hint"] = (
@@ -2339,6 +2337,64 @@ def _build_proactive_recent_conversation(
             }
         )
     return recent[-limit:]
+
+
+def _build_proactive_recent_conversation_for_window(
+    window: Any,
+    *,
+    limit: int = PROACTIVE_RECENT_CONVERSATION_LIMIT,
+    content_limit: int = PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT,
+) -> list[dict[str, str]]:
+    """主动事件优先读取持久化历史，避免重启后丢失近期语境。"""
+    history_entries = _load_proactive_history_entries(window)
+    if history_entries:
+        return _build_proactive_recent_conversation_from_history_entries(
+            history_entries,
+            subtitle_language=str(getattr(window, "subtitle_language", SUBTITLE_LANGUAGE_ZH)),
+            limit=limit,
+            content_limit=content_limit,
+        )
+    return _build_proactive_recent_conversation(
+        getattr(window, "messages", []),
+        limit=limit,
+        content_limit=content_limit,
+    )
+
+
+def _load_proactive_history_entries(window: Any) -> list[ChatHistoryEntry]:
+    history_store = getattr(window, "history_store", None)
+    if history_store is None or not hasattr(history_store, "load"):
+        return []
+    try:
+        entries = history_store.load()
+    except OSError as exc:
+        debug_log("ProactiveCare", "读取近期聊天历史失败", {"error": str(exc)})
+        return []
+    return [entry for entry in entries if isinstance(entry, ChatHistoryEntry)]
+
+
+def _build_proactive_recent_conversation_from_history_entries(
+    entries: list[ChatHistoryEntry],
+    *,
+    subtitle_language: str,
+    limit: int = PROACTIVE_RECENT_CONVERSATION_LIMIT,
+    content_limit: int = PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.role not in {"user", "assistant"}:
+            continue
+        messages.append(
+            {
+                "role": entry.role,
+                "content": entry.display_content(subtitle_language),
+            }
+        )
+    return _build_proactive_recent_conversation(
+        messages,
+        limit=limit,
+        content_limit=content_limit,
+    )
 
 
 def _proactive_recent_conversation_content(content: Any) -> str:
