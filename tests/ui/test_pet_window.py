@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 import uuid
@@ -391,7 +392,18 @@ def test_settings_dialog_exposes_windows_mcp_restart_setting() -> None:
     app.processEvents()
 
 
-def test_settings_dialog_does_not_load_memory_on_open() -> None:
+def _process_events_until(app, predicate, timeout_ms: int = 1500):  # type: ignore[no-untyped-def]
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    app.processEvents()
+    return predicate()
+
+
+def test_settings_dialog_loads_memory_on_open_in_background() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -405,7 +417,13 @@ def test_settings_dialog_does_not_load_memory_on_open() -> None:
 
         def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
             self.list_calls += 1
-            return []
+            return [
+                {
+                    "id": "memory-001",
+                    "content": "主人喜欢精简的管理界面",
+                    "updated_at": "2026-06-02T01:00:00Z",
+                }
+            ]
 
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
@@ -423,8 +441,518 @@ def test_settings_dialog_does_not_load_memory_on_open() -> None:
         memory_store=memory_store,  # type: ignore[arg-type]
     )
 
-    assert memory_store.list_calls == 0
-    assert dialog.memory_table.item(0, 0).text() == "点击“刷新”加载长期记忆。"
+    assert dialog.memory_status_label.text() == "正在加载长期记忆..."
+    assert _process_events_until(app, lambda: memory_store.list_calls == 1)
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    assert dialog.memory_status_label.text() == "已加载 1 条记忆"
+    assert dialog.memory_table.item(0, 1).text() == "主人喜欢精简的管理界面"
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_filters_memory_locally() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.list_calls = 0
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            return [
+                {"id": "alpha-001", "content": "偏好浅色界面"},
+                {"id": "beta-002", "content": "喜欢批量管理记忆"},
+            ]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    assert memory_store.list_calls == 1
+
+    dialog.memory_search_edit.setText("批量")
+    app.processEvents()
+
+    assert memory_store.list_calls == 1
+    assert dialog.memory_table.rowCount() == 1
+    assert dialog.memory_table.item(0, 1).text() == "喜欢批量管理记忆"
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_deletes_selected_memories(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.list_calls = 0
+            self.deleted: list[str] = []
+            self.records = [
+                {"id": "memory-001", "content": "第一条记忆"},
+                {"id": "memory-002", "content": "第二条记忆"},
+                {"id": "memory-003", "content": "第三条记忆"},
+            ]
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            return [record for record in self.records if record["id"] not in self.deleted]
+
+        def forget_memory(self, arguments):  # type: ignore[no-untyped-def]
+            self.deleted.append(arguments["id"])
+            return {"forgotten": {"id": arguments["id"]}}
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: settings_dialog_module.QMessageBox.StandardButton.Yes,
+    )
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._set_memory_checked(0, True)
+    dialog._set_memory_checked(1, True)
+    app.processEvents()
+
+    assert dialog.memory_delete_button.isEnabled()
+    assert dialog._selected_memory_ids == {"memory-001", "memory-002"}
+    dialog._delete_memory_entry()
+
+    assert memory_store.deleted == ["memory-001", "memory-002"]
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    assert memory_store.list_calls == 2
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_reports_partial_memory_delete_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+            self.records = [
+                {"id": "memory-001", "content": "第一条记忆"},
+                {"id": "memory-002", "content": "第二条记忆"},
+            ]
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [record for record in self.records if record["id"] not in self.deleted]
+
+        def forget_memory(self, arguments):  # type: ignore[no-untyped-def]
+            if arguments["id"] == "memory-002":
+                raise RuntimeError("后端删除失败")
+            self.deleted.append(arguments["id"])
+            return {"forgotten": {"id": arguments["id"]}}
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: settings_dialog_module.QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._set_memory_checked(0, True)
+    dialog._set_memory_checked(1, True)
+    dialog._delete_memory_entry()
+
+    assert warnings
+    assert "已删除 1 条，失败 1 条" in warnings[-1]
+    assert "后端删除失败" in warnings[-1]
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_selects_all_visible_memories_without_native_selection() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [
+                {"id": "memory-001", "content": "第一条记忆"},
+                {"id": "memory-002", "content": "第二条记忆"},
+            ]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._toggle_select_all_visible_memories()
+
+    assert dialog._selected_memory_ids == {"memory-001", "memory-002"}
+    assert dialog.memory_select_all_check.isChecked()
+    row_checkbox = dialog.memory_table.cellWidget(0, 0).findChild(qtwidgets.QCheckBox)
+    assert row_checkbox is not None
+    assert row_checkbox.isChecked()
+    assert dialog.memory_table.selectionModel().selectedRows() == []
+    assert dialog.memory_editor_container.isHidden()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_select_all_only_affects_filtered_results() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [
+                {"id": "alpha-001", "content": "浅色界面"},
+                {"id": "beta-002", "content": "批量管理"},
+            ]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog.memory_search_edit.setText("批量")
+    dialog._toggle_select_all_visible_memories()
+
+    assert dialog._selected_memory_ids == {"beta-002"}
+    assert dialog.memory_table.rowCount() == 1
+    assert dialog.memory_select_all_check.isChecked()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_single_selection_opens_editor_and_updates_memory(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.updated: list[dict[str, str]] = []
+            self.records = [{"id": "memory-001", "content": "旧内容"}]
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return list(self.records)
+
+        def update_memory(self, arguments, *, allow_sensitive=False):  # type: ignore[no-untyped-def]
+            self.updated.append(
+                {
+                    "id": arguments["id"],
+                    "content": arguments["content"],
+                    "allow_sensitive": str(allow_sensitive),
+                }
+            )
+            self.records[0]["content"] = arguments["content"]
+            return {"memory": self.records[0]}
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._open_memory_editor(0)
+
+    assert not dialog.memory_editor_container.isHidden()
+    assert dialog.memory_save_button.text() == "保存修改"
+    assert dialog.memory_content_edit.toPlainText() == "旧内容"
+    assert dialog.memory_preview_label.text() == ""
+
+    dialog.memory_content_edit.setPlainText("新内容")
+    dialog._save_memory_entry()
+
+    assert memory_store.updated == [
+        {"id": "memory-001", "content": "新内容", "allow_sensitive": "True"}
+    ]
+    assert dialog._selected_memory_ids == {"memory-001"}
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_content_click_switches_to_single_selection() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [
+                {"id": "memory-001", "content": "第一条记忆"},
+                {"id": "memory-002", "content": "第二条记忆"},
+            ]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._set_memory_checked(0, True)
+    dialog._handle_memory_item_clicked(dialog.memory_table.item(1, 1))
+
+    assert dialog._selected_memory_ids == {"memory-002"}
+    assert dialog._editing_memory_id == "memory-002"
+    assert dialog.memory_content_edit.toPlainText() == "第二条记忆"
+    assert dialog.memory_selection_label.text() == "已选择 1 条"
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_first_column_click_toggles_check_only() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [{"id": "memory-001", "content": "第一条记忆"}]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._handle_memory_item_clicked(dialog.memory_table.item(0, 0))
+
+    assert dialog._selected_memory_ids == {"memory-001"}
+    assert dialog._editing_memory_id is None
+    assert dialog.memory_editor_container.isHidden()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_multiple_checked_rows_keep_current_editor() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [
+                {"id": "memory-001", "content": "第一条记忆"},
+                {"id": "memory-002", "content": "第二条记忆"},
+            ]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._open_memory_editor(0)
+    assert not dialog.memory_editor_container.isHidden()
+    dialog._set_memory_checked(0, True)
+    dialog._set_memory_checked(1, True)
+
+    assert not dialog.memory_editor_container.isHidden()
+    assert dialog.memory_delete_button.isEnabled()
+    assert dialog.memory_selection_label.text() == "已选择 2 条"
+    assert dialog.memory_content_edit.toPlainText() == "第一条记忆"
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_collapses_manual_memory_entry_after_save(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.created: list[str] = []
+            self.records: list[dict[str, str]] = []
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return list(self.records)
+
+        def create_memory(self, arguments, *, allow_sensitive=False):  # type: ignore[no-untyped-def]
+            self.created.append(arguments["content"])
+            self.records.append({"id": "manual-001", "content": arguments["content"]})
+            return {"memory": self.records[-1], "ok": True}
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    assert not dialog.memory_editor_container.isVisible()
+
+    dialog._all_memories = [{"id": "existing-001", "content": "已有记忆"}]
+    dialog._refresh_memory_table()
+    dialog._set_memory_checked(0, True)
+    dialog.memory_new_button.setChecked(True)
+    dialog.memory_content_edit.setPlainText("手动新增的长期记忆")
+    dialog._save_memory_entry()
+
+    assert "existing-001" not in dialog._selected_memory_ids
+    assert memory_store.created == ["手动新增的长期记忆"]
+    assert not dialog.memory_new_button.isChecked()
+    assert dialog.memory_content_edit.toPlainText() == ""
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     dialog.deleteLater()
     app.processEvents()
 

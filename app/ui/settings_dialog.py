@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -11,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -71,6 +74,28 @@ class ApiConnectionTestWorker(QObject):
             self.finished.emit()
 
 
+class MemoryListWorker(QObject):
+    succeeded = Signal(list)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, memory_store: MemoryStore, limit: int = 200) -> None:
+        super().__init__()
+        self.memory_store = memory_store
+        self.limit = limit
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            memories = self.memory_store.list_memories(limit=self.limit)
+        except Exception as exc:  # UI 边界统一转成可读错误。
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(memories)
+        finally:
+            self.finished.emit()
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -94,7 +119,12 @@ class SettingsDialog(QDialog):
         self.current_character = current_character
         self.portrait_scale_percent = normalize_portrait_scale_percent(portrait_scale_percent)
         self.memory_store = memory_store
+        self._all_memories: list[dict[str, object]] = []
         self._visible_memories: list[dict[str, object]] = []
+        self._selected_memory_ids: set[str] = set()
+        self._memory_editor_mode: Literal["new", "edit"] | None = None
+        self._editing_memory_id: str | None = None
+        self._active_memory_id: str | None = None
         self.result_api_settings: ApiSettings | None = None
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
         self.result_character_id: str | None = None
@@ -104,6 +134,10 @@ class SettingsDialog(QDialog):
         self.result_debug_log_settings: DebugLogSettings | None = None
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
+        self._memory_list_thread: QThread | None = None
+        self._memory_list_worker: MemoryListWorker | None = None
+        self._memory_reload_pending = False
+        self._syncing_memory_selection = False
 
         self.setWindowTitle("设置")
         self.resize(560, 400)
@@ -457,110 +491,451 @@ class SettingsDialog(QDialog):
         self.memory_search_edit.setPlaceholderText("搜索记忆内容或 ID")
         self.memory_search_edit.textChanged.connect(self._refresh_memory_table)
 
-        self.memory_table = QTableWidget(0, 3, tab)
-        self.memory_table.setHorizontalHeaderLabels(["内容", "ID", "更新时间"])
+        self.memory_refresh_button = QPushButton("刷新", tab)
+        self.memory_refresh_button.clicked.connect(self._load_memory_entries)
+        self.memory_status_label = QLabel("正在加载长期记忆...", tab)
+        self.memory_status_label.setStyleSheet("color: #9b4f72;")
+
+        self.memory_table = QTableWidget(0, 4, tab)
+        self.memory_table.setHorizontalHeaderLabels(["", "内容", "更新时间", "ID"])
         self.memory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.memory_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.memory_table.verticalHeader().setVisible(False)
+        self.memory_table.setAlternatingRowColors(True)
+        self.memory_table.setWordWrap(True)
+        self.memory_table.itemClicked.connect(self._handle_memory_item_clicked)
+        header = self.memory_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.memory_table.setColumnWidth(0, 56)
+        self.memory_table.setColumnWidth(3, 82)
+        self.memory_select_all_check = QCheckBox(header)
+        self.memory_select_all_check.setToolTip("全选当前结果")
+        self.memory_select_all_check.stateChanged.connect(
+            self._handle_memory_select_all_check_changed
+        )
+        header.sectionResized.connect(
+            lambda *_args: self._sync_memory_select_all_check_geometry()
+        )
+        self._sync_memory_select_all_check_geometry()
 
+        self.memory_selection_label = QLabel("已选择 0 条", tab)
+        self.memory_selection_label.setStyleSheet("color: #7a3656;")
+        self.memory_delete_button = QPushButton("删除选中", tab)
+        self.memory_delete_button.setEnabled(False)
+        self.memory_delete_button.clicked.connect(self._delete_memory_entry)
+        self.memory_clear_selection_button = QPushButton("清空选择", tab)
+        self.memory_clear_selection_button.setEnabled(False)
+        self.memory_clear_selection_button.clicked.connect(self._clear_memory_selection)
+        self.memory_preview_label = QLabel("未选择记忆", tab)
+        self.memory_preview_label.setWordWrap(True)
+        self.memory_preview_label.setStyleSheet("color: #6d4a5b;")
+
+        self.memory_new_button = QPushButton("新增记忆", tab)
+        self.memory_new_button.setCheckable(True)
+        self.memory_new_button.toggled.connect(self._toggle_memory_new_editor)
         self.memory_content_edit = QTextEdit(tab)
         self.memory_content_edit.setPlaceholderText("新增长期记忆内容")
-        self.memory_content_edit.setFixedHeight(92)
-
-        self.memory_new_button = QPushButton("新增", tab)
-        self.memory_new_button.clicked.connect(self._clear_memory_editor)
-        self.memory_save_button = QPushButton("添加记忆", tab)
+        self.memory_content_edit.setFixedHeight(84)
+        self.memory_save_button = QPushButton("保存", tab)
         self.memory_save_button.clicked.connect(self._save_memory_entry)
-        self.memory_delete_button = QPushButton("删除", tab)
-        self.memory_delete_button.clicked.connect(self._delete_memory_entry)
-        self.memory_refresh_button = QPushButton("刷新", tab)
-        self.memory_refresh_button.clicked.connect(self._refresh_memory_table)
 
         filter_layout = QHBoxLayout()
         filter_layout.addWidget(self.memory_search_edit, 1)
+        filter_layout.addWidget(self.memory_refresh_button)
 
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(self.memory_status_label, 1)
+        status_layout.addWidget(self.memory_new_button)
+
+        selection_layout = QHBoxLayout()
+        selection_layout.addWidget(self.memory_selection_label)
+        selection_layout.addStretch(1)
+        selection_layout.addWidget(self.memory_clear_selection_button)
+        selection_layout.addWidget(self.memory_delete_button)
+
+        self.memory_editor_container = QWidget(tab)
         editor_layout = QFormLayout()
+        editor_layout.setContentsMargins(0, 0, 0, 0)
         editor_layout.setSpacing(8)
         editor_layout.addRow("内容", self.memory_content_edit)
-
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(self.memory_new_button)
-        button_layout.addWidget(self.memory_save_button)
-        button_layout.addWidget(self.memory_delete_button)
-        button_layout.addStretch(1)
-        button_layout.addWidget(self.memory_refresh_button)
+        editor_layout.addRow("", self.memory_save_button)
+        self.memory_editor_container.setLayout(editor_layout)
+        self.memory_editor_container.setVisible(False)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(16, 18, 16, 16)
         layout.setSpacing(10)
         layout.addLayout(filter_layout)
+        layout.addLayout(status_layout)
         layout.addWidget(self.memory_table, 1)
-        layout.addWidget(QLabel("编辑记忆", tab))
-        layout.addLayout(editor_layout)
-        layout.addLayout(button_layout)
+        layout.addLayout(selection_layout)
+        layout.addWidget(self.memory_editor_container)
         tab.setLayout(layout)
 
-        self._show_memory_placeholder("点击“刷新”加载长期记忆。")
+        self._show_memory_placeholder("正在加载长期记忆...")
         self._clear_memory_editor()
+        self._load_memory_entries()
         return tab
 
-    def _refresh_memory_table(self) -> None:
+    def _load_memory_entries(self) -> None:
         if self.memory_store is None or not hasattr(self, "memory_table"):
             return
-        is_ready = getattr(self.memory_store, "is_ready", None)
-        if callable(is_ready) and not is_ready():
-            preload = getattr(self.memory_store, "preload", None)
-            if callable(preload):
-                preload(wait=False)
-            self._show_memory_placeholder("长期记忆系统正在初始化。")
+        if self._memory_list_thread is not None:
+            self._memory_reload_pending = True
+            return
+
+        self.memory_status_label.setText("正在加载长期记忆...")
+        self.memory_refresh_button.setEnabled(False)
+        self._show_memory_placeholder("正在加载长期记忆...")
+
+        thread = QThread(self)
+        worker = MemoryListWorker(self.memory_store, limit=200)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_memory_load_success)
+        worker.failed.connect(self._handle_memory_load_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_memory_list_worker)
+
+        self._memory_list_thread = thread
+        self._memory_list_worker = worker
+        thread.start()
+
+    @Slot(list)
+    def _handle_memory_load_success(self, memories: list[dict[str, object]]) -> None:
+        self._all_memories = list(memories)
+        all_ids = {str(memory.get("id", "")) for memory in self._all_memories}
+        self._selected_memory_ids &= all_ids
+        if self._editing_memory_id and self._editing_memory_id not in all_ids:
+            self._memory_editor_mode = None
+            self._editing_memory_id = None
+            self._active_memory_id = None
+            self._clear_memory_editor()
+            self.memory_editor_container.setVisible(False)
+        self.memory_status_label.setText(f"已加载 {len(self._all_memories)} 条记忆")
+        self._refresh_memory_table()
+
+    @Slot(str)
+    def _handle_memory_load_failed(self, message: str) -> None:
+        self._all_memories = []
+        self.memory_status_label.setText(f"读取失败：{message}")
+        self._show_memory_placeholder("记忆读取失败，请稍后重试。")
+        QMessageBox.warning(self, "读取失败", message)
+
+    @Slot()
+    def _reset_memory_list_worker(self) -> None:
+        self.memory_refresh_button.setEnabled(True)
+        self._memory_list_thread = None
+        self._memory_list_worker = None
+        if self._memory_reload_pending:
+            self._memory_reload_pending = False
+            self._load_memory_entries()
+
+    def _refresh_memory_table(self) -> None:
+        if not hasattr(self, "memory_table"):
             return
         keyword = self.memory_search_edit.text().strip()
-        try:
-            if keyword:
-                self._visible_memories = self.memory_store.search_memory(
-                    {"query": keyword, "limit": 200}
-                )["memories"]
-            else:
-                self._visible_memories = self.memory_store.list_memories(limit=200)
-        except (RuntimeError, ValueError) as exc:
-            QMessageBox.warning(self, "读取失败", str(exc))
-            self._visible_memories = []
+        keyword_lower = keyword.lower()
+        if keyword_lower:
+            self._visible_memories = [
+                memory
+                for memory in self._all_memories
+                if keyword_lower in str(memory.get("content", "")).lower()
+                or keyword_lower in str(memory.get("id", "")).lower()
+            ]
+        else:
+            self._visible_memories = list(self._all_memories)
+        if not self._visible_memories:
+            self._show_memory_placeholder("没有匹配的记忆。" if keyword else "暂无长期记忆。")
+            return
+
+        self._syncing_memory_selection = True
+        self.memory_table.blockSignals(True)
+        self.memory_table.clearContents()
         self.memory_table.setRowCount(len(self._visible_memories))
         for row, memory in enumerate(self._visible_memories):
+            memory_id = str(memory.get("id", ""))
+            content = str(memory.get("content", ""))
+            updated_at = str(memory.get("updated_at") or memory.get("created_at") or "")
+            is_checked = memory_id in self._selected_memory_ids
+
+            select_item = QTableWidgetItem("")
+            select_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            select_item.setData(Qt.ItemDataRole.UserRole, memory_id)
+
             values = [
-                str(memory.get("content", "")),
-                str(memory.get("id", "")),
-                _format_memory_time(
-                    str(memory.get("updated_at") or memory.get("created_at") or "")
-                ),
+                content,
+                _format_memory_time(updated_at),
+                _compact_memory_id(memory_id),
             ]
-            for column, value in enumerate(values):
+            self.memory_table.setItem(row, 0, select_item)
+            self._set_memory_checkbox_widget(row, memory_id, is_checked)
+            for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 if column == 1:
-                    item.setData(Qt.ItemDataRole.UserRole, str(memory.get("id", "")))
+                    item.setToolTip(content)
+                elif column == 3:
+                    item.setToolTip(memory_id)
+                    item.setData(Qt.ItemDataRole.UserRole, memory_id)
                 self.memory_table.setItem(row, column, item)
-        self.memory_table.resizeColumnsToContents()
+            self._apply_memory_row_checked_style(row, is_checked)
+        self.memory_table.blockSignals(False)
+        self._syncing_memory_selection = False
+        self._sync_memory_select_all_check_geometry()
+        self._sync_memory_bulk_actions()
 
     def _show_memory_placeholder(self, text: str) -> None:
         if not hasattr(self, "memory_table"):
             return
         self._visible_memories = []
+        self._syncing_memory_selection = True
+        self.memory_table.blockSignals(True)
+        self.memory_table.clearContents()
         self.memory_table.setRowCount(1)
         item = QTableWidgetItem(text)
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-        self.memory_table.setItem(0, 0, item)
-        self.memory_table.setItem(0, 1, QTableWidgetItem(""))
+        self.memory_table.setItem(0, 1, item)
+        self.memory_table.setItem(0, 0, QTableWidgetItem(""))
         self.memory_table.setItem(0, 2, QTableWidgetItem(""))
-        self.memory_table.resizeColumnsToContents()
+        self.memory_table.setItem(0, 3, QTableWidgetItem(""))
+        self.memory_table.blockSignals(False)
+        self._syncing_memory_selection = False
+        self._sync_memory_bulk_actions()
 
-    def _handle_memory_selection(self) -> None:
-        return
+    def _handle_memory_item_clicked(self, item: QTableWidgetItem) -> None:
+        if self._syncing_memory_selection:
+            return
+        if self._memory_editor_mode == "new" and self.memory_new_button.isChecked():
+            self.memory_new_button.setChecked(False)
+        row = item.row()
+        if row < 0 or row >= len(self._visible_memories):
+            return
+        memory_id = str(self._visible_memories[row].get("id", ""))
+        if not memory_id:
+            return
+        if item.column() == 0:
+            self._set_memory_checked(row, memory_id not in self._selected_memory_ids)
+            return
+        self._switch_memory_single_selection(row)
+
+    def _handle_memory_checkbox_state_changed(self, memory_id: str, checked: bool) -> None:
+        if self._syncing_memory_selection:
+            return
+        if self._memory_editor_mode == "new" and self.memory_new_button.isChecked():
+            self.memory_new_button.setChecked(False)
+        row = self._visible_memory_row_by_id(memory_id)
+        if row is None:
+            return
+        self._set_memory_checked(row, checked)
+
+    def _switch_memory_single_selection(self, row: int) -> None:
+        if row < 0 or row >= len(self._visible_memories):
+            return
+        memory_id = str(self._visible_memories[row].get("id", ""))
+        if not memory_id:
+            return
+        self._selected_memory_ids = {memory_id}
+        self._refresh_memory_table()
+        self._open_memory_editor(row)
+
+    def _handle_memory_select_all_check_changed(self, state: int) -> None:
+        if self._syncing_memory_selection:
+            return
+        checked = state == Qt.CheckState.Checked.value
+        self._set_all_visible_memories_checked(checked)
+
+    def _set_memory_checked(self, row: int, checked: bool) -> None:
+        if row < 0 or row >= len(self._visible_memories):
+            return
+        memory_id = str(self._visible_memories[row].get("id", ""))
+        if not memory_id:
+            return
+        if checked:
+            self._selected_memory_ids.add(memory_id)
+        else:
+            self._selected_memory_ids.discard(memory_id)
+
+        item = self.memory_table.item(row, 0)
+        if item is not None:
+            self.memory_table.blockSignals(True)
+            self.memory_table.blockSignals(False)
+        self._sync_memory_checkbox_widget(row, checked)
+        self._apply_memory_row_checked_style(row, checked)
+        self._sync_memory_bulk_actions()
+
+    def _open_memory_editor(self, row: int) -> None:
+        if row < 0 or row >= len(self._visible_memories):
+            return
+        if self._memory_editor_mode == "new" and self.memory_new_button.isChecked():
+            self.memory_new_button.setChecked(False)
+        memory = self._visible_memories[row]
+        memory_id = str(memory.get("id", ""))
+        if not memory_id:
+            return
+        self._memory_editor_mode = "edit"
+        self._editing_memory_id = memory_id
+        self._active_memory_id = memory_id
+        self.memory_content_edit.setPlainText(str(memory.get("content", "")))
+        self.memory_content_edit.setPlaceholderText("编辑长期记忆内容")
+        self.memory_save_button.setText("保存修改")
+        self.memory_editor_container.setVisible(True)
+        self.memory_preview_label.setText("")
+
+    def _set_all_visible_memories_checked(self, checked: bool) -> None:
+        visible_ids = {
+            str(memory.get("id", ""))
+            for memory in self._visible_memories
+            if str(memory.get("id", ""))
+        }
+        if not visible_ids:
+            return
+        if checked:
+            self._selected_memory_ids |= visible_ids
+        else:
+            self._selected_memory_ids -= visible_ids
+        self._refresh_memory_table()
+
+    def _toggle_select_all_visible_memories(self) -> None:
+        visible_ids = {
+            str(memory.get("id", ""))
+            for memory in self._visible_memories
+            if str(memory.get("id", ""))
+        }
+        if not visible_ids:
+            return
+        self._set_all_visible_memories_checked(
+            not visible_ids.issubset(self._selected_memory_ids)
+        )
+
+    def _visible_memory_row_by_id(self, memory_id: str) -> int | None:
+        for row, memory in enumerate(self._visible_memories):
+            if str(memory.get("id", "")) == memory_id:
+                return row
+        return None
+
+    def _set_memory_checkbox_widget(self, row: int, memory_id: str, checked: bool) -> None:
+        container = QWidget(self.memory_table)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        checkbox = QCheckBox(container)
+        checkbox.setChecked(checked)
+        checkbox.setToolTip("选择这条记忆")
+        checkbox.stateChanged.connect(
+            lambda state, current_id=memory_id: self._handle_memory_checkbox_state_changed(
+                current_id,
+                state == Qt.CheckState.Checked.value,
+            )
+        )
+        layout.addWidget(checkbox, 0, Qt.AlignmentFlag.AlignCenter)
+        container.setLayout(layout)
+        self.memory_table.setCellWidget(row, 0, container)
+        self._style_memory_checkbox_container(container, row, checked)
+
+    def _sync_memory_checkbox_widget(self, row: int, checked: bool) -> None:
+        container = self.memory_table.cellWidget(row, 0)
+        if container is None:
+            return
+        checkbox = container.findChild(QCheckBox)
+        if checkbox is not None:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(checked)
+            checkbox.blockSignals(False)
+        self._style_memory_checkbox_container(container, row, checked)
+
+    def _style_memory_checkbox_container(self, container: QWidget, row: int, checked: bool) -> None:
+        color = _memory_row_background_color(row, checked)
+        container.setStyleSheet(f"background: {color};")
+
+    def _sync_memory_select_all_check_geometry(self) -> None:
+        if not hasattr(self, "memory_select_all_check"):
+            return
+        header = self.memory_table.horizontalHeader()
+        checkbox_size = self.memory_select_all_check.sizeHint()
+        section_x = header.sectionViewportPosition(0)
+        section_width = header.sectionSize(0)
+        x = section_x + max(0, (section_width - checkbox_size.width()) // 2)
+        y = max(0, (header.height() - checkbox_size.height()) // 2)
+        self.memory_select_all_check.setGeometry(
+            x,
+            y,
+            checkbox_size.width(),
+            checkbox_size.height(),
+        )
+        self.memory_select_all_check.raise_()
+
+    def _toggle_memory_new_editor(self, checked: bool) -> None:
+        if not hasattr(self, "memory_editor_container"):
+            return
+        if checked:
+            self._clear_memory_selection()
+            self._memory_editor_mode = "new"
+            self._editing_memory_id = None
+            self._active_memory_id = None
+            self.memory_content_edit.clear()
+            self.memory_content_edit.setPlaceholderText("新增长期记忆内容")
+            self.memory_save_button.setText("保存")
+            self.memory_preview_label.setText("正在新增记忆")
+            self.memory_editor_container.setVisible(True)
+        elif self._memory_editor_mode == "new":
+            self._memory_editor_mode = None
+            self._editing_memory_id = None
+            self._active_memory_id = None
+            self._clear_memory_editor()
+            self.memory_editor_container.setVisible(False)
+            self._sync_memory_bulk_actions()
+        self.memory_new_button.setText("收起新增" if checked else "新增记忆")
+
+    def _clear_memory_selection(self) -> None:
+        if not hasattr(self, "memory_table"):
+            return
+        self._selected_memory_ids.clear()
+        self._refresh_memory_table()
+
+    def _sync_memory_bulk_actions(self) -> None:
+        if not hasattr(self, "memory_table"):
+            return
+        selected_memories = self._selected_memories()
+        selected_count = len(selected_memories)
+        visible_ids = {
+            str(memory.get("id", ""))
+            for memory in self._visible_memories
+            if str(memory.get("id", ""))
+        }
+        all_visible_selected = bool(visible_ids) and visible_ids.issubset(self._selected_memory_ids)
+
+        self.memory_selection_label.setText(f"已选择 {selected_count} 条")
+        self.memory_select_all_check.setEnabled(bool(visible_ids))
+        self.memory_select_all_check.blockSignals(True)
+        self.memory_select_all_check.setChecked(all_visible_selected)
+        self.memory_select_all_check.blockSignals(False)
+        self.memory_delete_button.setEnabled(selected_count > 0)
+        self.memory_clear_selection_button.setEnabled(selected_count > 0)
+
+        if self._memory_editor_mode != "new":
+            self.memory_preview_label.setText("")
+
+    def _apply_memory_row_checked_style(self, row: int, checked: bool) -> None:
+        brush = _memory_row_background(row, checked)
+        for column in range(self.memory_table.columnCount()):
+            item = self.memory_table.item(row, column)
+            if item is not None:
+                item.setBackground(brush)
+        container = self.memory_table.cellWidget(row, 0)
+        if container is not None:
+            self._style_memory_checkbox_container(container, row, checked)
 
     def _clear_memory_editor(self) -> None:
         if not hasattr(self, "memory_content_edit"):
             return
-        self.memory_table.clearSelection()
         self.memory_content_edit.clear()
 
     def _save_memory_entry(self) -> None:
@@ -571,51 +946,97 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "内容为空", "记忆内容不能为空。")
             return
         try:
-            self.memory_store.create_memory(
-                {"content": content, "source": "manual"},
-                allow_sensitive=True,
-            )
+            if self._memory_editor_mode == "edit" and self._editing_memory_id:
+                editing_id = self._editing_memory_id
+                self.memory_store.update_memory(
+                    {"id": editing_id, "content": content, "source": "manual"},
+                    allow_sensitive=True,
+                )
+                self._selected_memory_ids = {editing_id}
+                self._active_memory_id = editing_id
+                success_message = "记忆已更新。"
+            else:
+                self.memory_store.create_memory(
+                    {"content": content, "source": "manual"},
+                    allow_sensitive=True,
+                )
+                self._memory_editor_mode = None
+                self._editing_memory_id = None
+                self._active_memory_id = None
+                self._clear_memory_editor()
+                self.memory_new_button.setChecked(False)
+                success_message = "记忆已保存。"
         except (RuntimeError, ValueError) as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
-        self._clear_memory_editor()
-        self._refresh_memory_table()
-        QMessageBox.information(self, "保存成功", "记忆已保存。")
+        self._load_memory_entries()
+        QMessageBox.information(self, "保存成功", success_message)
 
     def _delete_memory_entry(self) -> None:
         if self.memory_store is None:
             return
-        memory = self._selected_memory()
-        if memory is None:
-            QMessageBox.information(self, "未选择", "请先选择一条记忆。")
+        memories = self._selected_memories()
+        if not memories:
+            QMessageBox.information(self, "未选择", "请先选择要删除的记忆。")
             return
         result = QMessageBox.question(
             self,
             "删除记忆",
-            "确定要删除选中的长期记忆吗？",
+            f"确定要删除选中的 {len(memories)} 条长期记忆吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if result != QMessageBox.StandardButton.Yes:
             return
-        try:
-            self.memory_store.forget_memory({"id": str(memory.get("id", ""))})
-        except (RuntimeError, ValueError) as exc:
-            QMessageBox.warning(self, "删除失败", str(exc))
-            return
-        self._refresh_memory_table()
-        self._clear_memory_editor()
+        failed: list[str] = []
+        deleted = 0
+        for memory in memories:
+            memory_id = str(memory.get("id", "")).strip()
+            if not memory_id:
+                failed.append("缺少记忆 ID")
+                continue
+            try:
+                self.memory_store.forget_memory({"id": memory_id})
+            except (RuntimeError, ValueError) as exc:
+                failed.append(f"{_compact_memory_id(memory_id)}：{exc}")
+            else:
+                deleted += 1
+        if self._editing_memory_id in self._selected_memory_ids:
+            self._memory_editor_mode = None
+            self._editing_memory_id = None
+            self._active_memory_id = None
+            self._clear_memory_editor()
+            self.memory_editor_container.setVisible(False)
+        self._clear_memory_selection()
+        self._load_memory_entries()
+        if failed:
+            QMessageBox.warning(
+                self,
+                "删除完成",
+                f"已删除 {deleted} 条，失败 {len(failed)} 条。\n" + "\n".join(failed),
+            )
+
+    def _selected_memory_rows(self) -> list[int]:
+        if not hasattr(self, "memory_table"):
+            return []
+        return [
+            row
+            for row, memory in enumerate(self._visible_memories)
+            if str(memory.get("id", "")) in self._selected_memory_ids
+        ]
+
+    def _selected_memories(self) -> list[dict[str, object]]:
+        return [
+            memory
+            for memory in self._all_memories
+            if str(memory.get("id", "")) in self._selected_memory_ids
+        ]
 
     def _selected_memory(self) -> dict[str, object] | None:
-        if not hasattr(self, "memory_table"):
+        memories = self._selected_memories()
+        if not memories:
             return None
-        selected_rows = self.memory_table.selectionModel().selectedRows()
-        if not selected_rows:
-            return None
-        row = selected_rows[0].row()
-        if row < 0 or row >= len(self._visible_memories):
-            return None
-        return self._visible_memories[row]
+        return memories[0]
 
     def accept(self) -> None:
         if self._api_test_thread is not None:
@@ -784,6 +1205,24 @@ class SettingsDialog(QDialog):
 def _is_http_url(url: str) -> bool:
     parsed_url = urlparse(url)
     return parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
+
+
+def _compact_memory_id(memory_id: str) -> str:
+    if len(memory_id) <= 16:
+        return memory_id
+    return f"{memory_id[:8]}...{memory_id[-4:]}"
+
+
+def _memory_row_background(row: int, checked: bool) -> QBrush:
+    return QBrush(QColor(_memory_row_background_color(row, checked)))
+
+
+def _memory_row_background_color(row: int, checked: bool) -> str:
+    if checked:
+        return "#f4c4da"
+    if row % 2:
+        return "#fff4f9"
+    return "#fffafd"
 
 
 def _format_memory_time(value: str) -> str:
