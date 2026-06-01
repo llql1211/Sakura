@@ -249,8 +249,10 @@ class HistoryWindow(QDialog):
             self._add_empty_state()
             return
 
+        previous_role: str | None = None
         for entry in entries:
-            self._add_entry(entry)
+            self._add_entry(entry, show_meta=entry.role != previous_role)
+            previous_role = entry.role
         self.history_layout.addStretch(1)
         self._schedule_layout_update()
 
@@ -316,7 +318,7 @@ class HistoryWindow(QDialog):
         self.history_layout.addWidget(empty_label)
         self.history_layout.addStretch(1)
 
-    def _add_entry(self, entry: ChatHistoryEntry) -> None:
+    def _add_entry(self, entry: ChatHistoryEntry, *, show_meta: bool = True) -> None:
         view = _entry_view_model(entry, self.subtitle_language, self.history_store.assistant_name)
 
         row = QWidget(self.history_content)
@@ -324,15 +326,16 @@ class HistoryWindow(QDialog):
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(0)
 
-        bubble = QFrame(row)
+        entry_column = QWidget(row)
+        entry_column_layout = QVBoxLayout(entry_column)
+        entry_column_layout.setContentsMargins(0, 0, 0, 0)
+        entry_column_layout.setSpacing(4)
+
+        bubble = QFrame(entry_column)
         bubble.setObjectName(view.bubble_object_name)
         bubble_layout = QVBoxLayout(bubble)
-        bubble_layout.setContentsMargins(14, 10, 14, 12)
-        bubble_layout.setSpacing(6)
-
-        meta_label = QLabel(view.meta_text, bubble)
-        meta_label.setObjectName("entryMeta")
-        meta_label.setAlignment(_label_alignment(view.align))
+        bubble_layout.setContentsMargins(14, 12, 14, 12)
+        bubble_layout.setSpacing(0)
 
         content_label = QLabel(view.content, bubble)
         content_label.setObjectName(_content_object_name(view.bubble_object_name))
@@ -342,18 +345,24 @@ class HistoryWindow(QDialog):
             Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
 
-        bubble_layout.addWidget(meta_label)
+        if show_meta:
+            meta_label = QLabel(view.meta_text, entry_column)
+            meta_label.setObjectName("entryMeta")
+            meta_label.setAlignment(_label_alignment(view.align))
+            entry_column_layout.addWidget(meta_label)
+
         bubble_layout.addWidget(content_label)
+        entry_column_layout.addWidget(bubble)
 
         if view.align == "right":
             row_layout.addStretch(1)
-            row_layout.addWidget(bubble)
+            row_layout.addWidget(entry_column)
         elif view.align == "center":
             row_layout.addStretch(1)
-            row_layout.addWidget(bubble)
+            row_layout.addWidget(entry_column)
             row_layout.addStretch(1)
         else:
-            row_layout.addWidget(bubble)
+            row_layout.addWidget(entry_column)
             row_layout.addStretch(1)
 
         self._bubble_frames.append(bubble)

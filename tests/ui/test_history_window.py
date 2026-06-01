@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import os
 import sys
 import types
+
+import pytest
 
 _STUBBED_PYSIDE = False
 if importlib.util.find_spec("PySide6") is None:
@@ -167,3 +170,86 @@ def test_entry_view_model_ignores_tone_and_portrait_metadata() -> None:
 
     assert view.content == "译文"
     assert view.meta_text == "桜 · 2026-05-30 16:20:30"
+
+
+def test_history_window_keeps_meta_outside_message_bubble() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QLabel")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.history_window import HistoryWindow
+
+    QApplication = qtwidgets.QApplication
+    QFrame = qtwidgets.QFrame
+    QLabel = qtwidgets.QLabel
+    app = QApplication.instance() or QApplication([])
+
+    class StaticHistoryStore:
+        assistant_name = "桜"
+
+        def load(self) -> list[ChatHistoryEntry]:
+            return [
+                _entry("user", "你好"),
+                _entry("assistant", "こんばんは"),
+                _entry("system", "系统记录"),
+            ]
+
+    store = StaticHistoryStore()
+
+    window = HistoryWindow(store)  # type: ignore[arg-type]
+    app.processEvents()
+
+    meta_labels = window.findChildren(QLabel, "entryMeta")
+    bubbles = [
+        *window.findChildren(QFrame, "userBubble"),
+        *window.findChildren(QFrame, "assistantBubble"),
+        *window.findChildren(QFrame, "systemBubble"),
+    ]
+
+    assert len(meta_labels) == 3
+    assert len(bubbles) == 3
+    for bubble in bubbles:
+        assert not any(meta.parent() is bubble for meta in meta_labels)
+        assert bubble.findChild(QLabel, "entryText") is not None or bubble.findChild(QLabel, "systemText") is not None
+
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_history_window_groups_consecutive_role_meta() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QLabel")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.history_window import HistoryWindow
+
+    QApplication = qtwidgets.QApplication
+    QFrame = qtwidgets.QFrame
+    QLabel = qtwidgets.QLabel
+    app = QApplication.instance() or QApplication([])
+
+    class StaticHistoryStore:
+        assistant_name = "桜"
+
+        def load(self) -> list[ChatHistoryEntry]:
+            return [
+                _entry("user", "请总结一下"),
+                _entry("assistant", "第一段"),
+                _entry("assistant", "第二段"),
+                _entry("assistant", "第三段"),
+                _entry("user", "继续"),
+            ]
+
+    window = HistoryWindow(StaticHistoryStore())  # type: ignore[arg-type]
+    app.processEvents()
+
+    meta_texts = [label.text() for label in window.findChildren(QLabel, "entryMeta")]
+
+    assert len(window.findChildren(QFrame, "assistantBubble")) == 3
+    assert meta_texts.count("桜 · 2026-05-30 16:20:30") == 1
+    assert meta_texts.count("你 · 2026-05-30 16:20:30") == 2
+
+    window.deleteLater()
+    app.processEvents()
