@@ -1963,6 +1963,7 @@ class PetWindow(QWidget):
             return
 
         self.api_client.update_settings(dialog.result_api_settings)
+        self.memory_store.set_api_settings(dialog.result_api_settings)
         self._apply_portrait_scale_percent(dialog.result_portrait_scale_percent)
         self.proactive_care_settings = dialog.result_proactive_care_settings
         mcp_restart_required = dialog.result_mcp_settings != self.mcp_settings
@@ -2223,6 +2224,7 @@ class PetWindow(QWidget):
         previous_character_id = self.character_profile.id
         self.character_profile = profile
         self.system_prompt = load_character_system_prompt(profile)
+        self.memory_store.set_scope(profile.id)
         self.agent_runtime.update_character(self.system_prompt, profile.reply_tones, profile.portrait_choices)
         self.setWindowTitle(profile.display_name)
         self.name_label.setText(profile.display_name)

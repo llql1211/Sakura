@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import sys
 import threading
 import uuid
 
@@ -30,6 +31,7 @@ from app.config.settings_service import AppSettingsService
 from app.config.yaml_config import load_yaml_mapping
 from app.core.plugin_manager import SakuraPluginManager
 from app.llm.api_client import (
+    ApiSettings,
     ApiRequestError,
     ChatCompletionTurn,
     NativeToolCall,
@@ -304,49 +306,39 @@ def test_proactive_care_screen_context_flag_controls_active_care() -> None:
     assert not screen_disabled_settings.allows_screen_context()
 
 
-def test_memory_store_reads_legacy_memory_without_pending_updates() -> None:
-    store = MemoryStore(_runtime_json_path("memory"))
-    store.path.parent.mkdir(parents=True, exist_ok=True)
-    store.path.write_text(
-        json.dumps(
-            {
-                "memories": [
-                    {
-                        "id": "abc123",
-                        "category": "fact",
-                        "content": "主人是 Sakura 的开发者",
-                        "created_at": "2026-05-30T17:13:44+08:00",
-                        "updated_at": "2026-05-30T17:14:16+08:00",
-                    }
-                ],
-                "pending_updates": [
-                    {
-                        "id": "pending",
-                        "category": "preference",
-                        "content": "旧候选记忆会被忽略",
-                    }
-                ],
-            },
-            ensure_ascii=False,
+def test_memory_store_builds_local_mem0_config() -> None:
+    root = _runtime_root_path("memory_config")
+    store = MemoryStore(
+        base_dir=root,
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
         ),
-        encoding="utf-8",
+        scope_id="sakura",
     )
 
-    snapshot = store.snapshot()
+    config = store.build_mem0_config()
 
-    assert len(snapshot["memories"]) == 1
-    assert snapshot["memories"][0]["source"] == "legacy"
-    assert "pending_updates" not in snapshot
+    assert config["vector_store"]["provider"] == "qdrant"
+    assert config["vector_store"]["config"]["collection_name"] == "sakura_memories"
+    assert config["vector_store"]["config"]["embedding_model_dims"] == 384
+    assert config["vector_store"]["config"]["path"].endswith("data/memory/qdrant")
+    assert config["history_db_path"].endswith("data\\memory\\mem0_history.db") or config[
+        "history_db_path"
+    ].endswith("data/memory/mem0_history.db")
+    assert config["llm"]["config"]["model"] == "test-model"
+    assert config["llm"]["config"]["api_key"] == "test-key"
+    assert config["llm"]["config"]["openai_base_url"] == "https://api.example.com/v1"
+    assert config["embedder"]["provider"] == "huggingface"
 
 
 def test_memory_store_create_update_search_and_delete() -> None:
-    store = MemoryStore(_runtime_json_path("memory"))
+    fake = FakeMem0()
+    store = MemoryStore(base_dir=_runtime_root_path("memory"), scope_id="sakura", memory_client=fake)
     created = store.create_memory(
         {
-            "category": "project",
             "content": "Sakura 正在实现自动记忆整理",
-            "importance": 0.8,
-            "confidence": 0.9,
         }
     )["memory"]
 
@@ -354,30 +346,37 @@ def test_memory_store_create_update_search_and_delete() -> None:
         {
             "id": created["id"],
             "content": "Sakura 正在实现自动记忆整理和管理页",
-            "importance": 0.95,
         }
     )["memory"]
 
-    search_result = store.search_memory({"keyword": "管理页", "category": "project"})
+    search_result = store.search_memory({"query": "管理页"})
     assert search_result["memories"] == [updated]
 
-    removed = store.delete_memory({"id": created["id"]})["memory"]
+    removed = store.forget_memory({"id": created["id"]})["forgotten"]
     assert removed["content"] == "Sakura 正在实现自动记忆整理和管理页"
-    assert store.snapshot()["memories"] == []
+    assert store.list_memories() == []
 
 
-def test_memory_store_rejects_sensitive_auto_memory() -> None:
-    store = MemoryStore(_runtime_json_path("memory"))
+def test_memory_store_uses_vendored_mem0_path_first() -> None:
+    from app.agent.memory import MEM0_VENDOR_ROOT, install_mem0_vendor
 
-    result = store.upsert_auto_memory(
-        {
-            "category": "fact",
-            "content": "API_KEY=sk-1234567890abcdef1234567890abcdef",
-        }
+    vendor_root = install_mem0_vendor()
+
+    assert vendor_root == MEM0_VENDOR_ROOT
+    assert str(MEM0_VENDOR_ROOT) == sys.path[0]
+
+
+def test_builtin_registry_registers_mem0_memory_tools() -> None:
+    registry = create_builtin_tool_registry(
+        _runtime_root_path("builtin_memory_tools"),
+        memory=MemoryStore(memory_client=FakeMem0()),
     )
 
-    assert result["reason"] == "包含敏感凭据或隐私字段"
-    assert store.snapshot()["memories"] == []
+    descriptions = {tool["name"]: tool for tool in registry.describe_tools()}
+
+    assert descriptions["memory_search"]["group"] == "memory"
+    assert descriptions["memory_remember"]["group"] == "memory"
+    assert descriptions["memory_forget"]["group"] == "memory"
 
 
 def test_tool_registry_requires_confirmation_returns_pending_action() -> None:
@@ -519,7 +518,7 @@ def test_tool_registry_describes_group_and_risk_metadata() -> None:
     registry = ToolRegistry(
         [
             Tool(
-                name="search_memory",
+                name="memory_search",
                 description="搜索记忆",
                 group="memory",
                 risk="low",
@@ -2763,6 +2762,62 @@ def _runtime_json_path(name: str) -> Path:
 
 def _runtime_root_path(name: str) -> Path:
     return Path(__file__).resolve().parents[2] / "__pycache__" / "test_runtime" / name / uuid.uuid4().hex
+
+
+class FakeMem0:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def add(self, messages, *, user_id=None, metadata=None, infer=True):  # type: ignore[no-untyped-def]
+        content = messages if isinstance(messages, str) else messages[0]["content"]
+        record = {
+            "id": uuid.uuid4().hex[:8],
+            "memory": str(content),
+            "user_id": user_id,
+            "metadata": metadata or {},
+            "event": "ADD",
+        }
+        self.records.append(record)
+        return {"results": [record]}
+
+    def get_all(self, *, filters=None, top_k=20):  # type: ignore[no-untyped-def]
+        return {"results": self._filtered(filters)[:top_k]}
+
+    def search(self, query, *, filters=None, top_k=20):  # type: ignore[no-untyped-def]
+        results = [
+            record
+            for record in self._filtered(filters)
+            if str(query) in str(record.get("memory", ""))
+        ]
+        return {"results": results[:top_k]}
+
+    def get(self, memory_id):  # type: ignore[no-untyped-def]
+        for record in self.records:
+            if record["id"] == memory_id:
+                return dict(record)
+        return None
+
+    def update(self, memory_id, data, metadata=None):  # type: ignore[no-untyped-def]
+        for record in self.records:
+            if record["id"] == memory_id:
+                record["memory"] = data
+                if metadata:
+                    record["metadata"] = metadata
+                updated = {**record, "event": "UPDATE"}
+                return {"results": [updated]}
+        raise ValueError(memory_id)
+
+    def delete(self, memory_id):  # type: ignore[no-untyped-def]
+        self.records = [record for record in self.records if record["id"] != memory_id]
+        return {"ok": True}
+
+    def _filtered(self, filters):  # type: ignore[no-untyped-def]
+        user_id = (filters or {}).get("user_id")
+        return [
+            dict(record)
+            for record in self.records
+            if user_id is None or record.get("user_id") == user_id
+        ]
 
 
 def _write_mcp_config(root: Path, server_body: str) -> Path:

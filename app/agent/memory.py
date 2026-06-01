@@ -1,336 +1,393 @@
 from __future__ import annotations
 
-import json
-import re
-import uuid
+import logging
+import sys
+import threading
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from app.storage.chat_history import ChatHistoryEntry
+
+if TYPE_CHECKING:
+    from app.llm.api_client import ApiSettings
 
 
-MEMORY_CATEGORIES = {"preference", "project", "habit", "fact", "relationship"}
-MEMORY_SOURCES = {"auto", "manual", "legacy", "imported"}
+logger = logging.getLogger(__name__)
 
-_SENSITIVE_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"\b(api[_-]?key|secret|token|password|passwd|pwd)\b\s*[:=]",
-        r"\b(sk-[A-Za-z0-9_\-]{16,})\b",
-        r"\b[A-Za-z0-9_\-]{24,}\.[A-Za-z0-9_\-]{12,}\.[A-Za-z0-9_\-]{12,}\b",
-        r"\b(?:\d[ -]*?){13,19}\b",
-        r"\b\d{17}[\dXx]\b",
-        r"(密码|口令|密钥|令牌|银行卡|信用卡|身份证)\s*[:：]",
-    )
-]
+MEM0_VENDOR_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "mem0"
+DEFAULT_MEMORY_SCOPE = "sakura"
+DEFAULT_COLLECTION_NAME = "sakura_memories"
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_DIMS = 384
+DEFAULT_MEMORY_LIMIT = 20
+
+
+def install_mem0_vendor() -> Path:
+    """优先把仓库内置的 mem0 放到导入路径最前面。"""
+
+    vendor_path = str(MEM0_VENDOR_ROOT)
+    if MEM0_VENDOR_ROOT.exists():
+        if vendor_path in sys.path:
+            sys.path.remove(vendor_path)
+        sys.path.insert(0, vendor_path)
+    return MEM0_VENDOR_ROOT
+
+
+install_mem0_vendor()
+
+
+@dataclass
+class MemoryCurationCounts:
+    """mem0 写入结果的轻量统计。"""
+
+    created: int = 0
+    updated: int = 0
+    deleted: int = 0
+    ignored: int = 0
+    total: int = 0
 
 
 @dataclass
 class MemoryStore:
-    """按 JSON 保存正式长期记忆。"""
+    """Sakura 对本地内置 mem0 的适配层。"""
 
-    path: Path | None = None
-    values: dict[str, Any] = field(default_factory=dict)
+    base_dir: Path | None = None
+    api_settings: "ApiSettings | None" = None
+    scope_id: str = DEFAULT_MEMORY_SCOPE
+    memory_client: Any | None = None
+    _memory: Any | None = field(default=None, init=False, repr=False)
+    _loading: bool = field(default=False, init=False, repr=False)
+    _loading_started_at: float = field(default=0.0, init=False, repr=False)
+    _load_error: str = field(default="", init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
-    def snapshot(self) -> dict[str, list[dict[str, Any]]]:
-        return self._load()
+    def __post_init__(self) -> None:
+        self.base_dir = _resolve_base_dir(self.base_dir)
+        self.scope_id = _normalize_scope_id(self.scope_id)
+        if self.memory_client is not None:
+            self._memory = self.memory_client
 
-    def list_memories(self, include_archived: bool = False) -> list[dict[str, Any]]:
-        data = self._load()
-        memories = data["memories"]
-        if include_archived:
-            return memories
-        return [memory for memory in memories if not memory.get("archived", False)]
+    def set_scope(self, scope_id: str) -> None:
+        """切换角色后更新 mem0 user_id 作用域。"""
+
+        self.scope_id = _normalize_scope_id(scope_id)
+
+    def set_api_settings(self, api_settings: "ApiSettings") -> None:
+        """API 设置变更后重置 mem0，下次使用新配置重新初始化。"""
+
+        self.api_settings = api_settings
+        self.reset_runtime()
+
+    def reset_runtime(self) -> None:
+        with self._lock:
+            self._memory = self.memory_client
+            self._loading = False
+            self._loading_started_at = 0.0
+            self._load_error = ""
+
+    def build_mem0_config(self) -> dict[str, Any]:
+        """生成 mem0 配置：本地 Qdrant + Sakura 当前 OpenAI-compatible LLM。"""
+
+        memory_dir = self.base_dir / "data" / "memory"
+        qdrant_path = memory_dir / "qdrant"
+        qdrant_path.mkdir(parents=True, exist_ok=True)
+
+        llm_config: dict[str, Any] = {
+            "provider": "openai",
+            "config": {
+                "model": "gpt-4.1-mini",
+                "temperature": 0.1,
+                "max_tokens": 2000,
+            },
+        }
+        if self.api_settings is not None:
+            llm_config["config"]["model"] = self.api_settings.model or "gpt-4.1-mini"
+            if self.api_settings.api_key:
+                llm_config["config"]["api_key"] = self.api_settings.api_key
+            if self.api_settings.base_url:
+                llm_config["config"]["openai_base_url"] = self.api_settings.base_url.rstrip("/")
+
+        return {
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "path": qdrant_path.as_posix(),
+                    "collection_name": DEFAULT_COLLECTION_NAME,
+                    "embedding_model_dims": DEFAULT_EMBEDDING_DIMS,
+                    "on_disk": True,
+                },
+            },
+            "llm": llm_config,
+            "embedder": {
+                "provider": "huggingface",
+                "config": {
+                    "model": DEFAULT_EMBEDDING_MODEL,
+                    "embedding_dims": DEFAULT_EMBEDDING_DIMS,
+                },
+            },
+            "history_db_path": str(memory_dir / "mem0_history.db"),
+        }
 
     def summary(self, limit: int = 12) -> str:
-        memories = _rank_memories(self.list_memories())[:limit]
+        mem = self._get_memory(wait=False)
+        if mem is None:
+            return "长期记忆系统正在初始化。"
+        raw = mem.get_all(filters={"user_id": self.scope_id}, top_k=limit)
+        memories = _normalize_memory_results(raw)
         if not memories:
             return "暂无长期记忆。"
-
         lines = ["长期记忆："]
         for memory in memories:
-            lines.append(
-                "- [{id}] {category} "
-                "(重要度 {importance:.2f} / 置信度 {confidence:.2f}): {content}".format(
-                    id=memory.get("id", ""),
-                    category=memory.get("category", ""),
-                    importance=_float_in_range(memory.get("importance"), default=0.5),
-                    confidence=_float_in_range(memory.get("confidence"), default=0.7),
-                    content=memory.get("content", ""),
-                )
-            )
+            memory_id = str(memory.get("id", ""))
+            content = str(memory.get("content", ""))
+            lines.append(f"- [{memory_id}] {content}")
         return "\n".join(lines)
 
-    def search_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        keyword = _optional_text(arguments, "keyword").lower()
-        category = _optional_text(arguments, "category")
-        include_archived = bool(arguments.get("include_archived", False))
-        if category:
-            category = _normalize_category(category)
-        memories = [
-            memory
-            for memory in self.list_memories(include_archived=include_archived)
-            if _matches_memory(memory, keyword, category)
-        ]
-        return {"memories": _rank_memories(memories)}
+    def list_memories(self, *, limit: int = DEFAULT_MEMORY_LIMIT) -> list[dict[str, Any]]:
+        mem = self._get_memory()
+        raw = mem.get_all(filters={"user_id": self.scope_id}, top_k=limit)
+        return _normalize_memory_results(raw)
 
-    def create_memory(self, arguments: dict[str, Any], *, allow_sensitive: bool = False) -> dict[str, Any]:
-        content = _required_text(arguments, "content")
-        source = _normalize_source(_optional_text(arguments, "source") or "manual")
-        if not allow_sensitive and source != "manual" and is_sensitive_memory_content(content):
-            raise ValueError("自动记忆包含敏感凭据或隐私字段，已拒绝写入。")
-
-        now = _now_iso()
-        memory = {
-            "id": _optional_text(arguments, "id") or uuid.uuid4().hex[:8],
-            "category": _normalize_category(_required_text(arguments, "category")),
-            "content": content,
-            "importance": _float_in_range(arguments.get("importance"), default=0.7),
-            "confidence": _float_in_range(arguments.get("confidence"), default=0.8),
-            "created_at": _optional_text(arguments, "created_at") or now,
-            "updated_at": _optional_text(arguments, "updated_at") or now,
-            "last_seen_at": _optional_text(arguments, "last_seen_at") or now,
-            "seen_count": _positive_int(arguments.get("seen_count"), default=1),
-            "source": source,
-            "archived": bool(arguments.get("archived", False)),
+    def search_memory(
+        self,
+        arguments: dict[str, Any],
+        *,
+        wait: bool = True,
+    ) -> dict[str, Any]:
+        query = _optional_text(arguments, "query") or _optional_text(arguments, "keyword")
+        limit = _positive_int(arguments.get("limit") or arguments.get("top_k"), DEFAULT_MEMORY_LIMIT)
+        mem = self._get_memory(wait=wait)
+        if mem is None:
+            return self._loading_response()
+        raw = (
+            mem.get_all(filters={"user_id": self.scope_id}, top_k=limit)
+            if not query
+            else mem.search(query, filters={"user_id": self.scope_id}, top_k=limit)
+        )
+        memories = _normalize_memory_results(raw)
+        return {
+            "agent_id": self.scope_id,
+            "query": query,
+            "count": len(memories),
+            "memories": memories,
         }
-        data = self._load()
-        data["memories"].append(memory)
-        self._save(data)
-        return {"memory": memory}
 
-    def update_memory(self, arguments: dict[str, Any], *, allow_sensitive: bool = False) -> dict[str, Any]:
+    def create_memory(
+        self,
+        arguments: dict[str, Any],
+        *,
+        allow_sensitive: bool = False,
+        wait: bool = True,
+    ) -> dict[str, Any]:
+        _ = allow_sensitive
+        content = _required_text(arguments, "content")
+        mem = self._get_memory(wait=wait)
+        if mem is None:
+            return self._loading_response()
+        metadata = _memory_metadata(arguments)
+        raw = mem.add(content, user_id=self.scope_id, metadata=metadata or None, infer=False)
+        memory = _first_memory_result(raw) or {"content": content, "memory": content}
+        return {"memory": memory, "ok": True}
+
+    def remember_memory(self, arguments: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
+        return self.create_memory(arguments, allow_sensitive=True, wait=wait)
+
+    def update_memory(
+        self,
+        arguments: dict[str, Any],
+        *,
+        allow_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        _ = allow_sensitive
         memory_id = _required_text(arguments, "id")
-        data = self._load()
-        for index, memory in enumerate(data["memories"]):
-            if memory.get("id") != memory_id:
-                continue
-            updated = dict(memory)
-            if "category" in arguments:
-                updated["category"] = _normalize_category(_required_text(arguments, "category"))
-            if "content" in arguments:
-                content = _required_text(arguments, "content")
-                source = _normalize_source(str(updated.get("source") or "manual"))
-                if not allow_sensitive and source != "manual" and is_sensitive_memory_content(content):
-                    raise ValueError("自动记忆包含敏感凭据或隐私字段，已拒绝写入。")
-                updated["content"] = content
-            if "importance" in arguments:
-                updated["importance"] = _float_in_range(arguments.get("importance"), default=updated["importance"])
-            if "confidence" in arguments:
-                updated["confidence"] = _float_in_range(arguments.get("confidence"), default=updated["confidence"])
-            if "last_seen_at" in arguments:
-                updated["last_seen_at"] = _optional_text(arguments, "last_seen_at") or _now_iso()
-            if "seen_count" in arguments:
-                updated["seen_count"] = _positive_int(arguments.get("seen_count"), default=updated["seen_count"])
-            if "source" in arguments:
-                updated["source"] = _normalize_source(_required_text(arguments, "source"))
-            if "archived" in arguments:
-                updated["archived"] = bool(arguments.get("archived", False))
-            updated["updated_at"] = _now_iso()
-            data["memories"][index] = _normalize_memory_record(updated)
-            self._save(data)
-            return {"memory": data["memories"][index]}
-        raise ValueError(f"未找到记忆：{memory_id}")
+        content = _required_text(arguments, "content")
+        mem = self._get_memory()
+        metadata = _memory_metadata(arguments)
+        raw = mem.update(memory_id, content, metadata=metadata or None)
+        current = _normalize_memory_record(mem.get(memory_id))
+        memory = current or _first_memory_result(raw) or {"id": memory_id, "content": content, "memory": content}
+        return {"memory": memory}
 
     def delete_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
-        data = self._load()
-        for index, memory in enumerate(data["memories"]):
-            if memory.get("id") != memory_id:
-                continue
-            removed = data["memories"].pop(index)
-            self._save(data)
-            return {"memory": removed}
-        raise ValueError(f"未找到记忆：{memory_id}")
+        mem = self._get_memory()
+        previous = _normalize_memory_record(mem.get(memory_id))
+        mem.delete(memory_id)
+        return {"memory": previous or {"id": memory_id, "content": ""}}
 
-    def archive_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self.update_memory({"id": _required_text(arguments, "id"), "archived": True})
+    def forget_memory(self, arguments: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
+        memory_id = _required_text(arguments, "id")
+        mem = self._get_memory(wait=wait)
+        if mem is None:
+            return self._loading_response()
+        previous = _normalize_memory_record(mem.get(memory_id))
+        mem.delete(memory_id)
+        forgotten = previous or {"id": memory_id, "content": ""}
+        return {"forgotten": forgotten, "memory": forgotten}
 
-    def forget_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        removed = self.delete_memory(arguments)["memory"]
-        return {"forgotten": removed}
+    def add_history_entries(self, entries: list[ChatHistoryEntry]) -> MemoryCurationCounts:
+        messages = _entries_for_mem0(entries)
+        if not messages:
+            return MemoryCurationCounts(total=len(entries))
+        mem = self._get_memory()
+        raw = mem.add(messages, user_id=self.scope_id, infer=True)
+        return _count_mem0_events(raw, total=len(messages))
 
-    def upsert_auto_memory(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        content = _required_text(arguments, "content")
-        if is_sensitive_memory_content(content):
-            return {"ignored": content, "reason": "包含敏感凭据或隐私字段"}
+    def _get_memory(self, *, wait: bool = True) -> Any | None:
+        with self._lock:
+            if self._memory is not None:
+                return self._memory
+            if self._load_error and not self._loading:
+                raise RuntimeError(self._load_error)
+            if not self._loading:
+                self._start_loading_locked()
+            if not wait:
+                return None
 
-        category = _normalize_category(_required_text(arguments, "category"))
-        data = self._load()
-        existing = _find_duplicate_memory(data["memories"], category, content)
-        if existing is None:
-            payload = {
-                **arguments,
-                "category": category,
-                "content": content,
-                "source": "auto",
-                "seen_count": _positive_int(arguments.get("seen_count"), default=1),
-            }
-            return {"created": self.create_memory(payload)["memory"]}
+        while True:
+            with self._lock:
+                if self._memory is not None:
+                    return self._memory
+                if not self._loading:
+                    break
+            time.sleep(0.2)
 
-        seen_count = _positive_int(existing.get("seen_count"), default=1) + 1
-        update_payload = {
-            "id": existing["id"],
-            "content": content,
-            "importance": max(
-                _float_in_range(existing.get("importance"), default=0.7),
-                _float_in_range(arguments.get("importance"), default=0.7),
-            ),
-            "confidence": max(
-                _float_in_range(existing.get("confidence"), default=0.8),
-                _float_in_range(arguments.get("confidence"), default=0.8),
-            ),
-            "last_seen_at": _now_iso(),
-            "seen_count": seen_count,
-            "archived": False,
-        }
-        return {"updated": self.update_memory(update_payload)["memory"]}
+        with self._lock:
+            if self._memory is not None:
+                return self._memory
+            if self._load_error:
+                raise RuntimeError(self._load_error)
+        raise RuntimeError("mem0 加载失败")
 
-    def apply_curation_operations(self, operations: list[dict[str, Any]]) -> dict[str, int]:
-        result = {"created": 0, "updated": 0, "archived": 0, "ignored": 0}
-        for operation in operations:
-            if not isinstance(operation, dict):
-                result["ignored"] += 1
-                continue
-            action = _optional_text(operation, "action").lower()
+    def _start_loading_locked(self) -> None:
+        self._loading = True
+        self._loading_started_at = time.time()
+        self._load_error = ""
+
+        def load() -> None:
             try:
-                if action == "create":
-                    applied = self.upsert_auto_memory(operation)
-                    if "created" in applied:
-                        result["created"] += 1
-                    elif "updated" in applied:
-                        result["updated"] += 1
-                    else:
-                        result["ignored"] += 1
-                elif action == "update":
-                    memory_id = _required_text(operation, "id")
-                    payload = {"id": memory_id, **operation}
-                    payload.pop("action", None)
-                    payload["source"] = operation.get("source", "auto")
-                    self.update_memory(payload)
-                    result["updated"] += 1
-                elif action == "archive":
-                    self.archive_memory({"id": _required_text(operation, "id")})
-                    result["archived"] += 1
-                else:
-                    result["ignored"] += 1
-            except ValueError:
-                result["ignored"] += 1
-        return result
+                mem = self._create_memory_client()
+            except Exception as exc:
+                logger.exception("mem0 初始化失败")
+                with self._lock:
+                    self._load_error = str(exc)
+                    self._loading = False
+                return
+            with self._lock:
+                self._memory = mem
+                self._loading = False
 
-    def _load(self) -> dict[str, list[dict[str, Any]]]:
-        if self.path is None:
-            return _normalize_data(self.values)
-        if not self.path.exists():
-            return {"memories": []}
+        thread = threading.Thread(target=load, name="sakura-mem0-loader", daemon=True)
+        thread.start()
 
-        try:
-            raw_data = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"记忆文件不是有效 JSON：{self.path}") from exc
-        return _normalize_data(raw_data)
+    def _create_memory_client(self) -> Any:
+        install_mem0_vendor()
+        from mem0 import Memory
 
-    def _save(self, data: dict[str, list[dict[str, Any]]]) -> None:
-        normalized = _normalize_data(data)
-        if self.path is None:
-            self.values = normalized
-            return
+        return Memory.from_config(self.build_mem0_config())
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+    def _loading_response(self) -> dict[str, Any]:
+        elapsed = int(time.time() - self._loading_started_at) if self._loading_started_at else 0
+        return {
+            "status": "loading",
+            "message": (
+                f"记忆系统正在初始化（已等待 {elapsed} 秒）。"
+                "请告诉主人记忆系统稍后就绪，不要连续重复调用记忆工具。"
+            ),
+            "memories": [],
+        }
 
 
-def is_sensitive_memory_content(content: str) -> bool:
-    text = content.strip()
-    if not text:
-        return False
-    return any(pattern.search(text) for pattern in _SENSITIVE_PATTERNS)
+def _resolve_base_dir(base_dir: Path | None) -> Path:
+    if base_dir is None:
+        return Path.cwd()
+    path = Path(base_dir)
+    if path.name == "memory.json" and path.parent.name == "data":
+        return path.parent.parent
+    return path
 
 
-def _normalize_data(raw_data: Any) -> dict[str, list[dict[str, Any]]]:
-    if not isinstance(raw_data, dict):
-        raise ValueError("记忆文件格式无效，顶层必须是 JSON object。")
-    memories = _normalize_memory_records(raw_data.get("memories", []))
-    return {"memories": memories}
+def _normalize_scope_id(scope_id: str | None) -> str:
+    text = (scope_id or "").strip()
+    return text if text and not any(ch.isspace() for ch in text) else DEFAULT_MEMORY_SCOPE
 
 
-def _normalize_memory_records(records: Any) -> list[dict[str, Any]]:
-    if not isinstance(records, list):
-        raise ValueError("记忆文件格式无效，memories 必须是列表。")
-    result: list[dict[str, Any]] = []
-    for item in records:
-        if not isinstance(item, dict):
+def _normalize_memory_results(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, dict):
+        candidates = raw.get("results") or raw.get("memories") or []
+    else:
+        candidates = raw
+    if not isinstance(candidates, list):
+        return []
+    memories: list[dict[str, Any]] = []
+    for item in candidates:
+        memory = _normalize_memory_record(item)
+        if memory is not None:
+            memories.append(memory)
+    return memories
+
+
+def _normalize_memory_record(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    content = str(raw.get("memory") or raw.get("content") or raw.get("data") or "").strip()
+    memory_id = str(raw.get("id") or raw.get("memory_id") or "").strip()
+    if not content and not memory_id:
+        return None
+    memory = dict(raw)
+    memory["id"] = memory_id
+    memory["content"] = content
+    memory["memory"] = content
+    return memory
+
+
+def _first_memory_result(raw: Any) -> dict[str, Any] | None:
+    memories = _normalize_memory_results(raw)
+    return memories[0] if memories else _normalize_memory_record(raw)
+
+
+def _memory_metadata(arguments: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key in ("category", "importance", "confidence", "source"):
+        value = arguments.get(key)
+        if value not in (None, ""):
+            metadata[key] = value
+    return metadata
+
+
+def _entries_for_mem0(entries: list[ChatHistoryEntry]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for entry in entries:
+        if entry.role not in {"user", "assistant"}:
             continue
-        try:
-            result.append(_normalize_memory_record(item))
-        except ValueError:
+        content = entry.content.strip()
+        if not content:
             continue
-    return result
+        if entry.translation.strip():
+            content = f"{content}\n中文翻译：{entry.translation.strip()}"
+        messages.append({"role": entry.role, "content": content})
+    return messages
 
 
-def _normalize_memory_record(item: dict[str, Any]) -> dict[str, Any]:
-    memory_id = item.get("id")
-    category = item.get("category")
-    content = item.get("content")
-    if not all(isinstance(value, str) and value.strip() for value in (memory_id, category, content)):
-        raise ValueError("记忆记录缺少 id、category 或 content。")
-    now = _now_iso()
-    created_at = _text_or_default(item.get("created_at"), now)
-    updated_at = _text_or_default(item.get("updated_at"), created_at)
-    return {
-        "id": memory_id.strip(),
-        "category": _normalize_category(category),
-        "content": content.strip(),
-        "importance": _float_in_range(item.get("importance"), default=0.65),
-        "confidence": _float_in_range(item.get("confidence"), default=0.8),
-        "created_at": created_at,
-        "updated_at": updated_at,
-        "last_seen_at": _text_or_default(item.get("last_seen_at"), updated_at),
-        "seen_count": _positive_int(item.get("seen_count"), default=1),
-        "source": _normalize_source(str(item.get("source") or "legacy")),
-        "archived": bool(item.get("archived", False)),
-    }
-
-
-def _rank_memories(memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(
-        memories,
-        key=lambda memory: (
-            _float_in_range(memory.get("importance"), default=0.5)
-            * _float_in_range(memory.get("confidence"), default=0.7),
-            str(memory.get("last_seen_at", "")),
-            _positive_int(memory.get("seen_count"), default=1),
-        ),
-        reverse=True,
-    )
-
-
-def _find_duplicate_memory(
-    memories: list[dict[str, Any]],
-    category: str,
-    content: str,
-) -> dict[str, Any] | None:
-    normalized_content = _normalize_for_match(content)
-    for memory in memories:
-        if memory.get("category") != category:
-            continue
-        if _normalize_for_match(str(memory.get("content", ""))) == normalized_content:
-            return memory
-    return None
-
-
-def _matches_memory(memory: dict[str, Any], keyword: str, category: str) -> bool:
-    if category and memory.get("category") != category:
-        return False
-    if not keyword:
-        return True
-    content = str(memory.get("content", "")).lower()
-    memory_id = str(memory.get("id", "")).lower()
-    memory_category = str(memory.get("category", "")).lower()
-    return keyword in content or keyword in memory_id or keyword in memory_category
+def _count_mem0_events(raw: Any, *, total: int) -> MemoryCurationCounts:
+    results = _normalize_memory_results(raw)
+    counts = MemoryCurationCounts(total=total)
+    if not results:
+        counts.ignored = total
+        return counts
+    for item in results:
+        event = str(item.get("event") or item.get("action") or "").upper()
+        if event in {"ADD", "CREATE", "CREATED"}:
+            counts.created += 1
+        elif event in {"UPDATE", "UPDATED"}:
+            counts.updated += 1
+        elif event in {"DELETE", "ARCHIVE", "DELETED", "ARCHIVED"}:
+            counts.deleted += 1
+        else:
+            counts.ignored += 1
+    return counts
 
 
 def _required_text(arguments: dict[str, Any], key: str) -> str:
@@ -345,43 +402,9 @@ def _optional_text(arguments: dict[str, Any], key: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _normalize_category(category: str) -> str:
-    normalized = category.strip()
-    if normalized not in MEMORY_CATEGORIES:
-        raise ValueError(f"记忆分类必须是：{', '.join(sorted(MEMORY_CATEGORIES))}")
-    return normalized
-
-
-def _normalize_source(source: str) -> str:
-    normalized = source.strip().lower()
-    if normalized in MEMORY_SOURCES:
-        return normalized
-    return "manual"
-
-
-def _float_in_range(value: Any, *, default: float) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        number = default
-    return max(0.0, min(1.0, number))
-
-
-def _positive_int(value: Any, *, default: int) -> int:
+def _positive_int(value: Any, default: int) -> int:
     try:
         number = int(value)
     except (TypeError, ValueError):
-        number = default
+        return default
     return max(1, number)
-
-
-def _text_or_default(value: Any, default: str) -> str:
-    return value.strip() if isinstance(value, str) and value.strip() else default
-
-
-def _normalize_for_match(content: str) -> str:
-    return re.sub(r"\s+", "", content).casefold()
-
-
-def _now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")

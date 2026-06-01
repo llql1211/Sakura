@@ -73,7 +73,11 @@ def build_app_context(base_dir: Path) -> AppContext:
         {"provider": type(tts_provider).__name__},
     )
 
-    memory_store = MemoryStore(base_dir / "data" / "memory.json")
+    memory_store = MemoryStore(
+        base_dir=base_dir,
+        api_settings=settings,
+        scope_id=character_profile.id,
+    )
     reminder_store = ReminderStore(base_dir / "data" / "reminders.json")
     tool_registry = create_builtin_tool_registry(
         base_dir,

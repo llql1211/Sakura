@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from app.agent.memory import MemoryStore
-from app.llm.api_client import ChatMessage, OpenAICompatibleClient
 from app.storage.chat_history import ChatHistoryEntry
 
 
@@ -32,7 +31,7 @@ class MemoryCurationResult:
     def summary(self) -> str:
         return (
             f"整理完成：新增 {self.created} 条，更新 {self.updated} 条，"
-            f"归档 {self.archived} 条，忽略 {self.ignored} 条。"
+            f"删除 {self.archived} 条，忽略 {self.ignored} 条。"
         )
 
 
@@ -97,88 +96,32 @@ class MemoryCurationState:
 
 
 class MemoryCurator:
-    """调用模型把聊天历史整理为长期记忆操作。"""
+    """调用 mem0 把聊天历史整理为长期记忆。"""
 
     def __init__(
         self,
-        api_client: OpenAICompatibleClient,
-        memory_store: MemoryStore,
+        api_client_or_memory_store: Any,
+        memory_store: MemoryStore | None = None,
     ) -> None:
-        self.api_client = api_client
-        self.memory_store = memory_store
+        self.api_client = None if memory_store is None else api_client_or_memory_store
+        self.memory_store = (
+            api_client_or_memory_store
+            if memory_store is None
+            else memory_store
+        )
 
     def curate_entries(self, entries: list[ChatHistoryEntry]) -> MemoryCurationResult:
-        history = _entries_for_model(entries)
-        if not history:
+        if not _entries_for_model(entries):
             return MemoryCurationResult(processed_entries=len(entries))
 
-        content = self.api_client.complete_raw(
-            _build_memory_curation_prompt(self.memory_store.snapshot()["memories"]),
-            [{"role": "user", "content": json.dumps({"history": history}, ensure_ascii=False)}],
-            temperature=0.2,
-        )
-        operations = _parse_operations(content)
-        counts = self.memory_store.apply_curation_operations(operations)
+        counts = self.memory_store.add_history_entries(entries)
         return MemoryCurationResult(
-            created=counts["created"],
-            updated=counts["updated"],
-            archived=counts["archived"],
-            ignored=counts["ignored"],
+            created=counts.created,
+            updated=counts.updated,
+            archived=counts.deleted,
+            ignored=counts.ignored,
             processed_entries=len(entries),
         )
-
-
-def _build_memory_curation_prompt(memories: list[dict[str, Any]]) -> str:
-    existing_memories = json.dumps(memories, ensure_ascii=False, indent=2)
-    return f"""
-你是 Sakura 的长期记忆整理器。你只负责从聊天历史中提炼长期有用的信息，并输出 JSON。
-不要输出 Markdown，不要解释，不要生成角色回复。
-
-现有长期记忆：
-{existing_memories}
-
-可用分类：
-- preference：用户稳定偏好，例如语言、称呼、回复风格、工具习惯。
-- project：项目状态、技术栈、长期任务目标。
-- habit：反复出现的行为习惯或工作方式。
-- fact：稳定事实。
-- relationship：用户与 Sakura 的关系、称呼、互动边界、长期相处上下文。
-
-整理规则：
-- 只记录未来多轮对话仍有帮助的信息。
-- 不记录一次性闲聊、临时情绪、玩笑、未确认猜测、普通问答过程。
-- 如果新信息与已有记忆重复，用 update；如果只是再次出现同一事实，也可以 update 提升重要度或置信度。
-- 如果发现已有记忆过时或冲突，用 archive。
-- 严禁记录密码、API Key、token、银行卡、身份证件号、支付信息等敏感凭据。
-- importance 和 confidence 必须是 0 到 1 之间的小数。
-
-只返回如下 JSON：
-{{
-  "operations": [
-    {{
-      "action": "create",
-      "category": "preference",
-      "content": "要保存的长期记忆",
-      "importance": 0.8,
-      "confidence": 0.9
-    }},
-    {{
-      "action": "update",
-      "id": "已有记忆 id",
-      "content": "更新后的内容",
-      "importance": 0.8,
-      "confidence": 0.9
-    }},
-    {{
-      "action": "archive",
-      "id": "已有记忆 id"
-    }},
-    {{
-      "action": "ignore"
-    }}
-  ]
-}}
-""".strip()
 
 
 def _entries_for_model(entries: list[ChatHistoryEntry]) -> list[dict[str, str]]:
@@ -198,25 +141,6 @@ def _entries_for_model(entries: list[ChatHistoryEntry]) -> list[dict[str, str]]:
             }
         )
     return result
-
-
-def _parse_operations(content: str) -> list[dict[str, Any]]:
-    data = json.loads(_strip_code_fence(content.strip()))
-    if not isinstance(data, dict):
-        raise ValueError("记忆整理结果必须是 JSON object。")
-    operations = data.get("operations", [])
-    if not isinstance(operations, list):
-        raise ValueError("记忆整理结果缺少 operations 列表。")
-    return [operation for operation in operations if isinstance(operation, dict)]
-
-
-def _strip_code_fence(content: str) -> str:
-    if not content.startswith("```"):
-        return content
-    lines = content.splitlines()
-    if len(lines) >= 3 and lines[-1].strip() == "```":
-        return "\n".join(lines[1:-1]).strip()
-    return content
 
 
 def _normalize_state(raw_data: Any) -> dict[str, Any]:

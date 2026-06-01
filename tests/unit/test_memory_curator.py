@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import uuid
-
-import pytest
 
 from app.agent.memory import MemoryStore
 from app.agent.memory_curator import (
@@ -16,55 +13,37 @@ from app.agent.memory_curator import (
 from app.storage.chat_history import ChatHistoryEntry
 
 
-def test_memory_curator_merges_duplicate_created_memories() -> None:
-    class Client:
-        def complete_raw(self, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
-            return json.dumps(
-                {
-                    "operations": [
-                        {
-                            "action": "create",
-                            "category": "preference",
-                            "content": "主人希望默认用中文沟通",
-                            "importance": 0.8,
-                            "confidence": 0.9,
-                        },
-                        {
-                            "action": "create",
-                            "category": "preference",
-                            "content": "主人希望默认用中文沟通",
-                            "importance": 0.7,
-                            "confidence": 0.85,
-                        },
-                    ]
-                },
-                ensure_ascii=False,
-            )
-
-    store = MemoryStore(_runtime_json_path("memory_curator_merge"))
-    curator = MemoryCurator(Client(), store)  # type: ignore[arg-type]
+def test_memory_curator_writes_history_through_mem0() -> None:
+    fake = FakeMem0()
+    store = MemoryStore(
+        base_dir=_runtime_root("memory_curator"),
+        scope_id="sakura",
+        memory_client=fake,
+    )
+    curator = MemoryCurator(store)
 
     result = curator.curate_entries([_entry("user", "以后默认中文和我说话")])
 
-    memories = store.snapshot()["memories"]
     assert result.created == 1
-    assert result.updated == 1
-    assert len(memories) == 1
-    assert memories[0]["seen_count"] == 2
+    assert result.processed_entries == 1
+    assert fake.calls[0]["infer"] is True
+    assert fake.calls[0]["user_id"] == "sakura"
+    assert fake.calls[0]["messages"][0]["content"] == "以后默认中文和我说话"
 
 
-def test_memory_curator_invalid_json_does_not_write_memory() -> None:
-    class Client:
-        def complete_raw(self, *_args, **_kwargs) -> str:  # type: ignore[no-untyped-def]
-            return "不是 JSON"
+def test_memory_curator_ignores_non_dialog_entries() -> None:
+    fake = FakeMem0()
+    store = MemoryStore(
+        base_dir=_runtime_root("memory_curator_empty"),
+        memory_client=fake,
+    )
+    curator = MemoryCurator(store)
 
-    store = MemoryStore(_runtime_json_path("memory_curator_invalid"))
-    curator = MemoryCurator(Client(), store)  # type: ignore[arg-type]
+    result = curator.curate_entries([_entry("system", "内部记录")])
 
-    with pytest.raises(json.JSONDecodeError):
-        curator.curate_entries([_entry("user", "记住一个重要偏好")])
-
-    assert store.snapshot()["memories"] == []
+    assert result.processed_entries == 1
+    assert result.created == 0
+    assert fake.calls == []
 
 
 def test_memory_curation_state_waits_until_trigger_turns() -> None:
@@ -122,3 +101,38 @@ def _runtime_json_path(name: str) -> Path:
         / uuid.uuid4().hex
         / f"{name}.json"
     )
+
+
+def _runtime_root(name: str) -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "__pycache__"
+        / "test_runtime"
+        / name
+        / uuid.uuid4().hex
+    )
+
+
+class FakeMem0:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def add(self, messages, *, user_id=None, infer=True, metadata=None):  # type: ignore[no-untyped-def]
+        self.calls.append(
+            {
+                "messages": messages,
+                "user_id": user_id,
+                "infer": infer,
+                "metadata": metadata,
+            }
+        )
+        return {
+            "results": [
+                {
+                    "id": "mem1",
+                    "memory": "主人希望默认用中文沟通",
+                    "user_id": user_id,
+                    "event": "ADD",
+                }
+            ]
+        }

@@ -159,31 +159,49 @@ def create_builtin_tool_registry(
                 requires_confirmation=True,
             ),
             Tool(
-                name="search_memory",
-                description="搜索已确认长期记忆。适合在用户询问偏好、习惯、项目状态等已知信息时使用。",
+                name="memory_search",
+                description=(
+                    "搜索 Sakura 的长期记忆。需要跨会话信息、用户偏好、项目状态或过往约定时使用。"
+                    "首次调用可能返回 status='loading'，这时直接告诉主人记忆系统正在初始化，不要重复调用。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "keyword": {"type": "string", "description": "搜索关键词，可为空。"},
-                        "category": {
-                            "type": "string",
-                            "description": "可选分类：preference、project、habit、fact、relationship。",
-                        },
+                        "query": {"type": "string", "description": "搜索关键词，可为空；为空时列出最近记忆。"},
+                        "limit": {"type": "integer", "description": "最多返回多少条，默认 20。"},
                     },
                 },
-                handler=memory.search_memory,
+                handler=lambda arguments: memory.search_memory(arguments, wait=False),
+                group="memory",
             ),
             Tool(
-                name="forget_memory",
-                description="在用户明确要求忘记某条信息时，按 id 删除正式长期记忆。",
+                name="memory_remember",
+                description=(
+                    "保存一条明确、长期有用的记忆。只在用户明确要求记住，或信息明显会长期帮助陪伴/协作时使用。"
+                    "不要保存密码、token、密钥、身份证、银行卡等敏感凭据。"
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string", "description": "正式记忆 id。"},
+                        "content": {"type": "string", "description": "要保存的长期记忆内容。"},
                     },
-                    "required": ["id"],
+                    "required": ["content"],
                 },
-                handler=memory.forget_memory,
+                handler=lambda arguments: memory.remember_memory(arguments, wait=False),
+                group="memory",
+            ),
+            Tool(
+                name="memory_forget",
+                description="在用户明确要求忘记某条信息时，按 memory_id 删除长期记忆。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
+                    },
+                    "required": ["memory_id"],
+                },
+                handler=lambda arguments: memory.forget_memory(_memory_forget_arguments(arguments), wait=False),
+                group="memory",
             ),
         ]
     )
@@ -225,6 +243,11 @@ def get_current_time() -> dict[str, str]:
         "datetime": now.isoformat(timespec="seconds"),
         "timezone": now.tzname() or "",
     }
+
+
+def _memory_forget_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    memory_id = arguments.get("memory_id") or arguments.get("id")
+    return {"id": memory_id}
 
 
 class TodoStore:

@@ -21,6 +21,7 @@ temp/
 *.log
 data/chat_history.jsonl
 data/chat_history/sakura.jsonl
+data/memory/
 data/memory.json
 data/memory_curation_state.json
 data/reminders.json
@@ -32,8 +33,11 @@ data/config/system_config.yaml
 task.md
 log.txt
 
-# Plugin安装目录
-plugins/
+# Plugin安装目录（只保留仓库内置插件，其他本地安装插件继续忽略）
+plugins/*
+!plugins/__init__.py
+!plugins/playwright_browser/
+!plugins/playwright_browser/**
 
 # 备份文件
 *.bak

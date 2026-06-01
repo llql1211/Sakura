@@ -141,7 +141,7 @@ class AgentRuntime:
         execution_results: list[ToolExecutionResult] = []
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
-        active_groups: set[str] = {"default", "mcp"}
+        active_groups: set[str] = {"default", "mcp", "memory"}
         for step_index in range(MAX_AGENT_STEPS_PER_TURN):
             browser_page_mode = _should_prefer_browser_page_tools(working_messages)
             browser_page_guard_active = (
@@ -249,7 +249,8 @@ class AgentRuntime:
             )
             for call in turn.tool_calls[:allowed_calls]:
                 total_tool_calls += 1
-                call_data = _native_tool_call_to_policy_call(call)
+                execution_arguments = _tool_arguments_for_execution(call, self.tools)
+                call_data = _native_tool_call_to_policy_call(call, execution_arguments)
                 debug_log("AgentRuntime", "准备工具调用", {"step_index": step_index, **call_data})
                 if _should_block_windows_tool_for_browser_page(call_data, browser_page_guard_active):
                     blocked_result = _build_browser_page_windows_tool_block_result(call_data)
@@ -291,7 +292,7 @@ class AgentRuntime:
                     continue
                 prepared = self.tools.prepare_or_execute(
                     call.name,
-                    call.arguments,
+                    execution_arguments,
                     _tool_call_reason(call),
                     tool_call_id=call.id,
                 )
@@ -387,9 +388,13 @@ class AgentRuntime:
                         f"已跳过后续调用 {skipped_call.name}。"
                     )
                     limit_result = ToolExecutionResult(
-                        tool_name=skipped_call.name,
+                        tool_name="runtime",
                         success=False,
-                        content={"skipped": True, "reason": "tool_call_limit"},
+                        content={
+                            "skipped": True,
+                            "reason": "tool_call_limit",
+                            "tool_name": skipped_call.name,
+                        },
                         error=limit_error,
                     )
                     step_results.append(limit_result)
@@ -407,6 +412,37 @@ class AgentRuntime:
                             payload=_redact_tool_result_for_model(limit_result),
                         )
                     )
+
+            executed_calls = [
+                _native_tool_call_to_policy_call(call, _tool_arguments_for_execution(call, self.tools))
+                for call in turn.tool_calls[:allowed_calls]
+            ]
+            if _should_auto_snapshot_after_browser_navigation(executed_calls, step_results, self.tools):
+                snapshot_result = _execute_auto_browser_snapshot(self.tools, step_index)
+                step_results.append(snapshot_result)
+                execution_results.append(snapshot_result)
+                tool_messages.extend(
+                    _build_tool_messages_for_result(
+                        NativeToolCall(
+                            id=f"auto_browser_snapshot_{step_index}",
+                            name=BROWSER_SNAPSHOT_TOOL_NAME,
+                            arguments={},
+                            arguments_json="{}",
+                        ),
+                        snapshot_result,
+                        include_images=self.model_vision_enabled,
+                    )
+                )
+                emitted_actions.append(
+                    AgentAction(
+                        type="tool_call",
+                        payload=_redact_tool_result_for_model(snapshot_result),
+                    )
+                )
+                should_fast_forward_final_reply = _should_fast_forward_after_auto_browser_snapshot(
+                    working_messages,
+                    snapshot_result,
+                )
 
             if pending_actions:
                 debug_log(
@@ -701,7 +737,7 @@ class AgentRuntime:
 - 网页搜索与浏览：web__web_search、web__fetch_url、playwright_navigate、playwright_search_web 等 playwright_* 系列
 - 屏幕观察：observe_screen（仅在启用时可用）
 - 桌面控制与窗口操作：windows_Snapshot、windows_Screenshot、windows_Click 等 windows_* 系列
-- 提醒与记忆：add_reminder、forget_memory
+- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_forget
 调用工具时优先根据领域选择最匹配的工具前缀和名称。如果任务跨越多个领域，可以分步调用。
 
 
@@ -727,8 +763,9 @@ class AgentRuntime:
 {extra_instructions.strip()}
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
 - 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
-- 长期记忆由后台整理器自动维护；你不要尝试写入记忆。
-- 只有用户明确要求忘掉信息时，才使用 forget_memory。
+- 需要跨会话信息、用户偏好或项目状态时，优先使用 memory_search。
+- 只有用户明确要求记住，或信息明显长期有用且不包含敏感凭据时，才使用 memory_remember。
+- 只有用户明确要求忘掉信息时，才使用 memory_forget。
 """.strip()
 
     def _build_proactive_tool_system_prompt(
@@ -811,11 +848,14 @@ def _should_emit_progress(metadata: dict[str, Any]) -> bool:
     return any(str(name).startswith("windows__") for name in tool_names)
 
 
-def _native_tool_call_to_policy_call(call: NativeToolCall) -> dict[str, Any]:
+def _native_tool_call_to_policy_call(
+    call: NativeToolCall,
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "id": call.id,
         "name": call.name,
-        "arguments": call.arguments,
+        "arguments": arguments if arguments is not None else call.arguments,
         "reason": _tool_call_reason(call),
     }
 
@@ -823,6 +863,23 @@ def _native_tool_call_to_policy_call(call: NativeToolCall) -> dict[str, Any]:
 def _tool_call_reason(call: NativeToolCall) -> str:
     reason = call.arguments.get("reason")
     return reason.strip() if isinstance(reason, str) else ""
+
+
+def _tool_arguments_for_execution(call: NativeToolCall, tools: ToolRegistry) -> dict[str, Any]:
+    """移除规划层的 reason 字段，避免它污染真实工具参数。"""
+
+    arguments = dict(call.arguments)
+    if "reason" not in arguments:
+        return arguments
+    tool = tools.get(call.name)
+    properties = {}
+    if tool is not None and isinstance(tool.parameters, dict):
+        raw_properties = tool.parameters.get("properties", {})
+        if isinstance(raw_properties, dict):
+            properties = raw_properties
+    if "reason" not in properties:
+        arguments.pop("reason", None)
+    return arguments
 
 
 def _groups_from_search_tools_result(result: ToolExecutionResult) -> set[str]:
@@ -1869,9 +1926,15 @@ def _summarize_tool_results(results: list[ToolExecutionResult]) -> str:
             elif isinstance(result.content.get("task"), dict):
                 task = result.content["task"]
                 parts.append(f"待办「{task.get('text', '')}」已更新。")
+            elif isinstance(result.content.get("forgotten"), dict):
+                memory = result.content["forgotten"]
+                content = memory.get("content") or memory.get("id", "")
+                parts.append(f"记忆「{content}」已删除。")
             elif isinstance(result.content.get("memory"), dict):
                 memory = result.content["memory"]
                 parts.append(f"记忆「{memory.get('content', '')}」已更新。")
+            elif result.content.get("status") == "loading":
+                parts.append(str(result.content.get("message", "工具正在初始化。")))
             elif result.tool_name == "open_url":
                 parts.append(f"网页已打开：{result.content.get('url', '')}。")
             elif result.tool_name == "open_local_folder":
