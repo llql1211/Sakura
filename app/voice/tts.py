@@ -5,6 +5,7 @@ import re
 import socket
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -75,6 +76,9 @@ class TTSProvider(Protocol):
     def discard_prepared(self, handle: TTSPreparedAudio) -> None:
         """丢弃不再需要的预生成音频。"""
 
+    def warm_up_playback(self) -> None:
+        """提前初始化本地播放器，避免第一句朗读承担冷启动成本。"""
+
 
 class NullTTSProvider:
     def speak(
@@ -127,6 +131,9 @@ class NullTTSProvider:
     def discard_prepared(self, handle: TTSPreparedAudio) -> None:
         debug_log("TTS", "丢弃静音预生成句柄", {"text": handle.text, "tone": handle.tone})
         handle.cancelled = True
+
+    def warm_up_playback(self) -> None:
+        debug_log("TTS", "静音 Provider 跳过播放器预热")
 
 
 class TTSConfigError(RuntimeError):
@@ -256,6 +263,7 @@ class GPTSoVITSTTSProvider(QObject):
         self._tone_indices: dict[str, int] = {}
         self._weights_ready = False
         self._service_checked = False
+        self._playback_warmup_requested = False
 
         self._audio_output: QAudioOutput | None = None
         self._player: QMediaPlayer | None = None
@@ -360,6 +368,39 @@ class GPTSoVITSTTSProvider(QObject):
         if handle.audio_path is not None:
             self._schedule_audio_cleanup(handle.audio_path)
             handle.audio_path = None
+
+    def warm_up_playback(self) -> None:
+        """把 Qt Multimedia 的冷启动提前到空闲阶段完成。"""
+
+        if self._player is not None:
+            debug_log("TTS", "Qt 多媒体播放器已初始化，跳过预热")
+            return
+        if self._playback_warmup_requested:
+            debug_log("TTS", "Qt 多媒体播放器预热已排队，跳过重复请求")
+            return
+        self._playback_warmup_requested = True
+        debug_log("TTS", "安排 Qt 多媒体播放器预热")
+        QTimer.singleShot(0, self._warm_up_playback)
+
+    @Slot()
+    def _warm_up_playback(self) -> None:
+        started_at = time.perf_counter()
+        try:
+            if self._player is not None:
+                debug_log("TTS", "Qt 多媒体播放器已初始化，预热无需执行")
+                return
+            debug_log("TTS", "开始预热 Qt 多媒体播放器")
+            self._ensure_player()
+            debug_log(
+                "TTS",
+                "Qt 多媒体播放器预热完成",
+                {"elapsed_ms": int((time.perf_counter() - started_at) * 1000)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            debug_log("TTS", "Qt 多媒体播放器预热失败", {"error": str(exc)})
+            self._failed.emit(f"Qt 多媒体播放器预热失败：{exc}")
+        finally:
+            self._playback_warmup_requested = False
 
     def _queue_request(self, request: _TTSRequest) -> None:
         with self._request_lock:

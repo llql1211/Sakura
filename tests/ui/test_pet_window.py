@@ -283,13 +283,21 @@ def test_pet_window_unlocks_after_deferred_services_are_applied() -> None:
     from app.ui.pet_window import PetWindow
     from app.voice.tts import NullTTSProvider
 
+    class WarmableTTSProvider(NullTTSProvider):
+        def __init__(self) -> None:
+            self.warm_up_count = 0
+
+        def warm_up_playback(self) -> None:
+            self.warm_up_count += 1
+
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
     root = _build_runtime_root_with_character(qtgui.QPixmap, qtcore.Qt)
     context = build_initial_app_context(root)
     window = PetWindow(context)
+    tts_provider = WarmableTTSProvider()
     services = DeferredStartupServices(
-        tts_provider=NullTTSProvider(),
+        tts_provider=tts_provider,
         tool_registry=context.tool_registry,
         extension_registry=ExtensionRegistry(),
         plugin_manager=SakuraPluginManager(base_dir=root),
@@ -305,6 +313,7 @@ def test_pet_window_unlocks_after_deferred_services_are_applied() -> None:
     assert window.send_button.isEnabled()
     assert window.screenshot_button.isEnabled()
     assert window.subtitle_controller.speech_text == window.character_profile.initial_message
+    assert tts_provider.warm_up_count == 1
 
     window.close()
     window.deleteLater()
@@ -2313,6 +2322,9 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
         def _apply_character(self, profile):  # type: ignore[no-untyped-def]
             self.character_profile = profile
 
+        def _warm_up_tts_playback(self, provider):  # type: ignore[no-untyped-def]
+            self.warmed_tts_provider = provider
+
         def _save_system_config_values(self, section, values):  # type: ignore[no-untyped-def]
             self.settings_service.save_system_values(section, values)
 
@@ -2330,6 +2342,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     window.portrait_scale_percent = 100
     window.retired_tts_providers = []
     window.tts_provider = object()
+    window.warmed_tts_provider = None
     window.voice_playback_controller = VoicePlaybackControllerStub()
     return window
 

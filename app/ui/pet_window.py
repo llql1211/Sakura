@@ -157,6 +157,7 @@ class PetWindow(QWidget):
         self.mcp_tool_provider = context.mcp_tool_provider
         self.plugin_manager = context.plugin_manager
         self.agent_runtime = context.agent_runtime
+        self.conversation_coordinator = context.conversation_coordinator
         self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = context.history_store
@@ -335,6 +336,8 @@ class PetWindow(QWidget):
             preload_segment=self.portrait_controller.preload_for_segment,
         )
         self.speech_timer = self.subtitle_controller.speech_timer
+        if not self.startup_initializing:
+            QTimer.singleShot(0, self._warm_up_current_tts_playback)
 
         bubble_header = QHBoxLayout()
         bubble_header.setContentsMargins(0, 0, 0, 0)
@@ -1028,6 +1031,7 @@ class PetWindow(QWidget):
         self.worker = ChatWorker(
             self.agent_runtime,
             request_messages,
+            conversation_coordinator=self.conversation_coordinator,
             visual_observation_store=getattr(self, "visual_observation_store", None),
             visual_observation_jobs=visual_observation_jobs,
         )
@@ -1574,6 +1578,7 @@ class PetWindow(QWidget):
         self.worker = EventWorker(
             self.agent_runtime,
             event,
+            conversation_coordinator=self.conversation_coordinator,
         )
         self.worker.visual_observation_store = getattr(self, "visual_observation_store", None)
         self.worker.visual_observation_jobs = getattr(self, "pending_event_visual_observation_jobs", [])
@@ -1601,6 +1606,9 @@ class PetWindow(QWidget):
             self._clear_active_event()
             return
         self._clear_active_event()
+        if not result.reply.text.strip() and not result.reply.translation.strip() and not result.actions:
+            self._log_interaction_stage("event_silent", {"event_type": event.type if event else ""})
+            return
         self._consume_agent_result(result)
         if reminder_id is not None:
             self._mark_reminder_completed(reminder_id)
@@ -1876,6 +1884,7 @@ class PetWindow(QWidget):
         self.retired_tts_providers.append(self.tts_provider)
         self.tts_provider = services.tts_provider
         self.voice_playback_controller.set_provider(services.tts_provider)
+        self._warm_up_tts_playback(services.tts_provider)
         self.tool_registry = services.tool_registry
         self.free_access_enabled = self.tool_registry.free_access_enabled
         self.agent_runtime.tools = services.tool_registry
@@ -1925,6 +1934,25 @@ class PetWindow(QWidget):
         if provider.thread() == application.thread():
             return
         provider.moveToThread(application.thread())
+
+    def _warm_up_current_tts_playback(self) -> None:
+        self._warm_up_tts_playback(self.tts_provider)
+
+    def _warm_up_tts_playback(self, provider: TTSProvider) -> None:
+        warm_up = getattr(provider, "warm_up_playback", None)
+        if not callable(warm_up):
+            return
+        try:
+            warm_up()
+        except Exception as exc:  # noqa: BLE001
+            debug_log(
+                "TTS",
+                "播放器预热请求失败",
+                {
+                    "provider": type(provider).__name__,
+                    "error": str(exc),
+                },
+            )
 
     def _apply_startup_initializing_state(self) -> None:
         self.input_edit.setPlaceholderText(STARTUP_INITIALIZING_TEXT)
@@ -2086,6 +2114,7 @@ class PetWindow(QWidget):
         self.retired_tts_providers.append(self.tts_provider)
         self.tts_provider = new_tts_provider
         self.voice_playback_controller.set_provider(new_tts_provider)
+        self._warm_up_tts_playback(new_tts_provider)
         self._apply_character(selected_profile)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())

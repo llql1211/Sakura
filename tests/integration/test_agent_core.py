@@ -1069,6 +1069,62 @@ def test_playwright_search_web_returns_structured_results(monkeypatch: pytest.Mo
     browser.shutdown_browser()
 
 
+def test_playwright_search_web_registry_keeps_default_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    class TitleEl:
+        def inner_text(self) -> str:
+            return "萌娘百科 - 二阶堂真红"
+
+    class SnippetEl:
+        def inner_text(self) -> str:
+            return "二阶堂真红是《五彩斑斓的世界》系列角色。"
+
+    class DisplayUrlEl:
+        def inner_text(self) -> str:
+            return "zh.moegirl.org.cn"
+
+    class LinkEl:
+        def get_attribute(self, name: str) -> str | None:
+            return "https://zh.moegirl.org.cn/二阶堂真红" if name == "href" else None
+
+    class ResultEl:
+        def query_selector(self, selector: str):  # type: ignore[no-untyped-def]
+            if selector == ".result__title":
+                return TitleEl()
+            if selector == ".result__snippet":
+                return SnippetEl()
+            if selector == ".result__url":
+                return DisplayUrlEl()
+            if selector == ".result__a":
+                return LinkEl()
+            return None
+
+    class Page:
+        def goto(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        def query_selector_all(self, selector: str):  # type: ignore[no-untyped-def]
+            return [ResultEl()] if selector == ".result__body" else []
+
+    from plugins.playwright_browser import browser
+
+    monkeypatch.setattr(browser, "_page", None)
+    monkeypatch.setattr(browser, "_bg_executor", None)
+    monkeypatch.setattr(browser, "_browser_thread_id", None)
+    monkeypatch.setattr(browser, "_use_bg_thread", False)
+    monkeypatch.setattr(browser, "_ensure_browser", lambda: Page())
+
+    registry = ToolRegistry()
+    manager = SakuraPluginManager(Path(__file__).resolve().parents[2])
+    manager.load_from_config(registry)
+    try:
+        result = registry.execute("playwright_search_web", {"query": "二阶堂真红 百科"})
+    finally:
+        manager.shutdown_all()
+
+    assert result.success
+    assert "萌娘百科 - 二阶堂真红" in result.content
+
+
 def test_playwright_browser_operations_stay_on_single_worker_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     from plugins.playwright_browser import browser
 
@@ -1853,6 +1909,78 @@ def test_visible_browser_request_blocks_background_search_and_continues_planning
     assert [action.payload["tool_name"] for action in result.actions] == ["runtime"]
     assert not called["web_search"]
     assert client.raw_calls == 2
+
+
+def test_visible_browser_request_keeps_blocking_background_search_after_playwright_failure() -> None:
+    class BrowserFailureThenWebFallbackClient:
+        def __init__(self) -> None:
+            self.raw_calls = 0
+            self.tool_names: list[str] = []
+            self.tool_name_batches: list[list[str]] = []
+            self.messages: list[list[dict[str, object]]] = []
+
+        def complete_raw(self, system_prompt, messages, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            self.raw_calls += 1
+            self.messages.append(messages)
+            if self.raw_calls == 1:
+                assert "web__web_search" not in self.tool_names
+                return (
+                    '{"reply":{"segments":[{"ja":"調べるね。","zh":"我查一下。","tone":"中性"}]},'
+                    '"tool_calls":[{"name":"playwright_search_web","arguments":{"query":"二阶堂真红 百科"},"reason":"可见搜索"}]}'
+                )
+            if self.raw_calls == 2:
+                assert "web__web_search" not in self.tool_names
+                assert "本轮是显式可见浏览器任务" in system_prompt
+                return (
+                    '{"reply":{"segments":[{"ja":"別の方法で探すね。","zh":"我换个方式找。","tone":"中性"}]},'
+                    '"tool_calls":[{"name":"web__web_search","arguments":{"query":"二阶堂真红 百科"},"reason":"后台搜索"}]}'
+                )
+            assert "已阻止 web__web_search" in str(messages)
+            return (
+                '{"reply":{"segments":[{"ja":"ブラウザ検索が失敗した。裏側の検索には切り替えない。",'
+                '"zh":"浏览器搜索失败了。我不会切到后台搜索。","tone":"中性"}]},'
+                '"tool_calls":[]}'
+            )
+
+        complete_with_tools = _legacy_complete_with_tools
+
+    called = {"playwright": False, "web_search": False}
+
+    def playwright_search(_arguments):  # type: ignore[no-untyped-def]
+        called["playwright"] = True
+        raise RuntimeError("browser broke")
+
+    def web_search(_arguments):  # type: ignore[no-untyped-def]
+        called["web_search"] = True
+        return {"results": []}
+
+    registry = ToolRegistry(
+        [
+            Tool(name="playwright_search_web", description="浏览器搜索", handler=playwright_search, group="browser"),
+            Tool(name="playwright_navigate", description="打开浏览器页面", handler=lambda _arguments: {}, group="browser"),
+            Tool(name="playwright_get_text", description="读取浏览器文本", handler=lambda _arguments: {}, group="browser"),
+            Tool(name="web__web_search", description="后台搜索", handler=web_search, group="mcp"),
+        ]
+    )
+    client = BrowserFailureThenWebFallbackClient()
+    runtime = AgentRuntime(
+        api_client=client,  # type: ignore[arg-type]
+        system_prompt="你是 Sakura。",
+        tools=registry,
+    )
+
+    result = runtime.handle_user_message(
+        [{"role": "user", "content": "用浏览器查查看二阶堂真红的百科吧,我们一起来看看"}]
+    )
+
+    assert result.reply.translation == "浏览器搜索失败了。我不会切到后台搜索。"
+    assert called["playwright"]
+    assert not called["web_search"]
+    assert [action.payload["tool_name"] for action in result.actions] == [
+        "playwright_search_web",
+        "runtime",
+    ]
+    assert client.raw_calls == 3
 
 
 def test_plain_lookup_still_exposes_background_web_tools() -> None:
