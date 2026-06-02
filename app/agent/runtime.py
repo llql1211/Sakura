@@ -340,6 +340,10 @@ class AgentRuntime:
                         working_messages,
                         turn.content,
                     ),
+                    _debug=_build_debug_meta(
+                        self.api_client, execution_results,
+                        total_tool_calls, turn_started_at,
+                    ),
                     actions=emitted_actions,
                 )
 
@@ -599,6 +603,10 @@ class AgentRuntime:
                     )
                 return AgentResult(
                     reply=_build_pending_action_reply(pending_actions),
+                    _debug=_build_debug_meta(
+                        self.api_client, execution_results,
+                        total_tool_calls, turn_started_at,
+                    ),
                     actions=[
                         *emitted_actions,
                         *[
@@ -2415,3 +2423,24 @@ def _build_proactive_vision_unsupported_reply() -> ChatReply:
     )
 
 
+
+def _build_debug_meta(
+    api_client: Any,
+    execution_results: list,
+    total_tool_calls: int,
+    turn_started_at: float,
+) -> dict[str, Any]:
+    """构建写入聊天记录的调试元数据，包含工具调用摘要和耗时。"""
+    return {
+        "model": getattr(api_client, "model", getattr(api_client, "model_name", "unknown")),
+        "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
+        "tool_calls_total": total_tool_calls,
+        "tool_results": [
+            {
+                "name": result.tool_name,
+                "success": result.success,
+                "error": result.error or "",
+            }
+            for result in execution_results
+        ],
+    }

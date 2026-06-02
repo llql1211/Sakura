@@ -164,6 +164,7 @@ class AgentResult:
 
     reply: ChatReply
     actions: list[AgentAction] = field(default_factory=list)
+    _debug: dict[str, Any] | None = field(default=None)
 
 
 @dataclass(frozen=True)

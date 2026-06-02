@@ -1070,7 +1070,6 @@ class PetWindow(QWidget):
         )
         self.messages.append({"role": "assistant", "content": reply.text})
         self._record_assistant_reply_history(reply)
-        self._show_reply_segments(reply.segments)
 
     @Slot(object)
     def _handle_reply(self, result: AgentResult) -> None:
@@ -1094,8 +1093,7 @@ class PetWindow(QWidget):
             return
         reply = result.reply
         self.messages.append({"role": "assistant", "content": reply.text})
-        self._record_assistant_reply_history(reply)
-        self._record_completed_memory_turn()
+        self._record_assistant_reply_history(reply, _debug=result._debug)
         self._log_interaction_stage("assistant_message_recorded")
         self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
@@ -1358,10 +1356,7 @@ class PetWindow(QWidget):
         )
         if record_history:
             self.messages.append({"role": "assistant", "content": reply.text})
-            self._record_assistant_reply_history(reply)
-        self._show_reply_segments(reply.segments)
-        self._apply_pending_action_from_result(result)
-
+            self._record_assistant_reply_history(reply, _debug=result._debug)
     def _apply_pending_action_from_result(self, result: AgentResult) -> None:
         for action in result.actions:
             if action.type != "pending_action":
@@ -2239,9 +2234,10 @@ class PetWindow(QWidget):
         translation: str = "",
         tone: str = "",
         portrait: str = "",
+        _debug: dict | None = None,
     ) -> None:
         try:
-            self.history_store.append(role, content, translation, tone, portrait)
+            self.history_store.append(role, content, translation, tone, portrait, _debug=_debug)
         except OSError as exc:
             print(f"[History] 写入失败：{exc}")
             debug_log(
@@ -2257,17 +2253,18 @@ class PetWindow(QWidget):
                 },
             )
 
-    def _record_assistant_reply_history(self, reply: ChatReply) -> None:
+    def _record_assistant_reply_history(self, reply: ChatReply, _debug: dict | None = None) -> None:
         clean_segments = [segment for segment in reply.segments if segment.text.strip()]
         if not clean_segments:
             return
-        for segment in clean_segments:
+        for i, segment in enumerate(clean_segments):
             self._record_history(
                 "assistant",
                 segment.text,
                 segment.translation,
                 segment.tone,
                 segment.portrait,
+                _debug=_debug if i == 0 else None,
             )
 
     @Slot()

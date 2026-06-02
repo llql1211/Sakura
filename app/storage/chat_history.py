@@ -35,6 +35,7 @@ class ChatHistoryStore:
         translation: str = "",
         tone: str = "",
         portrait: str = "",
+        _debug: dict | None = None,
     ) -> None:
         entry = {
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -47,6 +48,8 @@ class ChatHistoryStore:
             entry["tone"] = tone.strip()
         if portrait.strip():
             entry["portrait"] = portrait.strip()
+        if _debug is not None:
+            entry["_debug"] = _debug
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(entry, ensure_ascii=False) + "\n")
