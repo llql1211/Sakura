@@ -12,6 +12,8 @@
 
 模型的回复按段落组织为双语 JSON 片段（日文原文 + 中文字幕 + 语气标签），UI 对同一份结构同步驱动字幕、表情和可选的 TTS。
 
+架构参考了 [KdaiP/EchoBot](https://github.com/KdaiP/EchoBot) 的「Decision - Roleplay - Agent」三层设计，将路由决策、角色表达和工具执行分离为独立层。
+
 ## 核心功能
 
 - **角色包驱动。** `CharacterRegistry` 扫描 `characters/*/character.json`，校验角色卡、立绘和语音参考资源。
@@ -20,7 +22,9 @@
 
 - **语气联动表情和语音。** 语气同时驱动立绘切换和 TTS 参考音频选择，支持 GPT-SoVITS 权重切换。
 
-- **Agent 工具循环。** `AgentRuntime` 每轮先让模型规划是否需要工具，再执行待办、提醒、笔记、记忆、浏览器、屏幕观察等工具。
+- **编排层路由决策。** `ConversationCoordinator` 先由 `DecisionLayer` 按用户意图选择路由（纯聊天 / 屏幕观察 / Agent 任务 / 确认询问 / 静默），再分发给 `RoleplayLayer`（角色表达）或 `AgentRunner`（工具执行），将决策与表达解耦。
+
+- **Agent 工具循环。** `AgentRuntime` 执行待办、提醒、笔记、记忆、浏览器、屏幕观察等工具，结果由角色表达层转述，不暴露内部实现细节。
 
 - **按需/自主屏幕观察。** 模型可在对话中请求当前屏幕截图，或自动决定是否获取屏幕信息。
 
@@ -30,9 +34,11 @@
 
 - **长期记忆与候选确认。** 长期记忆先写候选，用户确认后才写入正式记忆。支持自动记忆整理。
 
-- **MCP 扩展。** `data/config/mcp.yaml` 注册 stdio/SSE MCP Server，支持运行时开关。
+- **MCP 扩展。** `data/config/mcp.yaml` 注册 stdio/SSE MCP Server，支持运行时开关。内置 Web 搜索 MCP Server。
 
-- **历史回看与回溯、立绘动效、上下文修剪、调试日志。**
+- **路由模式。** 支持 `auto`（自动决策）、`chat_only`（纯聊天）、`force_agent`（强制 Agent）、`quiet`（静默）、`proactive_only`（仅主动关怀）五种模式，可在设置中切换。
+
+- **历史回看与回溯、立绘缩放与动效、上下文修剪、调试日志。**
 
 ## 启动流程
 
@@ -53,15 +59,20 @@ flowchart LR
     C --> D["characters/sakura/character.json<br/>角色包"]
     A --> E["OpenAICompatibleClient<br/>API 客户端"]
     B --> E
-    E --> F["AgentRuntime<br/>Agent 决策层"]
-    F --> G["ToolRegistry"]
-    G --> H["内置工具 + MCP 工具 + 插件工具"]
     A --> I["TTSProvider"]
     A --> J["AppBuilder"]
     J --> K["AppContext"]
     K --> L["PetWindow"]
-    F --> L
     I --> L
+    K --> O["ConversationCoordinator<br/>编排层"]
+    O --> P["DecisionLayer<br/>路由决策"]
+    P --> Q["RoleplayLayer<br/>角色表达"]
+    P --> R["AgentRunner<br/>任务执行"]
+    R --> S["AgentRuntime<br/>Agent 核心"]
+    S --> T["ToolRegistry"]
+    T --> U["内置工具 + MCP 工具 + 插件工具"]
+    Q --> L
+    S --> L
 ```
 
 ## 项目结构
@@ -70,11 +81,18 @@ flowchart LR
 .
 ├── main.py                             # 应用入口
 ├── app/
+│   ├── orchestration/                  # 编排层（决策路由 + 角色表达 + Agent 执行）
+│   │   ├── coordinator.py              # ConversationCoordinator 同步编排
+│   │   ├── decision.py                 # DecisionLayer LLM 路由决策
+│   │   ├── roleplay.py                 # RoleplayLayer 角色化表达
+│   │   ├── agent_runner.py             # AgentRunner Agent 执行桥接
+│   │   ├── events.py                   # 编排层事件/数据结构
+│   │   └── route_modes.py              # 路由模式定义
 │   ├── agent/                          # Agent 决策层
 │   │   ├── actions.py                  # 动作/事件/待确认数据结构
 │   │   ├── builtin_tools.py            # 内置工具（待办/提醒/笔记/记忆等）
 │   │   ├── memory.py / reminders.py    # 长期记忆 / 提醒
-│   │   ├── memory_curator.py           # 自动记忆整理
+│   │   ├── memory_curator.py           # 自动记忆整理（含后台 Worker）
 │   │   ├── runtime.py                  # AgentRuntime（决策/工具循环）
 │   │   ├── runtime_limits.py           # 运行时限制常量
 │   │   ├── screen_policy.py            # 屏幕观察策略
@@ -92,6 +110,7 @@ flowchart LR
 │   │   ├── app_context.py              # AppContext 依赖容器
 │   │   ├── bootstrap.py                # 启动装配
 │   │   ├── builder/                    # AppBuilder / ServiceContainer / Lifecycle
+│   │   ├── contracts/                  # 核心接口契约
 │   │   ├── chat_pipeline.py            # ChatPipeline 对话编排
 │   │   ├── chat_worker.py              # Qt 后台线程 Worker
 │   │   ├── debug_log.py                # 调试日志（自动脱敏）
@@ -147,8 +166,8 @@ flowchart LR
 │   ├── memory/                         # 长期记忆
 │   └── visual_observations/            # 视觉观察记录
 ├── tests/                              # pytest 测试
-│   ├── unit/                           # 单元测试
-│   ├── integration/                    # 集成测试
+│   ├── unit/                           # 单元测试（配置 / LLM / 工具 / 编排等）
+│   ├── integration/                    # 集成测试（AgentCore / ChatPipeline / Coordinator）
 │   └── ui/                             # UI 测试
 ├── docs/                               # 文档
 │   ├── ARCHITECTURE.md                 # 架构说明
@@ -224,6 +243,7 @@ tts:
 | `api.yaml: tts.gpt_sovits.api_url` | TTS 接口 | `http://127.0.0.1:9880/tts` |
 | `system_config.yaml: ui.subtitle_language` | 气泡语言 `ja`/`zh` | `ja` |
 | `system_config.yaml: ui.portrait_scale_percent` | 立绘缩放 | `100` |
+| `system_config.yaml: route_mode` | 路由模式 `auto`/`chat_only`/`force_agent`/`quiet`/`proactive_only` | `auto` |
 | `system_config.yaml: proactive_care.enabled` | 主动关怀 | `false` |
 | `system_config.yaml: proactive_care.check_interval_minutes` | 检查间隔 | `20` |
 | `system_config.yaml: proactive_care.cooldown_minutes` | 冷却时间 | `10` |
