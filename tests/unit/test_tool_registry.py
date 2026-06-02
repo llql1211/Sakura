@@ -178,6 +178,7 @@ class TestToolRegistryExecution:
 
     def test_prepare_or_execute_with_confirmation(self) -> None:
         registry = ToolRegistry([_dummy_tool("risky", requires_confirmation=True)])
+        registry.set_free_access_enabled(False)
         result = registry.prepare_or_execute("risky", {})
         assert isinstance(result, PendingToolAction)
 
