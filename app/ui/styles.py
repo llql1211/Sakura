@@ -17,6 +17,12 @@ PET_WINDOW_STYLEHEET = """
     font-size: 19px;
     line-height: 1.35;
 }
+#ttsErrorText {
+    color: #9f314e;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.25;
+}
 #replyHistoryPanel {
     background: rgba(255, 255, 255, 92);
     border: 1px solid rgba(238, 172, 200, 154);

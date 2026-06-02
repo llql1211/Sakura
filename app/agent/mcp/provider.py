@@ -196,7 +196,22 @@ def _expand_runtime_tokens(value: str, base_dir: Path) -> str:
 
 
 def _runtime_executable(command: str) -> str:
+    for candidate in _python_script_candidates(command):
+        if candidate.is_file():
+            return str(candidate)
     return shutil.which(command) or command
+
+
+def _python_script_candidates(command: str) -> list[Path]:
+    script_name = command
+    if sys.platform == "win32" and not script_name.lower().endswith(".exe"):
+        script_name = f"{script_name}.exe"
+
+    executable_dir = Path(sys.executable).resolve().parent
+    return [
+        executable_dir / script_name,
+        executable_dir / "Scripts" / script_name,
+    ]
 
 
 def _close_quietly(bridge: MCPBridgeLike) -> None:

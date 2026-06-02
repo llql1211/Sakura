@@ -72,7 +72,7 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
     )
     service.save_current_character_id(CharacterRegistryStub(), "nanami")  # type: ignore[arg-type]
     service.save_mcp_runtime_settings(MCPRuntimeSettings(windows_enabled=True))
-    service.save_debug_log_settings(DebugLogSettings(enabled=True, body_enabled=True))
+    service.save_debug_log_settings(DebugLogSettings(enabled=True, body_enabled=True, file_enabled=True))
     service.save_proactive_care_settings(
         ProactiveCareSettings(
             enabled=True,
@@ -95,6 +95,7 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
     assert system["mcp"]["windows_enabled"] is True
     assert system["debug"]["enabled"] is True
     assert system["debug"]["body_enabled"] is True
+    assert system["debug"]["file_enabled"] is True
     assert system["proactive_care"]["check_interval_minutes"] == 5
 
 
@@ -171,11 +172,21 @@ def test_settings_service_saves_and_loads_genie_tts_settings() -> None:
 def test_settings_service_loads_debug_log_settings() -> None:
     root = _runtime_root("yaml_debug")
     service = AppSettingsService(root)
+    service.save_system_values("debug", {"enabled": True, "body_enabled": False, "file_enabled": True})
+
+    settings = service.load_debug_log_settings()
+
+    assert settings == DebugLogSettings(enabled=True, body_enabled=False, file_enabled=True)
+
+
+def test_settings_service_loads_debug_file_disabled_by_default() -> None:
+    root = _runtime_root("yaml_debug_legacy")
+    service = AppSettingsService(root)
     service.save_system_values("debug", {"enabled": True, "body_enabled": False})
 
     settings = service.load_debug_log_settings()
 
-    assert settings == DebugLogSettings(enabled=True, body_enabled=False)
+    assert settings == DebugLogSettings(enabled=True, body_enabled=False, file_enabled=False)
 
 
 def _runtime_root(name: str) -> Path:

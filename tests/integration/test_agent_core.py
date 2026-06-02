@@ -178,13 +178,13 @@ def test_due_reminders_and_mark_completed() -> None:
     assert store.due_reminders(now) == []
 
 
-def test_proactive_care_settings_default_to_disabled() -> None:
+def test_proactive_care_settings_default_to_enabled() -> None:
     service = AppSettingsService(_runtime_root_path("proactive_defaults"))
     settings = service.load_proactive_care_settings()
 
-    assert not settings.enabled
-    assert not settings.screen_context_enabled
-    assert settings.check_interval_minutes == 20
+    assert settings.enabled
+    assert settings.screen_context_enabled
+    assert settings.check_interval_minutes == 2
     assert settings.cooldown_minutes == 10
     assert settings.screen_context_batch_limit == 6
 

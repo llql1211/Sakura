@@ -27,10 +27,11 @@ class ApiSettings:
 
 @dataclass(frozen=True)
 class DebugLogSettings:
-    """终端调试日志配置。"""
+    """调试日志配置。"""
 
     enabled: bool = False
     body_enabled: bool = False
+    file_enabled: bool = False
 
 
 # ---- TTS 配置 (存根，实际实现在 app/voice/tts.py) ----

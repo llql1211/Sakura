@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sys
 import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from app.agent.mcp.config import MCPServerConfig
@@ -37,6 +39,7 @@ class MCPBridge:
     def connect(self) -> None:
         if self._loop is not None:
             return
+        self._ensure_stdio_command_exists()
         self._thread = threading.Thread(
             target=self._run_loop,
             name=f"sakura-mcp-{self.config.name}",
@@ -91,6 +94,20 @@ class MCPBridge:
             raise RuntimeError("MCP Bridge 尚未连接。")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
+
+    def _ensure_stdio_command_exists(self) -> None:
+        """启动前检查 stdio 命令，避免把 WinError 2 直接暴露给用户。"""
+
+        if self.config.transport != "stdio" or not self.config.command:
+            return
+        command = self.config.command.strip().strip('"').strip("'")
+        if _stdio_command_exists(command):
+            return
+        raise RuntimeError(
+            f"MCP Server {self.config.name} 启动失败：找不到命令 {command}。"
+            "请先确认依赖已安装；如果这是 Windows MCP，请运行 install.bat 安装 uv，"
+            "或在设置里关闭 Windows MCP 后重启 Sakura。"
+        )
 
     async def _connect(self) -> None:
         ready = asyncio.Event()
@@ -175,7 +192,11 @@ class MCPBridge:
         if self._close_requested is not None:
             self._close_requested.set()
         if self._connection_task is not None:
-            await self._connection_task
+            try:
+                await self._connection_task
+            except Exception:
+                # 连接阶段已经报告过错误；关闭时只清理，避免二次刷屏。
+                pass
         self._connection_task = None
         self._close_requested = None
         self._session = None
@@ -292,3 +313,11 @@ def _deduplicate_preserving_order(items: list[str]) -> list[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+def _stdio_command_exists(command: str) -> bool:
+    if not command:
+        return False
+    if any(separator in command for separator in ("/", "\\")) or Path(command).is_absolute():
+        return Path(command).is_file()
+    return shutil.which(command) is not None

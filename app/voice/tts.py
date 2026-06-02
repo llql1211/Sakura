@@ -274,6 +274,7 @@ class GPTSoVITSTTSSettings:
             raise TTSConfigError("缺少 GPT_SOVITS_TEXT_LANG。")
 
 class GPTSoVITSTTSProvider(QObject):
+    error_occurred = Signal(str)
     _audio_ready = Signal(str, object, object)
     _prepared_audio_ready = Signal(object, str)
     _prepared_audio_failed = Signal(object, str)
@@ -895,6 +896,7 @@ class GPTSoVITSTTSProvider(QObject):
     @Slot(str)
     def _log_error(self, message: str) -> None:
         print(f"[TTS] {message}")
+        self.error_occurred.emit(message)
 
     @Slot(object)
     def _run_callback(self, callback: TTSCallback | None) -> None:

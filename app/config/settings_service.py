@@ -8,7 +8,12 @@ from app.agent.mcp.settings import MCPRuntimeSettings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.llm.api_client import ApiSettings
-from app.agent.proactive_care import ProactiveCareSettings
+from app.agent.proactive_care import (
+    PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES,
+    PROACTIVE_DEFAULT_COOLDOWN_MINUTES,
+    PROACTIVE_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
+    ProactiveCareSettings,
+)
 from app.voice.tts import (
     DEFAULT_GENIE_TTS_API_URL,
     DEFAULT_GPT_SOVITS_API_URL,
@@ -26,10 +31,11 @@ SYSTEM_CONFIG_FILE = "system_config.yaml"
 
 @dataclass(frozen=True)
 class DebugLogSettings:
-    """终端调试日志配置。"""
+    """调试日志配置。"""
 
     enabled: bool = False
     body_enabled: bool = False
+    file_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -204,6 +210,7 @@ class AppSettingsService:
         return DebugLogSettings(
             enabled=_bool_value(debug.get("enabled"), False),
             body_enabled=_bool_value(debug.get("body_enabled"), False),
+            file_enabled=_bool_value(debug.get("file_enabled"), False),
         )
 
     def save_debug_log_settings(self, settings: DebugLogSettings) -> None:
@@ -212,28 +219,29 @@ class AppSettingsService:
             {
                 "enabled": bool(settings.enabled),
                 "body_enabled": bool(settings.body_enabled),
+                "file_enabled": bool(settings.file_enabled),
             },
         )
 
     def load_proactive_care_settings(self) -> ProactiveCareSettings:
         proactive = self._system_section("proactive_care")
         return ProactiveCareSettings(
-            enabled=_bool_value(proactive.get("enabled"), False),
+            enabled=_bool_value(proactive.get("enabled"), True),
             screen_context_enabled=_bool_value(
                 proactive.get("screen_context_enabled"),
-                False,
+                True,
             ),
             check_interval_minutes=_int_value(
                 proactive.get("check_interval_minutes"),
-                20,
+                PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES,
             ),
             cooldown_minutes=_int_value(
                 proactive.get("cooldown_minutes"),
-                10,
+                PROACTIVE_DEFAULT_COOLDOWN_MINUTES,
             ),
             screen_context_batch_limit=_int_value(
                 proactive.get("screen_context_batch_limit"),
-                6,
+                PROACTIVE_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
             ),
         )
 

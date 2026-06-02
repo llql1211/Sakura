@@ -10,6 +10,7 @@ from app.voice.tts import TTSPreparedAudio, TTSProvider
 
 LogStageCallback = Callable[[str, dict[str, Any] | None], None]
 TTSCallback = Callable[[], None]
+TTSErrorCallback = Callable[[str], None]
 
 
 class VoicePlaybackController:
@@ -20,10 +21,12 @@ class VoicePlaybackController:
         tts_provider: TTSProvider,
         log_stage: LogStageCallback,
         target_text_lang_getter: Callable[[], str] | None = None,
+        on_error: TTSErrorCallback | None = None,
     ) -> None:
         self.tts_provider = tts_provider
         self._log_stage = log_stage
         self._target_text_lang_getter = target_text_lang_getter or (lambda: "ja")
+        self._on_error = on_error
         self._prepared_next_segment: ChatSegment | None = None
         self._prepared_next_tts: TTSPreparedAudio | None = None
 
@@ -79,6 +82,7 @@ class VoicePlaybackController:
                 },
             )
             print(f"[TTS] 播放失败，已继续显示字幕：{exc}")
+            self._notify_error(f"播放失败，已继续显示字幕：{exc}")
             on_started()
             on_finished()
 
@@ -130,6 +134,7 @@ class VoicePlaybackController:
                 },
             )
             print(f"[TTS] 预生成失败，已继续字幕流程：{exc}")
+            self._notify_error(f"预生成失败，已继续字幕流程：{exc}")
 
     def discard_prepared(self) -> None:
         if self._prepared_next_tts is not None:
@@ -174,3 +179,11 @@ class VoicePlaybackController:
         }
         self._log_stage("tts_skipped_language_guard", payload)
         debug_log("TTS", "语言守卫跳过异常文本 TTS", payload)
+
+    def _notify_error(self, message: str) -> None:
+        if self._on_error is None:
+            return
+        try:
+            self._on_error(message)
+        except Exception as exc:  # noqa: BLE001
+            debug_log("TTS", "TTS 错误提示回调失败", {"error": str(exc)})

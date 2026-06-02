@@ -17,6 +17,9 @@ from typing import Any, Callable, Protocol
 ProgressCallback = Callable[[int], None]
 StatusCallback = Callable[[str], None]
 
+class DownloadCancelledError(Exception):
+    """用户主动取消下载时抛出此异常，调用方据此判断是用户取消而非真正的错误。"""
+
 _DOWNLOAD_CHUNK_SIZE = 512 * 1024
 _HASH_CHUNK_SIZE = 4 * 1024 * 1024
 _VERIFY_PROGRESS_END = 10
@@ -170,6 +173,7 @@ def download_and_extract_bundle(
     entry: TTSBundleEntry,
     base_dir: Path,
     *,
+    check_cancel: Callable[[], None] | None = None,
     on_progress: ProgressCallback | None = None,
     on_status: StatusCallback | None = None,
     urlopen: UrlOpenCallable = urllib.request.urlopen,
@@ -185,7 +189,7 @@ def download_and_extract_bundle(
     _emit_progress(on_progress, 0)
     if _archive_verification_error(archive, entry, on_progress=on_progress) is not None:
         _emit_status(on_status, "download")
-        _download_archive(entry, archive, on_progress=on_progress, urlopen=urlopen)
+        _download_archive(entry, archive, on_progress=on_progress, urlopen=urlopen, check_cancel=check_cancel)
     _emit_progress(on_progress, _DOWNLOAD_PROGRESS_END)
 
     _emit_status(on_status, "extract")
@@ -284,6 +288,7 @@ def _download_archive(
     *,
     on_progress: ProgressCallback | None,
     urlopen: UrlOpenCallable,
+    check_cancel: Callable[[], None] | None = None,
 ) -> None:
     part = archive.with_name(f"{archive.name}.part")
     if part.exists():
@@ -303,6 +308,8 @@ def _download_archive(
                         break
                     file.write(chunk)
                     hasher.update(chunk)
+                    if check_cancel is not None:
+                        check_cancel()
                     downloaded += len(chunk)
                     _emit_progress(
                         on_progress,

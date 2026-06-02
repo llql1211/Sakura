@@ -47,6 +47,7 @@ class TestDebugLogSettings:
         s = DebugLogSettings()
         assert s.enabled is False
         assert s.body_enabled is False
+        assert s.file_enabled is False
 
     def test_enabled(self) -> None:
         s = DebugLogSettings(enabled=True)

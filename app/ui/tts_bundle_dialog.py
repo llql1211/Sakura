@@ -19,6 +19,7 @@ from app.voice.tts_bundle import (
     TTS_BUNDLES,
     TTSBundleEntry,
     cleanup_stale_download_archives,
+    DownloadCancelledError,
     download_and_extract_bundle,
     format_bundle_label,
     format_gpu_summary,
@@ -33,20 +34,33 @@ class TTSBundleDownloadThread(QThread):
     status = Signal(str)
     succeeded = Signal(str)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, entry: TTSBundleEntry, base_dir: Path) -> None:
         super().__init__()
         self.entry = entry
         self.base_dir = base_dir
+        self._cancel_flag = False
+
+    def cancel(self) -> None:
+        """请求取消正在进行的下载。"""
+        self._cancel_flag = True
 
     def run(self) -> None:
+        def _check_cancel() -> None:
+            if self._cancel_flag:
+                raise DownloadCancelledError("用户取消了下载")
         try:
             work_dir = download_and_extract_bundle(
                 self.entry,
                 self.base_dir,
+                check_cancel=_check_cancel,
                 on_progress=self.progress.emit,
                 on_status=self.status.emit,
             )
+        except DownloadCancelledError:
+            self.cancelled.emit()
+            return
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
@@ -88,8 +102,8 @@ class TTSBundleDownloadDialog(QDialog):
 
         self.start_button = QPushButton("开始下载", self)
         self.start_button.clicked.connect(self._start_download)
-        self.cancel_button = QPushButton("取消", self)
-        self.cancel_button.clicked.connect(self.reject)
+        self.cancel_button = QPushButton("关闭", self)
+        self.cancel_button.clicked.connect(self._on_cancel_clicked)
 
         form = QFormLayout()
         form.addRow("整合包", self.bundle_combo)
@@ -118,7 +132,8 @@ class TTSBundleDownloadDialog(QDialog):
         self.downloaded_provider = None
         self.bundle_combo.setEnabled(False)
         self.start_button.setEnabled(False)
-        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("取消下载")
+        self.cancel_button.setEnabled(True)
         self.status_label.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -130,6 +145,7 @@ class TTSBundleDownloadDialog(QDialog):
         thread.status.connect(self._handle_status)
         thread.succeeded.connect(self._handle_success)
         thread.failed.connect(self._handle_failure)
+        thread.cancelled.connect(self._handle_cancelled)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_thread)
         thread.start()
@@ -156,12 +172,38 @@ class TTSBundleDownloadDialog(QDialog):
         QMessageBox.warning(self, "下载失败", message)
         self.bundle_combo.setEnabled(True)
         self.start_button.setEnabled(True)
+        self.cancel_button.setText("关闭")
         self.cancel_button.setEnabled(True)
         self._thread = None
 
     @Slot()
     def _clear_thread(self) -> None:
         self._thread = None
+
+    @Slot()
+    def _handle_cancelled(self) -> None:
+        """下载被用户取消后，恢复界面状态。"""
+        self.bundle_combo.setEnabled(True)
+        self.start_button.setEnabled(True)
+        self.cancel_button.setText("关闭")
+        self.cancel_button.setEnabled(True)
+        self.status_label.setText("下载已取消")
+        self._thread = None
+
+    def _on_cancel_clicked(self) -> None:
+        """取消按钮点击：下载中则取消下载，否则关闭对话框。"""
+        if self._thread is not None and self._thread.isRunning():
+            self._cancel_download()
+        else:
+            self.reject()
+
+    def _cancel_download(self) -> None:
+        """请求取消下载线程。"""
+        thread = self._thread
+        if thread is not None:
+            self.status_label.setText("正在取消下载...")
+            self.cancel_button.setEnabled(False)
+            thread.cancel()
 
     def _cleanup_legacy_archives(self) -> None:
         try:
@@ -171,7 +213,15 @@ class TTSBundleDownloadDialog(QDialog):
 
     def reject(self) -> None:
         if self._thread is not None and self._thread.isRunning():
-            QMessageBox.information(self, "下载中", "整合包下载或解压正在进行，完成后才能关闭。")
+            reply = QMessageBox.question(
+                self,
+                "取消下载",
+                "下载正在进行中，确定要取消下载吗？\n已下载的进度将会丢失。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._cancel_download()
             return
         super().reject()
 

@@ -15,6 +15,11 @@ from app.agent.proactive_care import ProactiveCareSettings
 from app.ui.pet_window import PetWindow
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.portrait_controller import PORTRAIT_SCALE_DEFAULT_PERCENT
+from app.ui.subtitle_controller import (
+    REPLY_SEGMENT_PAUSE_MS,
+    SPEECH_TYPING_INTERVAL_MS,
+    normalize_subtitle_display_speed,
+)
 from app.voice.tts import TTSConfigError
 
 
@@ -105,9 +110,18 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         mcp_settings=settings_service.load_mcp_runtime_settings(),
         debug_log_settings=settings_service.load_debug_log_settings(),
         portrait_scale_percent=PORTRAIT_SCALE_DEFAULT_PERCENT,
+        subtitle_typing_interval_ms=SPEECH_TYPING_INTERVAL_MS,
+        reply_segment_pause_ms=REPLY_SEGMENT_PAUSE_MS,
     )
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
+    (
+        subtitle_typing_interval_ms,
+        reply_segment_pause_ms,
+    ) = normalize_subtitle_display_speed(
+        getattr(dialog, "result_subtitle_typing_interval_ms", SPEECH_TYPING_INTERVAL_MS),
+        getattr(dialog, "result_reply_segment_pause_ms", REPLY_SEGMENT_PAUSE_MS),
+    )
     if (
         dialog.result_api_settings is None
         or dialog.result_tts_settings is None
@@ -134,7 +148,11 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
     settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
     settings_service.save_system_values(
         "ui",
-        {"portrait_scale_percent": int(dialog.result_portrait_scale_percent)},
+        {
+            "portrait_scale_percent": int(dialog.result_portrait_scale_percent),
+            "subtitle_typing_interval_ms": subtitle_typing_interval_ms,
+            "reply_segment_pause_ms": reply_segment_pause_ms,
+        },
     )
     return build_initial_app_context(base_dir)
 

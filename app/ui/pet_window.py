@@ -83,6 +83,11 @@ from app.ui.portrait_controller import (
     PORTRAIT_SCALE_DEFAULT_PERCENT,
     normalize_portrait_scale_percent,
 )
+from app.ui.subtitle_controller import (
+    REPLY_SEGMENT_PAUSE_MS,
+    SPEECH_TYPING_INTERVAL_MS,
+    normalize_subtitle_display_speed,
+)
 from app.voice.tts import (
     TTS_PROVIDER_GENIE,
     GenieTTSProvider,
@@ -119,6 +124,7 @@ if TYPE_CHECKING:
 
 REMINDER_CHECK_INTERVAL_MS = 30_000
 STARTUP_INITIALIZING_TEXT = "初始化中……"
+TTS_ERROR_DISPLAY_MS = 8_000
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
@@ -191,6 +197,10 @@ class PetWindow(QWidget):
         self.memory_curation_consumed_turns = 0
         self.drag_offset: QPoint | None = None
         self.portrait_scale_percent = self._load_portrait_scale_percent()
+        (
+            self.subtitle_typing_interval_ms,
+            self.reply_segment_pause_ms,
+        ) = self._load_subtitle_display_speed()
         self.stage_size = _stage_size_for_portrait_scale_percent(self.portrait_scale_percent)
         self.pending_tool_action: PendingToolAction | None = None
         self.pending_manual_screen_observation: ScreenObservation | None = None
@@ -241,6 +251,8 @@ class PetWindow(QWidget):
                 "subtitle_language": self.subtitle_language,
                 "screen_observation_enabled": self.screen_observation_enabled,
                 "autonomous_screen_observation_enabled": self.autonomous_screen_observation_enabled,
+                "subtitle_typing_interval_ms": self.subtitle_typing_interval_ms,
+                "reply_segment_pause_ms": self.reply_segment_pause_ms,
                 "proactive_care": self.proactive_care_settings,
                 "auto_memory": self.memory_curation_settings,
             },
@@ -303,6 +315,15 @@ class PetWindow(QWidget):
         self.speech_label.setWordWrap(True)
         self.speech_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
+        self.tts_error_label = QLabel("", self.bubble)
+        self.tts_error_label.setObjectName("ttsErrorText")
+        self.tts_error_label.setWordWrap(True)
+        self.tts_error_label.setVisible(False)
+        self.tts_error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.tts_error_timer = QTimer(self)
+        self.tts_error_timer.setSingleShot(True)
+        self.tts_error_timer.timeout.connect(self._hide_tts_error)
+
         self.reply_history_panel = QFrame(self.bubble)
         _configure_reply_history_panel(self.reply_history_panel)
 
@@ -326,7 +347,9 @@ class PetWindow(QWidget):
             self.tts_provider,
             self._log_interaction_stage,
             lambda: str(getattr(getattr(self.tts_provider, "settings", None), "text_lang", "ja")),
+            self._show_tts_error,
         )
+        self._connect_tts_error_signal(self.tts_provider)
         self.subtitle_controller = SubtitleController(
             self.speech_label,
             self.voice_playback_controller,
@@ -337,6 +360,8 @@ class PetWindow(QWidget):
             lambda: bool(self.active_interaction_id),
             self,
             preload_segment=self.portrait_controller.preload_for_segment,
+            typing_interval_ms=self.subtitle_typing_interval_ms,
+            segment_pause_ms=self.reply_segment_pause_ms,
         )
         self.speech_timer = self.subtitle_controller.speech_timer
         if not self.startup_initializing:
@@ -352,6 +377,7 @@ class PetWindow(QWidget):
         bubble_text_layout.setSpacing(6)
         bubble_text_layout.addLayout(bubble_header)
         bubble_text_layout.addWidget(self.speech_label, 1)
+        bubble_text_layout.addWidget(self.tts_error_label)
 
         history_button_layout = QVBoxLayout()
         history_button_layout.setContentsMargins(2, 3, 2, 3)
@@ -827,6 +853,9 @@ class PetWindow(QWidget):
         self.active_interaction_started_at = None
         self.active_interaction_last_at = None
         self._update_reply_history_buttons()
+        # 每完成一轮对话（含完整回复）累计一次，驱动自动记忆整理触发
+        if outcome == "reply_completed":
+            self._record_completed_memory_turn()
 
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
@@ -1902,9 +1931,11 @@ class PetWindow(QWidget):
         if self.plugin_manager is not services.plugin_manager:
             self.plugin_manager.shutdown_all()
 
+        self._disconnect_tts_error_signal(self.tts_provider)
         self._retire_tts_provider(self.tts_provider)
         self.tts_provider = services.tts_provider
         self.voice_playback_controller.set_provider(services.tts_provider)
+        self._connect_tts_error_signal(services.tts_provider)
         self._warm_up_tts_playback(services.tts_provider)
         self.tool_registry = services.tool_registry
         self.free_access_enabled = self.tool_registry.free_access_enabled
@@ -1934,6 +1965,8 @@ class PetWindow(QWidget):
         )
         for error in services.errors:
             print(f"[Startup] {error}")
+            if error.startswith("TTS"):
+                self._show_tts_error(error)
 
     @Slot(str)
     def handle_deferred_startup_failed(self, error: str) -> None:
@@ -1955,6 +1988,26 @@ class PetWindow(QWidget):
         if provider.thread() == application.thread():
             return
         provider.moveToThread(application.thread())
+
+    def _connect_tts_error_signal(self, provider: TTSProvider) -> None:
+        error_signal = getattr(provider, "error_occurred", None)
+        connect = getattr(error_signal, "connect", None)
+        if not callable(connect):
+            return
+        try:
+            connect(self._show_tts_error)
+        except (TypeError, RuntimeError) as exc:
+            debug_log("TTS", "连接 TTS 错误提示信号失败", {"error": str(exc)})
+
+    def _disconnect_tts_error_signal(self, provider: TTSProvider) -> None:
+        error_signal = getattr(provider, "error_occurred", None)
+        disconnect = getattr(error_signal, "disconnect", None)
+        if not callable(disconnect):
+            return
+        try:
+            disconnect(self._show_tts_error)
+        except (TypeError, RuntimeError):
+            pass
 
     def _warm_up_current_tts_playback(self) -> None:
         self._warm_up_tts_playback(self.tts_provider)
@@ -2005,6 +2058,25 @@ class PetWindow(QWidget):
     @Slot(str)
     def set_speech(self, text: str) -> None:
         self.subtitle_controller.set_speech(text)
+
+    @Slot(str)
+    def _show_tts_error(self, message: str) -> None:
+        message = str(message).strip()
+        if not message:
+            return
+        text = f"TTS 异常：{_compact_tts_error(message)}"
+        self.tts_error_label.setText(text)
+        self.tts_error_label.setToolTip(message)
+        self.tts_error_label.setVisible(True)
+        self.tts_error_timer.start(TTS_ERROR_DISPLAY_MS)
+        self._log_interaction_stage("tts_error_visible", {"message": message})
+        debug_log("TTS", "TTS 错误已显示到界面", {"message": message})
+
+    @Slot()
+    def _hide_tts_error(self) -> None:
+        self.tts_error_label.clear()
+        self.tts_error_label.setToolTip("")
+        self.tts_error_label.setVisible(False)
 
     def toggle_visible(self) -> None:
         if self.isVisible():
@@ -2078,18 +2150,40 @@ class PetWindow(QWidget):
             self.plugin_manager.tools_tabs,
             parent=self,
             portrait_scale_percent=self.portrait_scale_percent,
+            subtitle_typing_interval_ms=self.subtitle_typing_interval_ms,
+            reply_segment_pause_ms=self.reply_segment_pause_ms,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        result_subtitle_typing_interval_ms = getattr(
+            dialog,
+            "result_subtitle_typing_interval_ms",
+            self.subtitle_typing_interval_ms,
+        )
+        result_reply_segment_pause_ms = getattr(
+            dialog,
+            "result_reply_segment_pause_ms",
+            self.reply_segment_pause_ms,
         )
         if (
-            dialog.exec() != QDialog.DialogCode.Accepted
-            or dialog.result_api_settings is None
+            dialog.result_api_settings is None
             or dialog.result_tts_settings is None
             or dialog.result_character_id is None
             or dialog.result_proactive_care_settings is None
             or dialog.result_mcp_settings is None
             or dialog.result_debug_log_settings is None
             or dialog.result_portrait_scale_percent is None
+            or result_subtitle_typing_interval_ms is None
+            or result_reply_segment_pause_ms is None
         ):
             return
+        (
+            result_subtitle_typing_interval_ms,
+            result_reply_segment_pause_ms,
+        ) = normalize_subtitle_display_speed(
+            result_subtitle_typing_interval_ms,
+            result_reply_segment_pause_ms,
+        )
 
         dialog_character_registry = getattr(dialog, "character_registry", None) or self.character_registry
         try:
@@ -2119,7 +2213,11 @@ class PetWindow(QWidget):
             self.settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
             self._save_system_config_values(
                 "ui",
-                {"portrait_scale_percent": dialog.result_portrait_scale_percent},
+                {
+                    "portrait_scale_percent": dialog.result_portrait_scale_percent,
+                    "subtitle_typing_interval_ms": result_subtitle_typing_interval_ms,
+                    "reply_segment_pause_ms": result_reply_segment_pause_ms,
+                },
             )
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
@@ -2129,14 +2227,24 @@ class PetWindow(QWidget):
             self.api_client.update_settings(dialog.result_api_settings)
             self.memory_store.reload_api_settings(dialog.result_api_settings, wait=False)
         self._apply_portrait_scale_percent(dialog.result_portrait_scale_percent)
+        self._apply_subtitle_display_speed(
+            result_subtitle_typing_interval_ms,
+            result_reply_segment_pause_ms,
+        )
         self.proactive_care_settings = dialog.result_proactive_care_settings
         mcp_restart_required = dialog.result_mcp_settings != self.mcp_settings
         self.mcp_settings = dialog.result_mcp_settings
         self.debug_log_settings = dialog.result_debug_log_settings
         self._sync_proactive_care_timer()
+        disconnect_tts_error_signal = getattr(self, "_disconnect_tts_error_signal", None)
+        if callable(disconnect_tts_error_signal):
+            disconnect_tts_error_signal(self.tts_provider)
         self._retire_tts_provider(self.tts_provider)
         self.tts_provider = new_tts_provider
         self.voice_playback_controller.set_provider(new_tts_provider)
+        connect_tts_error_signal = getattr(self, "_connect_tts_error_signal", None)
+        if callable(connect_tts_error_signal):
+            connect_tts_error_signal(new_tts_provider)
         self._warm_up_tts_playback(new_tts_provider)
         self._apply_character(selected_profile)
         if hasattr(self, "tray_icon"):
@@ -2372,6 +2480,13 @@ class PetWindow(QWidget):
             system_values.get("portrait_scale_percent", PORTRAIT_SCALE_DEFAULT_PERCENT)
         )
 
+    def _load_subtitle_display_speed(self) -> tuple[int, int]:
+        system_values = self._load_system_config_values("ui")
+        return normalize_subtitle_display_speed(
+            system_values.get("subtitle_typing_interval_ms", SPEECH_TYPING_INTERVAL_MS),
+            system_values.get("reply_segment_pause_ms", REPLY_SEGMENT_PAUSE_MS),
+        )
+
     def _load_screen_observation_enabled(self) -> bool:
         system_values = self._load_system_config_values("screen_observation")
         if "enabled" in system_values:
@@ -2383,11 +2498,11 @@ class PetWindow(QWidget):
     def _load_autonomous_screen_observation_enabled(self) -> bool:
         system_values = self._load_system_config_values("screen_observation")
         if "autonomous_enabled" in system_values:
-            enabled = _parse_bool(system_values.get("autonomous_enabled"), default=False)
+            enabled = _parse_bool(system_values.get("autonomous_enabled"), default=True)
             enabled = enabled and self.screen_observation_enabled
             debug_log("PetWindow", "自主屏幕观察 YAML 配置已加载", {"enabled": enabled})
             return enabled
-        return False
+        return self.screen_observation_enabled
 
     def _load_free_access_enabled(self) -> bool:
         """从 system_config.yaml 加载完整访问权限设置。"""
@@ -2412,6 +2527,26 @@ class PetWindow(QWidget):
         self.portrait_controller.set_stage_size(self.stage_size)
         self.portrait_controller.set_portrait_scale_percent(self.portrait_scale_percent)
         self.portrait_controller.apply_current()
+
+    def _apply_subtitle_display_speed(
+        self,
+        subtitle_typing_interval_ms: int,
+        reply_segment_pause_ms: int,
+    ) -> None:
+        (
+            self.subtitle_typing_interval_ms,
+            self.reply_segment_pause_ms,
+        ) = normalize_subtitle_display_speed(
+            subtitle_typing_interval_ms,
+            reply_segment_pause_ms,
+        )
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        set_display_speed = getattr(subtitle_controller, "set_display_speed", None)
+        if callable(set_display_speed):
+            set_display_speed(
+                self.subtitle_typing_interval_ms,
+                self.reply_segment_pause_ms,
+            )
 
     def _apply_character(self, profile: CharacterProfile) -> None:
         previous_character_id = self.character_profile.id
@@ -2676,6 +2811,13 @@ def _reply_history_segments_from_entries(entries: list[ChatHistoryEntry]) -> lis
             )
         segments.append(segment)
     return segments
+
+
+def _compact_tts_error(message: str, limit: int = 160) -> str:
+    compacted = " ".join(str(message).split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: max(0, limit - 1)].rstrip() + "…"
 
 
 def _parse_bool(value: Any, default: bool = False) -> bool:

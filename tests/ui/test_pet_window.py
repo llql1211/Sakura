@@ -236,6 +236,57 @@ def test_pet_window_loads_normalized_portrait_scale_percent() -> None:
     assert MinimalWindow({"portrait_scale_percent": 180})._load_portrait_scale_percent() == 150
 
 
+def test_pet_window_loads_normalized_subtitle_display_speed() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _load_subtitle_display_speed = PetWindow._load_subtitle_display_speed
+
+        def __init__(self, values):  # type: ignore[no-untyped-def]
+            self.values = values
+
+        def _load_system_config_values(self, section: str):  # type: ignore[no-untyped-def]
+            assert section == "ui"
+            return self.values
+
+    assert MinimalWindow({})._load_subtitle_display_speed() == (35, 100)
+    assert MinimalWindow(
+        {
+            "subtitle_typing_interval_ms": "invalid",
+            "reply_segment_pause_ms": "invalid",
+        }
+    )._load_subtitle_display_speed() == (35, 100)
+    assert MinimalWindow(
+        {
+            "subtitle_typing_interval_ms": 1,
+            "reply_segment_pause_ms": -1,
+        }
+    )._load_subtitle_display_speed() == (5, 0)
+    assert MinimalWindow(
+        {
+            "subtitle_typing_interval_ms": 250,
+            "reply_segment_pause_ms": 4000,
+        }
+    )._load_subtitle_display_speed() == (200, 3000)
+
+
+def test_pet_window_defaults_autonomous_screen_observation_to_enabled() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _load_autonomous_screen_observation_enabled = (
+            PetWindow._load_autonomous_screen_observation_enabled
+        )
+
+        screen_observation_enabled = True
+
+        def _load_system_config_values(self, section: str):  # type: ignore[no-untyped-def]
+            assert section == "screen_observation"
+            return {}
+
+    assert MinimalWindow()._load_autonomous_screen_observation_enabled()
+
+
 def test_pet_window_locks_controls_during_startup_initialization(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -307,6 +358,7 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
         plugin_manager=SakuraPluginManager(base_dir=root),
         mcp_settings=context.mcp_settings,
         mcp_tool_provider=None,
+        errors=("TTS 配置无效，已禁用：参考音频不存在",),
     )
 
     window.apply_deferred_services(services)
@@ -317,6 +369,8 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
     assert window.send_button.isEnabled()
     assert window.screenshot_button.isEnabled()
     assert window.subtitle_controller.speech_text == window.character_profile.initial_message
+    assert not window.tts_error_label.isHidden()
+    assert "TTS 配置无效" in window.tts_error_label.text()
     assert tts_provider.warm_up_count == 1
 
     window.close()
@@ -1416,6 +1470,86 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
     assert calls == {"save_api": 0, "update_api": 0, "reload_memory": 0}
 
 
+def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    api_settings = ApiSettings("https://api.example.com/v1", "test-key", "test-model")
+    tts_settings = _minimal_tts_settings()
+    saved_ui_values: dict[str, object] = {}
+
+    class SettingsServiceStub:
+        def load_tts_settings(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return tts_settings
+
+        def save_api_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_tts_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_current_character_id(self, *_args):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_proactive_care_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_mcp_runtime_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_system_values(self, section, values):  # type: ignore[no-untyped-def]
+            assert section == "ui"
+            saved_ui_values.update(values)
+
+    class ApiClientStub:
+        settings = api_settings
+
+        def update_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+    class MemoryStoreStub:
+        def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+    class DialogStub:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.result_api_settings = api_settings
+            self.result_tts_settings = tts_settings
+            self.result_character_id = "sakura"
+            self.result_proactive_care_settings = ProactiveCareSettings(screen_context_enabled=True)
+            self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
+            self.result_debug_log_settings = DebugLogSettings()
+            self.result_portrait_scale_percent = 100
+            self.result_subtitle_typing_interval_ms = 80
+            self.result_reply_segment_pause_ms = 900
+
+        def exec(self):  # type: ignore[no-untyped-def]
+            return pet_window_module.QDialog.DialogCode.Accepted
+
+    window = _minimal_settings_window(
+        PetWindow,
+        SettingsServiceStub(),
+        ApiClientStub(),
+        MemoryStoreStub(),
+    )
+    monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
+    monkeypatch.setattr(pet_window_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+
+    window.show_settings()
+
+    assert saved_ui_values == {
+        "portrait_scale_percent": 100,
+        "subtitle_typing_interval_ms": 80,
+        "reply_segment_pause_ms": 900,
+    }
+    assert window.subtitle_typing_interval_ms == 80
+    assert window.reply_segment_pause_ms == 900
+    assert window.subtitle_controller.display_speeds == [(80, 900)]
+
+
 def test_show_settings_reloads_memory_in_background_when_api_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
@@ -1618,6 +1752,8 @@ def test_main_first_run_settings_saves_imported_character_and_builds_context(mon
             self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
             self.result_debug_log_settings = DebugLogSettings(enabled=True, body_enabled=False)
             self.result_portrait_scale_percent = 125
+            self.result_subtitle_typing_interval_ms = 70
+            self.result_reply_segment_pause_ms = 800
 
         def exec(self):  # type: ignore[no-untyped-def]
             return sakura_main.QDialog.DialogCode.Accepted
@@ -1635,6 +1771,9 @@ def test_main_first_run_settings_saves_imported_character_and_builds_context(mon
     assert "portrait_scale_percent: 125" in (
         root / "data" / "config" / "system_config.yaml"
     ).read_text(encoding="utf-8")
+    system_config = (root / "data" / "config" / "system_config.yaml").read_text(encoding="utf-8")
+    assert "subtitle_typing_interval_ms: 70" in system_config
+    assert "reply_segment_pause_ms: 800" in system_config
 
 
 def test_settings_dialog_returns_portrait_scale_percent() -> None:
@@ -1687,6 +1826,45 @@ def test_settings_dialog_returns_portrait_scale_percent() -> None:
 
     assert dialog.result_portrait_scale_percent == 125
     assert dialog.portrait_scale_slider.value() == 125
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_returns_subtitle_display_speed() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("subtitle_display_speed_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        subtitle_typing_interval_ms=60,
+        reply_segment_pause_ms=500,
+    )
+
+    assert dialog.subtitle_typing_interval_spin.value() == 60
+    assert dialog.reply_segment_pause_spin.value() == 500
+
+    dialog.subtitle_typing_interval_spin.setValue(90)
+    dialog.reply_segment_pause_spin.setValue(1200)
+    dialog.accept()
+
+    assert dialog.result_subtitle_typing_interval_ms == 90
+    assert dialog.result_reply_segment_pause_ms == 1200
     dialog.deleteLater()
     app.processEvents()
 
@@ -2056,6 +2234,7 @@ class _DummySubtitleController:
         self.shown_immediately: list[str] = []
         self.subtitle_languages: list[str] = []
         self.restarted = False
+        self.display_speeds: list[tuple[int, int]] = []
 
     def cancel_reply_flow(self, placeholder_text: str | None = None) -> None:
         self.cancelled_with.append(placeholder_text)
@@ -2074,6 +2253,9 @@ class _DummySubtitleController:
 
     def restart_current_segment_speech(self) -> None:
         self.restarted = True
+
+    def set_display_speed(self, typing_interval_ms: int, segment_pause_ms: int) -> None:
+        self.display_speeds.append((typing_interval_ms, segment_pause_ms))
 
 
 def test_manual_screenshot_empty_input_sends_default_text() -> None:
@@ -2874,6 +3056,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     class MinimalSettingsWindow:
         show_settings = pet_window_cls.show_settings
         _retire_tts_provider = pet_window_cls._retire_tts_provider
+        _apply_subtitle_display_speed = pet_window_cls._apply_subtitle_display_speed
 
         def _create_tts_provider_from_settings(self, _settings):  # type: ignore[no-untyped-def]
             return object()
@@ -2905,10 +3088,13 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     window.memory_store = memory_store
     window.plugin_manager = PluginManagerStub()
     window.portrait_scale_percent = 100
+    window.subtitle_typing_interval_ms = 35
+    window.reply_segment_pause_ms = 100
     window.retired_tts_providers = []
     window.tts_provider = object()
     window.warmed_tts_provider = None
     window.voice_playback_controller = VoicePlaybackControllerStub()
+    window.subtitle_controller = _DummySubtitleController()
     return window
 
 
@@ -3003,6 +3189,44 @@ def test_action_resolution_clears_queued_reply_batches() -> None:
             {"cleared_batch_count": 2},
         )
     ]
+
+
+def test_subtitle_controller_updates_display_speed() -> None:
+    from app.ui.subtitle_controller import SubtitleController
+    from app.voice import VoicePlaybackController
+
+    class DummyLabel:
+        def clear(self) -> None:
+            pass
+
+        def setText(self, _text: str) -> None:
+            pass
+
+    class DummyTTS:
+        def discard_prepared(self, _handle):  # type: ignore[no-untyped-def]
+            pass
+
+    controller = SubtitleController(
+        DummyLabel(),  # type: ignore[arg-type]
+        VoicePlaybackController(DummyTTS(), lambda *_args, **_kwargs: None),
+        "zh",
+        lambda *_args, **_kwargs: None,
+        lambda _segment: None,
+        lambda: None,
+        lambda: True,
+        typing_interval_ms=70,
+        segment_pause_ms=800,
+    )
+
+    assert controller.typing_interval_ms == 70
+    assert controller.segment_pause_ms == 800
+    assert controller.speech_timer.interval() == 70
+
+    controller.set_display_speed(90, 1200)
+
+    assert controller.typing_interval_ms == 90
+    assert controller.segment_pause_ms == 1200
+    assert controller.speech_timer.interval() == 90
 
 
 def test_subtitle_controller_show_text_immediately_does_not_use_tts() -> None:

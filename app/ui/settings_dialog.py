@@ -47,6 +47,15 @@ from app.ui.portrait_controller import (
     PORTRAIT_SCALE_MIN_PERCENT,
     normalize_portrait_scale_percent,
 )
+from app.ui.subtitle_controller import (
+    REPLY_SEGMENT_PAUSE_MAX_MS,
+    REPLY_SEGMENT_PAUSE_MIN_MS,
+    REPLY_SEGMENT_PAUSE_MS,
+    SPEECH_TYPING_INTERVAL_MS,
+    SUBTITLE_TYPING_INTERVAL_MAX_MS,
+    SUBTITLE_TYPING_INTERVAL_MIN_MS,
+    normalize_subtitle_display_speed,
+)
 from app.agent.proactive_care import (
     PROACTIVE_MAX_COOLDOWN_MINUTES,
     PROACTIVE_MAX_CHECK_INTERVAL_MINUTES,
@@ -148,6 +157,8 @@ class SettingsDialog(QDialog):
         tools_tab_contributions: list[ToolsTabContribution] | None = None,
         parent=None,  # type: ignore[no-untyped-def]
         portrait_scale_percent: int = PORTRAIT_SCALE_DEFAULT_PERCENT,
+        subtitle_typing_interval_ms: int = SPEECH_TYPING_INTERVAL_MS,
+        reply_segment_pause_ms: int = REPLY_SEGMENT_PAUSE_MS,
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
@@ -155,6 +166,13 @@ class SettingsDialog(QDialog):
         self.character_registry = character_registry
         self.current_character = current_character
         self.portrait_scale_percent = normalize_portrait_scale_percent(portrait_scale_percent)
+        (
+            self.subtitle_typing_interval_ms,
+            self.reply_segment_pause_ms,
+        ) = normalize_subtitle_display_speed(
+            subtitle_typing_interval_ms,
+            reply_segment_pause_ms,
+        )
         self.memory_store = memory_store
         self._all_memories: list[dict[str, object]] = []
         self._visible_memories: list[dict[str, object]] = []
@@ -166,6 +184,8 @@ class SettingsDialog(QDialog):
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
         self.result_character_id: str | None = None
         self.result_portrait_scale_percent: int | None = None
+        self.result_subtitle_typing_interval_ms: int | None = None
+        self.result_reply_segment_pause_ms: int | None = None
         self.result_proactive_care_settings: ProactiveCareSettings | None = None
         self.result_mcp_settings: MCPRuntimeSettings | None = None
         self.result_debug_log_settings: DebugLogSettings | None = None
@@ -418,7 +438,7 @@ class SettingsDialog(QDialog):
         self.tts_api_url_edit = QLineEdit(settings.api_url, tab)
         self.tts_api_url_edit.setPlaceholderText(_default_tts_api_url(settings.provider))
         self.tts_work_dir_edit = QLineEdit(str(settings.work_dir or ""), tab)
-        self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_v2pro")
+        self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_nvidia50/GPT-SoVITS-v2pro-20250604-nvidia50")
         self.tts_bundle_download_button = QPushButton("一键下载 TTS 整合包", tab)
         self.tts_bundle_download_button.clicked.connect(self._download_gpt_sovits_bundle)
         self.tts_provider_combo.currentIndexChanged.connect(lambda _index: self._sync_tts_provider_controls())
@@ -541,12 +561,33 @@ class SettingsDialog(QDialog):
         self.debug_body_enabled_check.setChecked(debug_settings.body_enabled)
         self.debug_log_enabled_check.toggled.connect(self.debug_body_enabled_check.setEnabled)
         self.debug_body_enabled_check.setEnabled(self.debug_log_enabled_check.isChecked())
+        self.debug_file_enabled_check = QCheckBox("输出文件运行日志", tab)
+        self.debug_file_enabled_check.setChecked(debug_settings.file_enabled)
+
+        self.subtitle_typing_interval_spin = QSpinBox(tab)
+        self.subtitle_typing_interval_spin.setRange(
+            SUBTITLE_TYPING_INTERVAL_MIN_MS,
+            SUBTITLE_TYPING_INTERVAL_MAX_MS,
+        )
+        self.subtitle_typing_interval_spin.setSuffix(" 毫秒")
+        self.subtitle_typing_interval_spin.setValue(self.subtitle_typing_interval_ms)
+
+        self.reply_segment_pause_spin = QSpinBox(tab)
+        self.reply_segment_pause_spin.setRange(
+            REPLY_SEGMENT_PAUSE_MIN_MS,
+            REPLY_SEGMENT_PAUSE_MAX_MS,
+        )
+        self.reply_segment_pause_spin.setSuffix(" 毫秒")
+        self.reply_segment_pause_spin.setValue(self.reply_segment_pause_ms)
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
         form_layout.setSpacing(12)
         form_layout.addRow("", self.debug_log_enabled_check)
         form_layout.addRow("", self.debug_body_enabled_check)
+        form_layout.addRow("", self.debug_file_enabled_check)
+        form_layout.addRow("字幕逐字间隔", self.subtitle_typing_interval_spin)
+        form_layout.addRow("回复分段停顿", self.reply_segment_pause_spin)
         tab.setLayout(form_layout)
         return tab
 
@@ -1135,6 +1176,13 @@ class SettingsDialog(QDialog):
         self.result_tts_settings = tts_settings
         self.result_character_id = character_id
         self.result_portrait_scale_percent = self._selected_portrait_scale_percent()
+        (
+            self.result_subtitle_typing_interval_ms,
+            self.result_reply_segment_pause_ms,
+        ) = normalize_subtitle_display_speed(
+            self.subtitle_typing_interval_spin.value(),
+            self.reply_segment_pause_spin.value(),
+        )
         self.result_proactive_care_settings = ProactiveCareSettings(
             enabled=self.proactive_screen_context_enabled_check.isChecked(),
             screen_context_enabled=self.proactive_screen_context_enabled_check.isChecked(),
@@ -1151,6 +1199,7 @@ class SettingsDialog(QDialog):
                 self.debug_log_enabled_check.isChecked()
                 and self.debug_body_enabled_check.isChecked()
             ),
+            file_enabled=self.debug_file_enabled_check.isChecked(),
         )
         super().accept()
 
@@ -1225,9 +1274,9 @@ class SettingsDialog(QDialog):
         provider = str(self.tts_provider_combo.currentData() or TTS_PROVIDER_GPT_SOVITS)
         self.tts_api_url_edit.setPlaceholderText(_default_tts_api_url(provider))
         if provider == TTS_PROVIDER_GENIE:
-            self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/genie_tts_server")
+            self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/genie_tts_server/Genie-TTS Server")
         else:
-            self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_v2pro")
+            self.tts_work_dir_edit.setPlaceholderText("data/tts_bundles/installed/gpt_sovits_nvidia50/GPT-SoVITS-v2pro-20250604-nvidia50")
 
     def _import_character_archive(self) -> None:
         if self._character_export_thread is not None:

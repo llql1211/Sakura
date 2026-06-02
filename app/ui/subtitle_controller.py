@@ -9,10 +9,14 @@ from app.llm.chat_reply import ChatSegment
 from app.core.debug_log import debug_log
 from app.voice import VoicePlaybackController
 
-#字幕逐字显示速度
+# 字幕逐字显示速度。
 SPEECH_TYPING_INTERVAL_MS = 35
-#分段回复之间的默认停顿时间
+# 分段回复之间的默认停顿时间。
 REPLY_SEGMENT_PAUSE_MS = 100
+SUBTITLE_TYPING_INTERVAL_MIN_MS = 5
+SUBTITLE_TYPING_INTERVAL_MAX_MS = 200
+REPLY_SEGMENT_PAUSE_MIN_MS = 0
+REPLY_SEGMENT_PAUSE_MAX_MS = 3000
 
 LogStageCallback = Callable[[str, dict[str, Any] | None], None]
 SegmentCallback = Callable[[ChatSegment], None]
@@ -32,6 +36,8 @@ class SubtitleController(QObject):
         should_complete_reply: Callable[[], bool],
         parent: QObject | None = None,
         preload_segment: SegmentCallback | None = None,
+        typing_interval_ms: int = SPEECH_TYPING_INTERVAL_MS,
+        segment_pause_ms: int = REPLY_SEGMENT_PAUSE_MS,
     ) -> None:
         super().__init__(parent)
         self.speech_label = speech_label
@@ -54,10 +60,22 @@ class SubtitleController(QObject):
         self.current_segment_speech_done = False
         self.current_segment_tts_done = True
         self.reply_advance_scheduled = False
+        self.typing_interval_ms, self.segment_pause_ms = normalize_subtitle_display_speed(
+            typing_interval_ms,
+            segment_pause_ms,
+        )
 
         self.speech_timer = QTimer(self)
-        self.speech_timer.setInterval(SPEECH_TYPING_INTERVAL_MS)
+        self.speech_timer.setInterval(self.typing_interval_ms)
         self.speech_timer.timeout.connect(self._show_next_speech_char)
+
+    def set_display_speed(self, typing_interval_ms: int, segment_pause_ms: int) -> None:
+        """更新字幕逐字间隔和分段停顿，后续显示流程立即使用新配置。"""
+        self.typing_interval_ms, self.segment_pause_ms = normalize_subtitle_display_speed(
+            typing_interval_ms,
+            segment_pause_ms,
+        )
+        self.speech_timer.setInterval(self.typing_interval_ms)
 
     def show_segments(self, segments: list[ChatSegment]) -> None:
         clean_segments = [segment for segment in segments if segment.text.strip()]
@@ -264,12 +282,12 @@ class SubtitleController(QObject):
             "next_segment_scheduled",
             {
                 "sequence_id": sequence_id,
-                "delay_ms": REPLY_SEGMENT_PAUSE_MS,
+                "delay_ms": self.segment_pause_ms,
                 "remaining_segments": len(self.pending_reply_segments),
             },
         )
         QTimer.singleShot(
-            REPLY_SEGMENT_PAUSE_MS,
+            self.segment_pause_ms,
             lambda: self._show_scheduled_next_reply_segment(sequence_id, reply_advance_token),
         )
 
@@ -325,3 +343,31 @@ def _segment_debug_payload(segment: ChatSegment) -> dict[str, str]:
         "portrait": segment.portrait,
         "translation": segment.translation,
     }
+
+
+def normalize_subtitle_display_speed(
+    typing_interval_ms: Any,
+    segment_pause_ms: Any,
+) -> tuple[int, int]:
+    return (
+        _clamped_int_value(
+            typing_interval_ms,
+            SPEECH_TYPING_INTERVAL_MS,
+            SUBTITLE_TYPING_INTERVAL_MIN_MS,
+            SUBTITLE_TYPING_INTERVAL_MAX_MS,
+        ),
+        _clamped_int_value(
+            segment_pause_ms,
+            REPLY_SEGMENT_PAUSE_MS,
+            REPLY_SEGMENT_PAUSE_MIN_MS,
+            REPLY_SEGMENT_PAUSE_MAX_MS,
+        ),
+    )
+
+
+def _clamped_int_value(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))

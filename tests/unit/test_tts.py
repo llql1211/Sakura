@@ -577,7 +577,12 @@ def test_voice_playback_controller_falls_back_to_subtitle_callbacks_on_tts_error
             raise RuntimeError("tts down")
 
     events: list[str] = []
-    controller = VoicePlaybackController(FailingTTS(), lambda *_args, **_kwargs: None)  # type: ignore[arg-type]
+    errors: list[str] = []
+    controller = VoicePlaybackController(
+        FailingTTS(),
+        lambda *_args, **_kwargs: None,
+        on_error=errors.append,
+    )  # type: ignore[arg-type]
 
     controller.speak_segment(
         ChatSegment("こんにちは", "中性"),
@@ -587,6 +592,7 @@ def test_voice_playback_controller_falls_back_to_subtitle_callbacks_on_tts_error
     )
 
     assert events == ["started", "finished"]
+    assert errors == ["播放失败，已继续显示字幕：tts down"]
 
 
 def test_voice_playback_controller_skips_chinese_text_for_japanese_tts() -> None:
@@ -744,9 +750,16 @@ def test_voice_playback_controller_ignores_prepare_error() -> None:
         def discard_prepared(self, *_args: object, **_kwargs: object) -> None:
             pass
 
-    controller = VoicePlaybackController(FailingPrepareTTS(), lambda *_args, **_kwargs: None)  # type: ignore[arg-type]
+    errors: list[str] = []
+    controller = VoicePlaybackController(
+        FailingPrepareTTS(),
+        lambda *_args, **_kwargs: None,
+        on_error=errors.append,
+    )  # type: ignore[arg-type]
 
     controller.prepare_next(ChatSegment("次の一段", "中性"))
+
+    assert errors == ["预生成失败，已继续字幕流程：prepare down"]
 
 
 def _minimal_tts_settings(

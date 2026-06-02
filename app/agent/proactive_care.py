@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES = 20
+PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES = 2
 PROACTIVE_DEFAULT_COOLDOWN_MINUTES = 10
 PROACTIVE_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT = 6
 PROACTIVE_MIN_CHECK_INTERVAL_MINUTES = 1
@@ -20,8 +20,8 @@ PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER = "[已抓取屏幕上下文]"
 class ProactiveCareSettings:
     """主动关怀配置；由主动屏幕获取开关控制是否运行。"""
 
-    enabled: bool = False
-    screen_context_enabled: bool = False
+    enabled: bool = True
+    screen_context_enabled: bool = True
     check_interval_minutes: int = PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES
     cooldown_minutes: int = PROACTIVE_DEFAULT_COOLDOWN_MINUTES
     screen_context_batch_limit: int = PROACTIVE_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT
