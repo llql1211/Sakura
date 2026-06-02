@@ -5,6 +5,7 @@ from typing import Any
 
 from app.agent import AgentEvent, AgentProgress, AgentResult, AgentRuntime, PendingToolAction
 from app.core.debug_log import debug_log, summarize_messages
+from app.orchestration import ConversationCoordinator
 from app.storage.visual_observation import (
     VisualObservationJob,
     VisualObservationRecord,
@@ -22,9 +23,11 @@ class ChatPipeline:
     def __init__(
         self,
         agent_runtime: AgentRuntime,
+        conversation_coordinator: ConversationCoordinator | None = None,
         visual_observation_store: VisualObservationStore | None = None,
     ) -> None:
         self.agent_runtime = agent_runtime
+        self.conversation_coordinator = conversation_coordinator
         self.visual_observation_store = visual_observation_store
 
     def run_user_message(
@@ -43,10 +46,12 @@ class ChatPipeline:
                 "messages": summarize_messages(messages),
             },
         )
-        return self.agent_runtime.handle_user_message(
-            messages,
-            progress_callback=progress_callback,
-        )
+        if self.conversation_coordinator is not None:
+            return self.conversation_coordinator.handle_user_turn(
+                messages,
+                progress_callback=progress_callback,
+            )
+        return self.agent_runtime.handle_user_message(messages, progress_callback=progress_callback)
 
     def run_confirmed_action(
         self,
@@ -91,6 +96,11 @@ class ChatPipeline:
                 "payload": event.payload,
             },
         )
+        if self.conversation_coordinator is not None:
+            return self.conversation_coordinator.handle_event(
+                event,
+                progress_callback=progress_callback,
+            )
         return self.agent_runtime.handle_event(
             event,
             progress_callback=progress_callback,

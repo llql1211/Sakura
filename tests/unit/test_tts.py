@@ -202,10 +202,16 @@ def test_tts_weight_switch_error_includes_endpoint_and_path(monkeypatch) -> None
     assert "bad weights" in messages[0]
 
 
-def test_gptsovits_provider_initializes_qt_player_lazily(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_gptsovits_provider_warms_up_qt_player_before_first_play(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.voice.tts as tts_module
 
     calls: list[str] = []
+
+    class TimerStub:
+        @staticmethod
+        def singleShot(_interval: int, callback) -> None:  # type: ignore[no-untyped-def]
+            calls.append("timer")
+            callback()
 
     class SignalStub:
         def connect(self, *_args: object, **_kwargs: object) -> None:
@@ -243,6 +249,7 @@ def test_gptsovits_provider_initializes_qt_player_lazily(monkeypatch) -> None:  
         def stop(self) -> None:
             pass
 
+    monkeypatch.setattr(tts_module, "QTimer", TimerStub)
     monkeypatch.setattr(tts_module, "QAudioOutput", AudioOutputStub)
     monkeypatch.setattr(tts_module, "QMediaPlayer", MediaPlayerStub)
 
@@ -250,10 +257,14 @@ def test_gptsovits_provider_initializes_qt_player_lazily(monkeypatch) -> None:  
 
     assert calls == []
 
+    provider.warm_up_playback()
+
+    assert calls == ["timer", "audio", "player"]
+
     provider._pending_audio.append((Path("dummy.wav"), None, None, None))
     provider._play_next()
 
-    assert calls == ["audio", "player", "source", "play"]
+    assert calls == ["timer", "audio", "player", "source", "play"]
 
 
 def test_voice_playback_controller_falls_back_to_subtitle_callbacks_on_tts_error() -> None:

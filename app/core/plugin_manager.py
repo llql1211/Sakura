@@ -117,8 +117,9 @@ def _plugin_root_from_entry(base_dir: Path, entry: str) -> Path:
 def _convert_registered_tool(registered: RegisteredTool) -> Tool:
     def handler(arguments: dict[str, Any]) -> Any:
         kwargs = {
-            name: arguments.get(name)
+            name: arguments[name]
             for name in registered.parameters.get("properties", {})
+            if name in arguments
         }
         return registered.func(**kwargs)
 

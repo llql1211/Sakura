@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
-from app.agent.actions import AgentAction, AgentEvent, AgentProgress, AgentResult, PendingToolAction
+from app.agent.actions import AgentAction, AgentEvent, AgentProgress, AgentResult, AgentTaskResult, PendingToolAction
 from app.agent.memory import MemoryStore
 from app.agent.screen_tools import (
     OBSERVE_SCREEN_TOOL_NAME,
@@ -178,6 +178,40 @@ class AgentRuntime:
             progress_callback=progress_callback,
         )
 
+    def run_user_task(
+        self,
+        messages: list[ChatMessage],
+        progress_callback: ProgressCallback | None = None,
+    ) -> AgentTaskResult:
+        """以中立执行器模式处理用户任务，结果交给 RoleplayLayer 再表达。"""
+
+        turn_started_at = time.perf_counter()
+        allow_screen_observation = (
+            self.model_vision_enabled
+            and self.autonomous_screen_observation_enabled
+            and not messages_contain_image(messages)
+            and _should_offer_screen_observation(messages)
+        )
+        debug_log(
+            "AgentRuntime",
+            "开始处理中立用户任务",
+            {
+                "message_count": len(messages),
+                "allow_screen_observation": allow_screen_observation,
+                "model_vision_enabled": self.model_vision_enabled,
+                "autonomous_screen_observation_enabled": self.autonomous_screen_observation_enabled,
+                "messages": summarize_messages(messages),
+            },
+        )
+        return self._run_tool_loop(
+            messages,
+            allow_screen_observation=allow_screen_observation,
+            turn_started_at=turn_started_at,
+            vision_unsupported_reply=_build_vision_unsupported_reply(),
+            progress_callback=progress_callback,
+            output_mode="neutral",
+        )
+
     def _run_tool_loop(
         self,
         messages: list[ChatMessage],
@@ -189,7 +223,8 @@ class AgentRuntime:
         initial_actions: list[AgentAction] | None = None,
         vision_unsupported_reply: ChatReply | None = None,
         progress_callback: ProgressCallback | None = None,
-    ) -> AgentResult:
+        output_mode: Literal["roleplay", "neutral"] = "roleplay",
+    ) -> AgentResult | AgentTaskResult:
         """执行 OpenAI 原生 tools/tool_calls 循环。"""
         working_messages: list[ChatMessage] = [*messages]
         execution_results: list[ToolExecutionResult] = []
@@ -207,7 +242,6 @@ class AgentRuntime:
             visible_browser_guard_active = (
                 _latest_user_requests_visible_browser(working_messages)
                 and _browser_dom_tools_available(self.tools)
-                and not _recent_browser_tool_failed(working_messages)
             )
             if browser_page_mode or visible_browser_guard_active:
                 active_groups.add("browser")
@@ -229,6 +263,15 @@ class AgentRuntime:
                         extra_instructions=planning_extra_instructions,
                     )
                     if proactive_mode
+                    else self._build_neutral_tool_system_prompt(
+                        allow_screen_observation=allow_screen_observation,
+                        step_index=step_index,
+                        remaining_steps=MAX_AGENT_STEPS_PER_TURN - step_index - 1,
+                        extra_instructions=planning_extra_instructions,
+                        browser_page_mode=browser_page_guard_active,
+                        visible_browser_mode=visible_browser_guard_active,
+                    )
+                    if output_mode == "neutral"
                     else self._build_tool_system_prompt(
                         allow_screen_observation=allow_screen_observation,
                         step_index=step_index,
@@ -249,6 +292,14 @@ class AgentRuntime:
             except ApiRequestError as exc:
                 if messages_contain_image(working_messages) and is_vision_unsupported_error(exc):
                     debug_log("AgentRuntime", "视觉输入不受支持，返回兜底回复", {"error": str(exc)})
+                    if output_mode == "neutral":
+                        reply = vision_unsupported_reply or _build_vision_unsupported_reply()
+                        return AgentTaskResult(
+                            status="failed",
+                            summary=reply.translation or reply.text,
+                            actions=emitted_actions,
+                            raw_reply=reply,
+                        )
                     return AgentResult(
                         reply=vision_unsupported_reply or _build_vision_unsupported_reply(),
                         actions=emitted_actions,
@@ -277,6 +328,12 @@ class AgentRuntime:
                         "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
                     },
                 )
+                if output_mode == "neutral":
+                    return _parse_neutral_task_result(
+                        turn.content,
+                        actions=emitted_actions,
+                        fallback_status="success",
+                    )
                 return AgentResult(
                     reply=self._parse_final_reply_with_retry(
                         system_prompt,
@@ -286,16 +343,17 @@ class AgentRuntime:
                     actions=emitted_actions,
                 )
 
-            _emit_progress_from_content(
-                progress_callback,
-                turn.content,
-                stage="tool_planning",
-                metadata={
-                    "step_index": step_index,
-                    "tool_names": [call.name for call in turn.tool_calls],
-                    "tool_call_count": len(turn.tool_calls),
-                },
-            )
+            if output_mode == "roleplay":
+                _emit_progress_from_content(
+                    progress_callback,
+                    turn.content,
+                    stage="tool_planning",
+                    metadata={
+                        "step_index": step_index,
+                        "tool_names": [call.name for call in turn.tool_calls],
+                        "tool_call_count": len(turn.tool_calls),
+                    },
+                )
             step_results: list[ToolExecutionResult] = []
             pending_actions: list[PendingToolAction] = []
             tool_messages: list[ChatMessage] = []
@@ -396,6 +454,14 @@ class AgentRuntime:
                                 "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
                             },
                         )
+                        if output_mode == "neutral":
+                            reply = _build_screen_observation_request_reply()
+                            return AgentTaskResult(
+                                status="needs_screen",
+                                summary=reply.translation or reply.text,
+                                actions=[*emitted_actions, screen_action],
+                                raw_reply=reply,
+                            )
                         return AgentResult(
                             reply=_build_screen_observation_request_reply(),
                             actions=[*emitted_actions, screen_action],
@@ -514,6 +580,23 @@ class AgentRuntime:
                         "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
                     },
                 )
+                if output_mode == "neutral":
+                    reply = _build_pending_action_reply(pending_actions)
+                    return AgentTaskResult(
+                        status="needs_confirmation",
+                        summary=reply.translation or reply.text,
+                        actions=[
+                            *emitted_actions,
+                            *[
+                                AgentAction(
+                                    type="pending_action",
+                                    payload=action.to_dict(include_context=True),
+                                )
+                                for action in pending_actions
+                            ],
+                        ],
+                        raw_reply=reply,
+                    )
                 return AgentResult(
                     reply=_build_pending_action_reply(pending_actions),
                     actions=[
@@ -549,6 +632,30 @@ class AgentRuntime:
 
         try:
             final_started_at = time.perf_counter()
+            if output_mode == "neutral":
+                final_task_result = _parse_neutral_task_result(
+                    self.api_client.complete_raw(
+                        self._build_neutral_final_prompt(),
+                        working_messages,
+                        temperature=0.2,
+                        response_format={"type": "json_object"},
+                    ),
+                    actions=emitted_actions,
+                    fallback_status=_status_from_tool_results(execution_results),
+                )
+                debug_log(
+                    "AgentRuntime",
+                    "中立任务结果生成完成",
+                    {
+                        "status": final_task_result.status,
+                        "summary": final_task_result.summary,
+                        "actions": [_redact_tool_result_for_model(result) for result in execution_results],
+                        "final_reply_elapsed_ms": int((time.perf_counter() - final_started_at) * 1000),
+                        "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
+                    },
+                )
+                return final_task_result
+
             final_reply = self.api_client.chat(
                 self._build_final_reply_prompt(),
                 working_messages,
@@ -558,6 +665,8 @@ class AgentRuntime:
         except Exception as exc:
             print(f"[AgentRuntime] 工具结果总结失败，使用本地兜底回复：{exc}")
             debug_log("AgentRuntime", "工具结果总结失败，使用本地兜底回复", {"error": str(exc)})
+            if output_mode == "neutral":
+                return _build_fallback_task_result(execution_results, actions=emitted_actions)
             final_reply = _build_fallback_tool_reply(execution_results)
         debug_log(
             "AgentRuntime",
@@ -761,6 +870,7 @@ class AgentRuntime:
         screen_observation_rule = _build_screen_and_desktop_routing_rule(allow_screen_observation)
         browser_page_rule = _build_browser_page_mode_rule(browser_page_mode)
         visible_browser_rule = _build_visible_browser_mode_rule(visible_browser_mode)
+        web_tool_capability_rule = _build_web_tool_capability_rule(visible_browser_mode)
         return f"""
 {self.system_prompt.strip()}
 
@@ -783,7 +893,7 @@ class AgentRuntime:
 {context_strategy}
 
 可用工具能力领域：
-- 网页：轻量公开资料用 web__web_search / web__fetch_url；可见浏览器操作用 playwright_*。
+{web_tool_capability_rule}
 - 屏幕：理解当前画面用 observe_screen（仅启用时可用）。
 - 桌面控制：窗口、鼠标、键盘和系统界面操作用 windows__*。
 - 提醒与记忆：add_reminder、memory_search、memory_remember、memory_forget
@@ -793,6 +903,71 @@ class AgentRuntime:
 - 可以在 assistant content 中写一句可直接说给用户听的短句；不要提前给最终结论。
 - 不要臆造工具名；只能使用 API tools 列表中的工具。
 - 高风险或 requires_confirmation 工具会在用户确认后执行；你可以发起 tool_call，但正文要简短说明为什么需要确认。
+- 用户明确要求浏览器可见过程或网页操作时，用 playwright_*，不要用后台 web__ 替代。
+- 浏览器外的桌面点击、输入、窗口操作才用 windows__*；操作前先用 windows__Snapshot / windows__Screenshot 获取真实状态。
+{screen_observation_rule}
+{browser_page_rule}
+{visible_browser_rule}
+- 如果 playwright_ 浏览器工具不可用，说明网页自动化能力不可用；不要回退到 Sakura 内置浏览器工具。
+- 需要网页交互时，只能基于当前页面真实内容选择工具，不要臆造 selector、target 或页面内容。
+{extra_instructions.strip()}
+- 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
+- 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
+- 需要跨会话信息、用户偏好或项目状态时，优先使用 memory_search。
+- 只有用户明确要求记住，或信息明显长期有用且不包含敏感凭据时，才使用 memory_remember。
+- 只有用户明确要求忘掉信息时，才使用 memory_forget。
+""".strip()
+
+    def _build_neutral_tool_system_prompt(
+        self,
+        allow_screen_observation: bool = False,
+        step_index: int = 0,
+        remaining_steps: int = MAX_AGENT_STEPS_PER_TURN - 1,
+        extra_instructions: str = "",
+        browser_page_mode: bool = False,
+        visible_browser_mode: bool = False,
+    ) -> str:
+        memory_summary = self._memory_summary()
+        current_time = datetime.now().astimezone().isoformat(timespec="seconds")
+        context_strategy = build_context_acquisition_strategy(
+            allow_screen_observation=allow_screen_observation
+        )
+        screen_observation_rule = _build_screen_and_desktop_routing_rule(allow_screen_observation)
+        browser_page_rule = _build_browser_page_mode_rule(browser_page_mode)
+        visible_browser_rule = _build_visible_browser_mode_rule(visible_browser_mode)
+        web_tool_capability_rule = _build_web_tool_capability_rule(visible_browser_mode)
+        return f"""
+你是 Sakura 的 AgentCore 执行层，只负责把任务办对。
+不要输出角色语气、日文、分段 Sakura JSON、表情、立绘或 TTS 文本。
+如果需要工具，请使用原生 tool_calls；如果信息已经足够，请只返回中立 JSON。
+
+中立 JSON 格式：
+{{"status":"success","summary":"面向用户的简洁中文任务结果","facts":["关键事实"]}}
+
+长期记忆摘要：
+{memory_summary}
+
+当前本地时间：
+{current_time}
+
+当前 Agent 循环：
+- 这是第 {step_index + 1} 步，之后最多还可以继续 {remaining_steps} 步。
+- 每步最多请求 {MAX_TOOL_CALLS_PER_STEP} 个工具，整轮最多 {MAX_TOOL_CALLS_PER_TURN} 个工具。
+- 工具结果足够、受限、需要确认或同参数失败时，停止循环并返回中立 JSON。
+
+{context_strategy}
+
+可用工具能力领域：
+{web_tool_capability_rule}
+- 屏幕：理解当前画面用 observe_screen（仅启用时可用）。
+- 桌面控制：窗口、鼠标、键盘和系统界面操作用 windows__*。
+- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_forget
+
+工具要求：
+- 只调用 API tools 列表中真实存在的工具；工具能帮助完成请求时优先发起原生 tool_calls。
+- assistant content 不要写角色台词；需要说明时写中立短句或 JSON。
+- 不要臆造工具名；只能使用 API tools 列表中的工具。
+- 高风险或 requires_confirmation 工具会在用户确认后执行；你可以发起 tool_call，但不要声称动作已经完成。
 - 用户明确要求浏览器可见过程或网页操作时，用 playwright_*，不要用后台 web__ 替代。
 - 浏览器外的桌面点击、输入、窗口操作才用 windows__*；操作前先用 windows__Snapshot / windows__Screenshot 获取真实状态。
 {screen_observation_rule}
@@ -835,6 +1010,22 @@ class AgentRuntime:
 你会收到上一轮工具调用结果。请基于这些结果给用户最终回复。
 不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。
 如果工具结果信息丰富，可以适当展开总结、补充细节或引导对话继续，让用户能感受到信息已经被充分理解和整理。
+""".strip()
+
+    def _build_neutral_final_prompt(self) -> str:
+        return """
+你是 Sakura 的 AgentCore 执行层。
+你会收到上一轮工具调用、工具结果和相关上下文。请只总结任务事实，不要角色扮演。
+不要输出日文、Sakura 分段 JSON、表情、立绘、TTS 文本、工具协议解释或内部推理。
+
+只返回 JSON：
+{"status":"success|failed","summary":"面向用户的简洁中文任务结果","facts":["关键事实"]}
+
+规则：
+- 保留重要路径、URL、时间、命令、错误、限制和不确定性。
+- 工具全部成功或已经完成用户目标时 status 为 success。
+- 工具有失败、被限制、信息不足或目标未完成时 status 为 failed，并在 summary 中说明真实原因。
+- 不要脑补工具结果没有给出的事实。
 """.strip()
 
     def _build_event_reply_prompt(self, event_type: str = "reminder_due") -> str:
@@ -1487,6 +1678,15 @@ def _build_visible_browser_mode_rule(visible_browser_mode: bool) -> str:
     )
 
 
+def _build_web_tool_capability_rule(visible_browser_mode: bool) -> str:
+    if visible_browser_mode:
+        return (
+            "- 网页：本轮是显式可见浏览器任务，使用 playwright_*；"
+            "后台 web__ 搜索/抓取只用于非可见浏览器的轻量公开资料。"
+        )
+    return "- 网页：轻量公开资料用 web__web_search / web__fetch_url；可见浏览器操作用 playwright_*。"
+
+
 def _build_screen_and_desktop_routing_rule(allow_screen_observation: bool) -> str:
     if allow_screen_observation:
         return "\n".join(
@@ -1934,6 +2134,82 @@ def _build_fallback_tool_reply(results: list[ToolExecutionResult]) -> ChatReply:
             },
             ensure_ascii=False,
         )
+    )
+
+
+def _parse_neutral_task_result(
+    content: str,
+    *,
+    actions: list[AgentAction],
+    fallback_status: str,
+) -> AgentTaskResult:
+    data = _try_parse_json_object(content)
+    if isinstance(data, dict):
+        status = str(data.get("status") or fallback_status).strip().lower()
+        if status not in {"success", "failed", "needs_confirmation", "needs_screen"}:
+            status = fallback_status
+        summary = str(data.get("summary") or data.get("text") or "").strip()
+        facts = _string_list(data.get("facts"))
+        if not summary and facts:
+            summary = "；".join(facts)
+        if summary:
+            return AgentTaskResult(
+                status=status,
+                summary=summary,
+                actions=[*actions],
+                facts=facts,
+            )
+
+    cleaned = str(content or "").strip()
+    return AgentTaskResult(
+        status=fallback_status,
+        summary=cleaned or "任务已结束，但模型没有返回可用摘要。",
+        actions=[*actions],
+    )
+
+
+def _try_parse_json_object(content: str) -> dict[str, Any] | None:
+    cleaned = str(content or "").strip()
+    if not cleaned:
+        return None
+    candidates = [cleaned]
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(cleaned[start : end + 1])
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _status_from_tool_results(results: list[ToolExecutionResult]) -> str:
+    if not results:
+        return "success"
+    return "success" if all(result.success for result in results) else "failed"
+
+
+def _build_fallback_task_result(
+    results: list[ToolExecutionResult],
+    *,
+    actions: list[AgentAction],
+) -> AgentTaskResult:
+    reply = _build_fallback_tool_reply(results)
+    return AgentTaskResult(
+        status=_status_from_tool_results(results),
+        summary=reply.translation or reply.text,
+        actions=[*actions],
+        raw_reply=reply,
     )
 
 
