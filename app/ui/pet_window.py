@@ -1410,6 +1410,9 @@ class PetWindow(QWidget):
         if record_history:
             self.messages.append({"role": "assistant", "content": reply.text})
             self._record_assistant_reply_history(reply, _debug=result._debug)
+        self._show_reply_segments(reply.segments)
+        self._apply_pending_action_from_result(result)
+
     def _apply_pending_action_from_result(self, result: AgentResult) -> None:
         for action in result.actions:
             if action.type != "pending_action":

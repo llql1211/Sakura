@@ -2686,6 +2686,35 @@ def test_reply_history_buttons_review_segments_without_tts_or_history() -> None:
     assert window.portrait_controller.applied[-1] == second
 
 
+def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
+    from app.agent import AgentResult
+    from app.llm.chat_reply import ChatReply
+    from app.ui.pet_window import PetWindow
+
+    class MinimalConsumeWindow:
+        _consume_agent_result = PetWindow._consume_agent_result
+
+    window = MinimalConsumeWindow()
+    segment = ChatSegment("時間だよ。水を飲んで。", "请求", "到时间了，喝水。", "伸手命令")
+    shown_segments = []
+    applied_results = []
+    history = []
+    window.messages = []
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+    window._record_assistant_reply_history = lambda reply, _debug=None: history.append((reply, _debug))
+    window._show_reply_segments = lambda segments: shown_segments.append(segments)
+    window._apply_pending_action_from_result = lambda result: applied_results.append(result)
+
+    result = AgentResult(reply=ChatReply([segment]), _debug={"source": "reminder_due"})
+
+    window._consume_agent_result(result)
+
+    assert window.messages == [{"role": "assistant", "content": segment.text}]
+    assert history == [(result.reply, {"source": "reminder_due"})]
+    assert shown_segments == [[segment]]
+    assert applied_results == [result]
+
+
 def test_reply_history_buttons_disable_while_busy_or_playing() -> None:
     from app.ui.pet_window import PetWindow
 
