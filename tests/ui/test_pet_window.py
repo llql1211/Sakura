@@ -1169,7 +1169,7 @@ def test_settings_dialog_memory_loader_thread_is_not_dialog_child() -> None:
     )
 
     try:
-        assert memory_store.started.wait(1.5)
+        assert _process_events_until(app, lambda: memory_store.started.is_set())
         assert dialog._memory_list_thread is not None
         assert dialog._memory_list_thread.parent() is None
     finally:
