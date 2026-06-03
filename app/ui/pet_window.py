@@ -111,13 +111,14 @@ from app.ui.fonts import _rounded_chinese_font, _rounded_japanese_font
 from app.ui import (
     FrostedGlassFrame,
     ManualScreenshotOverlay,
-    PET_WINDOW_STYLEHEET,
     PortraitController,
     SubtitleController,
     ToolConfirmationPanel,
     build_pet_tray_menu,
     capture_virtual_desktop_pixmap,
 )
+from app.ui.styles import pet_window_stylesheet
+from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings
 from app.voice import VoicePlaybackController
 
 if TYPE_CHECKING:
@@ -177,6 +178,7 @@ class PetWindow(QWidget):
         self.visual_observation_store = context.visual_observation_store
         self.mcp_settings = context.mcp_settings
         self.debug_log_settings = context.debug_log_settings
+        self.theme_settings = self.settings_service.load_theme_settings()
         self.memory_curation_settings = context.memory_curation_settings
         self.memory_curation_state = context.memory_curation_state
         self.memory_curator = context.memory_curator
@@ -440,7 +442,7 @@ class PetWindow(QWidget):
         input_layout.addWidget(self.send_button)
         self.input_bar.setLayout(input_layout)
 
-        self.setStyleSheet(PET_WINDOW_STYLEHEET)
+        self._apply_theme_settings(self.theme_settings)
         self._apply_fonts()
         self._load_reply_history_from_store()
         self._update_reply_history_buttons()
@@ -2185,9 +2187,11 @@ class PetWindow(QWidget):
                 self.history_store,
                 self.subtitle_language,
                 self._save_history_to_memory_and_clear,
+                self.theme_settings,
                 self,
             )
         self.history_window.set_subtitle_language(self.subtitle_language)
+        self.history_window.set_theme_settings(self.theme_settings)
         self.history_window.refresh()
         self.history_window.show()
         self.history_window.raise_()
@@ -2245,6 +2249,7 @@ class PetWindow(QWidget):
             portrait_scale_percent=self.portrait_scale_percent,
             subtitle_typing_interval_ms=self.subtitle_typing_interval_ms,
             reply_segment_pause_ms=self.reply_segment_pause_ms,
+            theme_settings=getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2258,6 +2263,11 @@ class PetWindow(QWidget):
             "result_reply_segment_pause_ms",
             self.reply_segment_pause_ms,
         )
+        result_theme_settings = getattr(
+            dialog,
+            "result_theme_settings",
+            getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS),
+        )
         if (
             dialog.result_api_settings is None
             or dialog.result_tts_settings is None
@@ -2266,6 +2276,7 @@ class PetWindow(QWidget):
             or dialog.result_mcp_settings is None
             or dialog.result_debug_log_settings is None
             or dialog.result_portrait_scale_percent is None
+            or result_theme_settings is None
             or result_subtitle_typing_interval_ms is None
             or result_reply_segment_pause_ms is None
         ):
@@ -2304,6 +2315,8 @@ class PetWindow(QWidget):
             )
             self.settings_service.save_mcp_runtime_settings(dialog.result_mcp_settings)
             self.settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
+            if result_theme_settings != getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS):
+                self.settings_service.save_theme_settings(result_theme_settings)
             self._save_system_config_values(
                 "ui",
                 {
@@ -2324,6 +2337,11 @@ class PetWindow(QWidget):
             result_subtitle_typing_interval_ms,
             result_reply_segment_pause_ms,
         )
+        apply_theme_settings = getattr(self, "_apply_theme_settings", None)
+        if callable(apply_theme_settings):
+            apply_theme_settings(result_theme_settings)
+        else:
+            self.theme_settings = result_theme_settings
         self.proactive_care_settings = dialog.result_proactive_care_settings
         mcp_restart_required = dialog.result_mcp_settings != self.mcp_settings
         self.mcp_settings = dialog.result_mcp_settings
@@ -2697,6 +2715,12 @@ class PetWindow(QWidget):
                 self.subtitle_typing_interval_ms,
                 self.reply_segment_pause_ms,
             )
+
+    def _apply_theme_settings(self, theme_settings: ThemeSettings) -> None:
+        self.theme_settings = (theme_settings or DEFAULT_THEME_SETTINGS).normalized()
+        self.setStyleSheet(pet_window_stylesheet(self.theme_settings))
+        if self.history_window is not None:
+            self.history_window.set_theme_settings(self.theme_settings)
 
     def _apply_character(self, profile: CharacterProfile) -> None:
         previous_character_id = self.character_profile.id

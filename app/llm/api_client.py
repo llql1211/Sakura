@@ -164,6 +164,8 @@ class OpenAICompatibleClient:
         except (KeyError, IndexError, TypeError) as exc:
             raise ApiRequestError(f"API 返回格式无法解析：{json.dumps(data, ensure_ascii=False)}") from exc
 
+        reasoning = data["choices"][0]["message"].get("reasoning_content", "")
+        content = (str(reasoning) + "\n" + str(content)).strip()
         result = str(content).strip()
         debug_log("API", "模型原始文本返回", {"content": result})
         return result

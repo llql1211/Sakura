@@ -24,6 +24,7 @@ from app.agent.screen_observation import (
 )
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
 from app.llm.chat_reply import parse_chat_reply_result
+from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings, build_history_window_stylesheet
 
 
 _VISUAL_ID_SUFFIX_RE = re.compile(r"，视觉记录\s+visual_id=[^\]\s]+")
@@ -49,12 +50,14 @@ class HistoryWindow(QDialog):
         history_store: ChatHistoryStore,
         subtitle_language: str = "ja",
         on_save_and_clear: Callable[[], None] | None = None,
+        theme_settings: ThemeSettings | None = None,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
         super().__init__(parent)
         self.history_store = history_store
         self.subtitle_language = subtitle_language
         self.on_save_and_clear = on_save_and_clear
+        self.theme_settings = (theme_settings or DEFAULT_THEME_SETTINGS).normalized()
         self._bubble_frames: list[QFrame] = []
 
         self.setWindowTitle("历史记录")
@@ -114,110 +117,7 @@ class HistoryWindow(QDialog):
         layout.addLayout(button_layout)
         self.setLayout(layout)
 
-        self.setStyleSheet(
-            """
-            QDialog {
-                background: #fff6fa;
-                color: #3d2b35;
-                font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
-                font-size: 16px;
-            }
-            QLabel#historyTitle {
-                color: #7a3656;
-                font-size: 22px;
-                font-weight: 700;
-            }
-            QLabel#historyCount {
-                color: #9b4f72;
-                background: rgba(255, 232, 241, 0.78);
-                border: 1px solid rgba(238, 172, 200, 0.48);
-                border-radius: 12px;
-                padding: 5px 10px;
-                font-size: 13px;
-            }
-            QScrollArea#historyScroll {
-                background: rgba(255, 244, 249, 0.94);
-                border: 1px solid rgba(238, 172, 200, 0.54);
-                border-radius: 14px;
-            }
-            QWidget#historyContent {
-                background: transparent;
-            }
-            QFrame#assistantBubble {
-                background: #fffafd;
-                border: 1px solid #f1c7d9;
-                border-radius: 14px;
-            }
-            QFrame#userBubble {
-                background: #ffe3ee;
-                border: 1px solid #eeb0ca;
-                border-radius: 14px;
-            }
-            QFrame#errorBubble {
-                background: #ffe9e7;
-                border: 1px solid #efc2bd;
-                border-radius: 14px;
-            }
-            QFrame#systemBubble {
-                background: #fff0f6;
-                border: 1px solid #efd0dc;
-                border-radius: 12px;
-            }
-            QLabel#entryMeta {
-                color: #a0647f;
-                font-size: 13px;
-            }
-            QLabel#entryText {
-                color: #3d2b35;
-                font-size: 16px;
-                line-height: 155%;
-            }
-            QLabel#errorText {
-                color: #9f393a;
-                font-size: 16px;
-                line-height: 155%;
-            }
-            QLabel#systemText {
-                color: #7e5d6b;
-                font-size: 15px;
-                line-height: 155%;
-            }
-            QPushButton {
-                background: rgba(255, 255, 255, 0.90);
-                border: 1px solid rgba(238, 172, 200, 0.58);
-                border-radius: 8px;
-                color: #7a3656;
-                min-width: 72px;
-                padding: 8px 12px;
-                font-size: 15px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background: rgba(255, 232, 241, 0.96);
-                border: 1px solid rgba(213, 91, 145, 0.62);
-            }
-            QPushButton#dangerButton {
-                background: #fff1f5;
-                border: 1px solid rgba(199, 88, 122, 0.52);
-                color: #b13e5a;
-            }
-            QPushButton#dangerButton:hover {
-                background: #ffe1ea;
-            }
-            QPushButton#primaryButton {
-                background: #d55b91;
-                border: 1px solid rgba(177, 62, 115, 0.55);
-                color: white;
-            }
-            QPushButton#primaryButton:hover {
-                background: #bf3f7a;
-            }
-            QPushButton#secondaryButton:default {
-                background: #d55b91;
-                color: white;
-            }
-            """
-        )
+        self.set_theme_settings(self.theme_settings)
         self.refresh()
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
@@ -240,6 +140,10 @@ class HistoryWindow(QDialog):
         self.history_store = history_store
         self.history_store.assistant_name = assistant_name
         self.refresh()
+
+    def set_theme_settings(self, settings: ThemeSettings) -> None:
+        self.theme_settings = settings.normalized()
+        self.setStyleSheet(build_history_window_stylesheet(self.theme_settings))
 
     def refresh(self) -> None:
         entries = self.history_store.load()

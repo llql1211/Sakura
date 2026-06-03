@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -8,6 +9,14 @@ from app.config.settings_service import AppSettingsService, DebugLogSettings
 from app.config.yaml_config import load_yaml_mapping
 from app.llm.api_client import ApiSettings
 from app.agent.proactive_care import ProactiveCareSettings
+from app.ui.theme import (
+    DEFAULT_THEME_SETTINGS,
+    DEFAULT_PET_WINDOW_STYLESHEET,
+    THEME_COLOR_FIELDS,
+    ThemeSettings,
+    build_pet_window_stylesheet,
+    parse_ai_theme_response,
+)
 from app.voice.tts import TTS_PROVIDER_CUSTOM_GPT_SOVITS, GPTSoVITSTTSSettings
 
 
@@ -216,6 +225,171 @@ def test_settings_service_loads_debug_file_disabled_by_default() -> None:
     settings = service.load_debug_log_settings()
 
     assert settings == DebugLogSettings(enabled=True, body_enabled=False, file_enabled=False)
+
+
+def test_settings_service_saves_and_loads_theme_settings() -> None:
+    root = _runtime_root("yaml_theme")
+    service = AppSettingsService(root)
+    settings = ThemeSettings(
+        primary_color="#112233",
+        primary_hover_color="#223344",
+        accent_color="#445566",
+        text_color="#070809",
+        secondary_text_color="#111213",
+        muted_text_color="#141516",
+        page_background_color="#f1f2f3",
+        panel_background_color="#e1e2e3",
+        input_background_color="#ffffff",
+        bubble_background_color="#d1d2d3",
+        border_color="#c1c2c3",
+        ai_enabled=True,
+    )
+
+    service.save_theme_settings(settings)
+    loaded = service.load_theme_settings()
+    system = load_yaml_mapping(service.system_config_path)
+
+    assert loaded == settings
+    for field, _label, _default in THEME_COLOR_FIELDS:
+        assert system["ui"]["theme"][field] == getattr(settings, field)
+    assert system["ui"]["theme"]["ai_enabled"] is True
+
+
+def test_settings_service_loads_default_theme_for_invalid_values() -> None:
+    root = _runtime_root("yaml_theme_invalid")
+    service = AppSettingsService(root)
+    service.save_system_values(
+        "ui",
+        {
+            "theme": {
+                "primary_color": "bad",
+                "primary_hover_color": "#123",
+                "accent_color": "#123",
+                "text_color": None,
+                "secondary_text_color": "",
+                "ai_enabled": "yes",
+            }
+        },
+    )
+
+    settings = service.load_theme_settings()
+
+    assert settings == ThemeSettings(
+        primary_color=DEFAULT_THEME_SETTINGS.primary_color,
+        primary_hover_color=DEFAULT_THEME_SETTINGS.primary_hover_color,
+        accent_color=DEFAULT_THEME_SETTINGS.accent_color,
+        text_color=DEFAULT_THEME_SETTINGS.text_color,
+        secondary_text_color=DEFAULT_THEME_SETTINGS.secondary_text_color,
+        muted_text_color=DEFAULT_THEME_SETTINGS.muted_text_color,
+        page_background_color=DEFAULT_THEME_SETTINGS.page_background_color,
+        panel_background_color=DEFAULT_THEME_SETTINGS.panel_background_color,
+        input_background_color=DEFAULT_THEME_SETTINGS.input_background_color,
+        bubble_background_color=DEFAULT_THEME_SETTINGS.bubble_background_color,
+        border_color=DEFAULT_THEME_SETTINGS.border_color,
+        ai_enabled=True,
+    )
+
+
+def test_default_theme_stylesheet_matches_legacy_pet_window_stylesheet() -> None:
+    assert build_pet_window_stylesheet(DEFAULT_THEME_SETTINGS) == DEFAULT_PET_WINDOW_STYLESHEET
+
+
+def test_theme_stylesheet_contains_configured_colors() -> None:
+    stylesheet = build_pet_window_stylesheet(
+        ThemeSettings(
+            primary_color="#112233",
+            primary_hover_color="#223344",
+            accent_color="#445566",
+            text_color="#070809",
+            secondary_text_color="#111213",
+            muted_text_color="#141516",
+            page_background_color="#f1f2f3",
+            panel_background_color="#e1e2e3",
+            input_background_color="#ffffff",
+            bubble_background_color="#d1d2d3",
+            border_color="#c1c2c3",
+        )
+    )
+
+    assert "#112233" in stylesheet
+    assert "rgba(34, 51, 68" in stylesheet
+    assert "#445566" in stylesheet
+    assert "#070809" in stylesheet
+    assert "rgba(17, 34, 51" in stylesheet
+
+
+def test_parse_ai_theme_response_validates_json_and_colors() -> None:
+    theme = parse_ai_theme_response(
+        json.dumps(
+            {
+                "primary_color": "#112233",
+                "primary_hover_color": "#223344",
+                "accent_color": "#445566",
+                "text_color": "#070809",
+                "secondary_text_color": "#111213",
+                "muted_text_color": "#141516",
+                "page_background_color": "#f1f2f3",
+                "panel_background_color": "#e1e2e3",
+                "input_background_color": "#ffffff",
+                "bubble_background_color": "#d1d2d3",
+                "border_color": "#c1c2c3",
+            }
+        ),
+        ai_enabled=True,
+    )
+
+    assert theme == ThemeSettings(
+        primary_color="#112233",
+        primary_hover_color="#223344",
+        accent_color="#445566",
+        text_color="#070809",
+        secondary_text_color="#111213",
+        muted_text_color="#141516",
+        page_background_color="#f1f2f3",
+        panel_background_color="#e1e2e3",
+        input_background_color="#ffffff",
+        bubble_background_color="#d1d2d3",
+        border_color="#c1c2c3",
+        ai_enabled=True,
+    )
+
+    try:
+        parse_ai_theme_response('{"primary_color":"#112233"}', ai_enabled=False)
+    except ValueError as exc:
+        assert "缺少字段" in str(exc)
+    else:
+        raise AssertionError("缺字段时应报错")
+
+    try:
+        parse_ai_theme_response(
+            json.dumps(
+                {
+                    "primary_color": "112233",
+                    "primary_hover_color": "#223344",
+                    "accent_color": "#445566",
+                    "text_color": "#070809",
+                    "secondary_text_color": "#111213",
+                    "muted_text_color": "#141516",
+                    "page_background_color": "#f1f2f3",
+                    "panel_background_color": "#e1e2e3",
+                    "input_background_color": "#ffffff",
+                    "bubble_background_color": "#d1d2d3",
+                    "border_color": "#c1c2c3",
+                }
+            ),
+            ai_enabled=False,
+        )
+    except ValueError as exc:
+        assert "#RRGGBB" in str(exc)
+    else:
+        raise AssertionError("非法颜色时应报错")
+
+    try:
+        parse_ai_theme_response("not json", ai_enabled=False)
+    except ValueError as exc:
+        assert "有效 JSON" in str(exc)
+    else:
+        raise AssertionError("非 JSON 时应报错")
 
 
 def _runtime_root(name: str) -> Path:

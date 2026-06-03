@@ -15,6 +15,7 @@ from app.config.settings_service import DebugLogSettings
 from app.llm.api_client import ApiSettings
 from app.llm.chat_reply import ChatSegment
 from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
+from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings
 from app.agent.proactive_care import ProactiveCareSettings
 from app.agent.screen_observation import ScreenObservation
 from app.voice.tts import GPTSoVITSTTSSettings
@@ -2248,6 +2249,279 @@ def test_settings_dialog_returns_subtitle_display_speed() -> None:
 
     assert dialog.result_subtitle_typing_interval_ms == 90
     assert dialog.result_reply_segment_pause_ms == 1200
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def _theme_settings(*, ai_enabled: bool = False) -> ThemeSettings:
+    return ThemeSettings(
+        primary_color="#112233",
+        primary_hover_color="#223344",
+        accent_color="#445566",
+        text_color="#070809",
+        secondary_text_color="#111213",
+        muted_text_color="#141516",
+        page_background_color="#f1f2f3",
+        panel_background_color="#e1e2e3",
+        input_background_color="#ffffff",
+        bubble_background_color="#d1d2d3",
+        border_color="#c1c2c3",
+        ai_enabled=ai_enabled,
+    )
+
+
+def _theme_json() -> str:
+    theme = _theme_settings()
+    return json.dumps(
+        {
+            "primary_color": theme.primary_color,
+            "primary_hover_color": theme.primary_hover_color,
+            "accent_color": theme.accent_color,
+            "text_color": theme.text_color,
+            "secondary_text_color": theme.secondary_text_color,
+            "muted_text_color": theme.muted_text_color,
+            "page_background_color": theme.page_background_color,
+            "panel_background_color": theme.panel_background_color,
+            "input_background_color": theme.input_background_color,
+            "bubble_background_color": theme.bubble_background_color,
+            "border_color": theme.border_color,
+        }
+    )
+
+
+def test_settings_dialog_returns_theme_settings() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("theme_settings_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=ThemeSettings(
+            primary_color="#112233",
+            primary_hover_color="#223344",
+            accent_color="#445566",
+            text_color="#070809",
+            ai_enabled=False,
+        ),
+    )
+
+    dialog.theme_primary_edit.setText("#223344")
+    dialog.theme_accent_edit.setText("#556677")
+    dialog.theme_text_edit.setText("#111111")
+    dialog.theme_color_edits["primary_hover_color"].setText("#334455")
+    dialog.theme_color_edits["secondary_text_color"].setText("#222222")
+    dialog.theme_color_edits["muted_text_color"].setText("#333333")
+    dialog.theme_color_edits["page_background_color"].setText("#f8f8f8")
+    dialog.theme_color_edits["panel_background_color"].setText("#eeeeee")
+    dialog.theme_color_edits["input_background_color"].setText("#ffffff")
+    dialog.theme_color_edits["bubble_background_color"].setText("#dddddd")
+    dialog.theme_color_edits["border_color"].setText("#cccccc")
+    dialog.theme_ai_enabled_check.setChecked(True)
+    dialog.accept()
+
+    assert dialog.result_theme_settings == ThemeSettings(
+        primary_color="#223344",
+        primary_hover_color="#334455",
+        accent_color="#556677",
+        text_color="#111111",
+        secondary_text_color="#222222",
+        muted_text_color="#333333",
+        page_background_color="#f8f8f8",
+        panel_background_color="#eeeeee",
+        input_background_color="#ffffff",
+        bubble_background_color="#dddddd",
+        border_color="#cccccc",
+        ai_enabled=True,
+    )
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_resets_default_theme_colors() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("theme_reset_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=ThemeSettings(
+            primary_color="#112233",
+            primary_hover_color="#223344",
+            accent_color="#445566",
+            text_color="#070809",
+            ai_enabled=True,
+        ),
+    )
+
+    dialog._reset_theme_colors()
+
+    assert dialog.theme_primary_edit.text() == DEFAULT_THEME_SETTINGS.primary_color
+    assert dialog.theme_accent_edit.text() == DEFAULT_THEME_SETTINGS.accent_color
+    assert dialog.theme_text_edit.text() == DEFAULT_THEME_SETTINGS.text_color
+    assert dialog.theme_color_edits["input_background_color"].text() == DEFAULT_THEME_SETTINGS.input_background_color
+    assert dialog.theme_ai_enabled_check.isChecked()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_theme_ai_worker_sends_portrait_image_and_prompt(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtCore")
+    import app.ui.settings_dialog as settings_dialog
+
+    root = _ui_runtime_root("theme_ai_worker")
+    profile = _build_settings_dialog_character(root, "sakura", "Sakura")
+    calls: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, settings: ApiSettings) -> None:
+            calls["settings"] = settings
+
+        def complete_raw(self, system_prompt, messages, **kwargs):  # type: ignore[no-untyped-def]
+            calls["system_prompt"] = system_prompt
+            calls["messages"] = messages
+            calls["kwargs"] = kwargs
+            return _theme_json()
+
+    monkeypatch.setattr(settings_dialog, "OpenAICompatibleClient", FakeClient)
+    events: list[ThemeSettings] = []
+    worker = settings_dialog.ThemeAiWorker(
+        ApiSettings("https://api.example.com/v1", "test-key", "test-model"),
+        profile,
+        ai_enabled=True,
+    )
+    worker.succeeded.connect(events.append)
+    worker.run()
+
+    assert events == [_theme_settings(ai_enabled=True)]
+    assert "只返回 JSON" in str(calls["system_prompt"])
+    assert "primary_hover_color" in str(calls["system_prompt"])
+    content = calls["messages"][0]["content"]  # type: ignore[index]
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_settings_dialog_ai_theme_success_and_failure_keep_current(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("theme_ai_dialog")
+
+    class FakeThread(qtcore.QObject):
+        started = qtcore.Signal()
+        finished = qtcore.Signal()
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+
+        def start(self) -> None:
+            self.started.emit()
+
+        def quit(self) -> None:
+            self.finished.emit()
+
+    class SuccessWorker(qtcore.QObject):
+        succeeded = qtcore.Signal(object)
+        failed = qtcore.Signal(str)
+        finished = qtcore.Signal()
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+
+        def moveToThread(self, _thread) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def run(self) -> None:
+            self.succeeded.emit(_theme_settings(ai_enabled=True))
+            self.finished.emit()
+
+    class FailedWorker(SuccessWorker):
+        def run(self) -> None:
+            self.failed.emit("vision unsupported")
+            self.finished.emit()
+
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=ThemeSettings(
+            primary_color="#aabbcc",
+            primary_hover_color="#aa99bb",
+            accent_color="#bbccdd",
+            text_color="#111111",
+            secondary_text_color="#222222",
+            muted_text_color="#333333",
+            page_background_color="#f8f8f8",
+            panel_background_color="#eeeeee",
+            input_background_color="#ffffff",
+            bubble_background_color="#dddddd",
+            border_color="#cccccc",
+            ai_enabled=True,
+        ),
+    )
+    monkeypatch.setattr("app.ui.settings_dialog.QThread", FakeThread)
+    monkeypatch.setattr("app.ui.settings_dialog.ThemeAiWorker", SuccessWorker)
+
+    dialog._generate_ai_theme()
+
+    assert dialog.theme_primary_edit.text() == "#112233"
+    assert dialog.theme_accent_edit.text() == "#445566"
+    assert dialog.theme_text_edit.text() == "#070809"
+
+    monkeypatch.setattr("app.ui.settings_dialog.ThemeAiWorker", FailedWorker)
+    dialog.theme_primary_edit.setText("#aabbcc")
+    dialog.theme_accent_edit.setText("#bbccdd")
+    dialog.theme_text_edit.setText("#111111")
+    dialog._generate_ai_theme()
+
+    assert dialog.theme_primary_edit.text() == "#aabbcc"
+    assert dialog.theme_accent_edit.text() == "#bbccdd"
+    assert dialog.theme_text_edit.text() == "#111111"
+    assert "保留当前配色" in dialog.theme_status_label.text()
     dialog.deleteLater()
     app.processEvents()
 

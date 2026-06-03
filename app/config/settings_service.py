@@ -8,6 +8,7 @@ from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_set
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.llm.api_client import ApiSettings
+from app.ui.theme import ThemeSettings, theme_from_mapping, theme_to_mapping
 from app.agent.proactive_care import (
     PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES,
     PROACTIVE_DEFAULT_COOLDOWN_MINUTES,
@@ -242,6 +243,17 @@ class AppSettingsService:
                 "file_enabled": bool(settings.file_enabled),
             },
         )
+
+    def load_theme_settings(self) -> ThemeSettings:
+        ui = self._system_section("ui")
+        return theme_from_mapping(ui.get("theme"))
+
+    def save_theme_settings(self, settings: ThemeSettings) -> None:
+        ui = self._system_section("ui")
+        ui["theme"] = theme_to_mapping(settings)
+        data = load_yaml_mapping(self.system_config_path)
+        data["ui"] = ui
+        save_yaml_mapping(self.system_config_path, data)
 
     def load_proactive_care_settings(self) -> ProactiveCareSettings:
         proactive = self._system_section("proactive_care")

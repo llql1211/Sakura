@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import mimetypes
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QColorDialog,
     QFileDialog,
     QFormLayout,
     QHeaderView,
@@ -41,7 +44,12 @@ from app.config.character_archive import (
     import_character_archive,
 )
 from app.config.settings_service import DebugLogSettings
-from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.llm.api_client import (
+    ApiSettings,
+    OpenAICompatibleClient,
+    STRUCTURED_JSON_RESPONSE_FORMAT,
+)
+from app.llm.prompts.recipes import build_theme_color_system_prompt
 from app.config.character_loader import CharacterProfile, CharacterRegistry
 from app.ui.portrait_controller import (
     PORTRAIT_SCALE_DEFAULT_PERCENT,
@@ -79,6 +87,16 @@ from app.voice.tts import (
     TTSConfigError,
 )
 from app.ui.tts_bundle_dialog import TTSBundleDownloadDialog
+from app.ui.theme import (
+    DEFAULT_THEME_SETTINGS,
+    THEME_COLOR_FIELDS,
+    ThemeSettings,
+    build_color_button_stylesheet,
+    build_settings_dialog_stylesheet,
+    normalize_hex_color,
+    mix,
+    parse_ai_theme_response,
+)
 from app.voice.tts_bundle import default_provider_bundle_work_dir, is_provider_bundle_work_dir
 from sdk.types import ToolsTabContribution
 
@@ -166,6 +184,52 @@ class MemoryListWorker(QObject):
             self.finished.emit()
 
 
+class ThemeAiWorker(QObject):
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, settings: ApiSettings, profile: CharacterProfile, *, ai_enabled: bool) -> None:
+        super().__init__()
+        self.settings = settings
+        self.profile = profile
+        self.ai_enabled = ai_enabled
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            data_url = _image_file_to_data_url(self.profile.default_portrait_path)
+            content = OpenAICompatibleClient(self.settings).complete_raw(
+                build_theme_color_system_prompt(self.profile.display_name),
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "请根据这张角色默认立绘生成 Sakura 桌宠 UI 主题配色。只返回完整 JSON 对象，不要输出 Markdown 或解释。",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": data_url,
+                                    "detail": "low",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.2,
+                # thinking 模型不兼容 json_object，依赖 prompt 约束 JSON 输出
+                max_tokens=2000,
+            )
+            self.succeeded.emit(parse_ai_theme_response(content, ai_enabled=self.ai_enabled))
+        except Exception as exc:  # noqa: BLE001 - UI 边界统一转成可读错误。
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
 class CharacterArchiveExportWorker(QObject):
     succeeded = Signal(str)
     failed = Signal(str)
@@ -205,10 +269,12 @@ class SettingsDialog(QDialog):
         portrait_scale_percent: int = PORTRAIT_SCALE_DEFAULT_PERCENT,
         subtitle_typing_interval_ms: int = SPEECH_TYPING_INTERVAL_MS,
         reply_segment_pause_ms: int = REPLY_SEGMENT_PAUSE_MS,
+        theme_settings: ThemeSettings | None = None,
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
         self.tts_settings = tts_settings
+        self.theme_settings = (theme_settings or DEFAULT_THEME_SETTINGS).normalized()
         self.character_registry = character_registry
         self.current_character = current_character
         self.portrait_scale_percent = normalize_portrait_scale_percent(portrait_scale_percent)
@@ -235,6 +301,7 @@ class SettingsDialog(QDialog):
         self.result_proactive_care_settings: ProactiveCareSettings | None = None
         self.result_mcp_settings: MCPRuntimeSettings | None = None
         self.result_debug_log_settings: DebugLogSettings | None = None
+        self.result_theme_settings: ThemeSettings | None = None
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
         self._tts_test_thread: QThread | None = None
@@ -243,6 +310,8 @@ class SettingsDialog(QDialog):
         self._save_button_text: str | None = None
         self._memory_list_thread: QThread | None = None
         self._memory_list_worker: MemoryListWorker | None = None
+        self._theme_ai_thread: QThread | None = None
+        self._theme_ai_worker: ThemeAiWorker | None = None
         self._character_export_thread: QThread | None = None
         self._character_export_worker: CharacterArchiveExportWorker | None = None
         self._memory_reload_pending = False
@@ -253,6 +322,7 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget(self)
         tabs.addTab(self._build_character_tab(character_registry, current_character), "角色")
+        tabs.addTab(self._build_theme_tab(), "主题")
         tabs.addTab(self._build_api_tab(api_settings), "API")
         tabs.addTab(self._build_tts_tab(tts_settings), "TTS")
         tabs.addTab(
@@ -284,91 +354,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(tabs, 1)
         layout.addWidget(buttons)
         self.setLayout(layout)
-        self.setStyleSheet(
-            """
-            QDialog {
-                background: #fff6fa;
-                color: #3d2b35;
-                font-family: "Microsoft YaHei", "Yu Gothic UI", sans-serif;
-                font-size: 14px;
-            }
-            QTabWidget::pane {
-                border: 1px solid rgba(238, 172, 200, 0.54);
-                border-radius: 8px;
-                background: rgba(255, 232, 241, 0.70);
-            }
-            QTabBar::tab {
-                background: rgba(255, 232, 241, 0.75);
-                border: 1px solid rgba(238, 172, 200, 0.48);
-                border-bottom: none;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                padding: 7px 18px;
-                margin-right: 4px;
-                color: #7a3656;
-            }
-            QTabBar::tab:selected {
-                background: #ffffff;
-                color: #b13e73;
-                font-weight: 700;
-            }
-            QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QTableWidget, QComboBox {
-                background: rgba(255, 255, 255, 0.92);
-                border: 1px solid rgba(238, 172, 200, 0.58);
-                border-radius: 7px;
-                padding: 6px 8px;
-                color: #3d2b35;
-                selection-background-color: rgba(213, 91, 145, 0.28);
-            }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus, QComboBox:focus {
-                border: 1px solid rgba(213, 91, 145, 0.76);
-                background: #ffffff;
-            }
-            QTableWidget {
-                gridline-color: rgba(238, 172, 200, 0.42);
-                alternate-background-color: rgba(255, 244, 249, 0.86);
-            }
-            QHeaderView::section {
-                background: #ffe8f1;
-                border: 1px solid rgba(238, 172, 200, 0.52);
-                color: #7a3656;
-                padding: 6px;
-                font-weight: 700;
-            }
-            QCheckBox {
-                color: #4b3440;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-                border-radius: 4px;
-                border: 1px solid rgba(213, 91, 145, 0.68);
-                background: #ffffff;
-            }
-            QCheckBox::indicator:checked {
-                background: #d55b91;
-                border: 1px solid #b13e73;
-            }
-            QPushButton {
-                background: #d55b91;
-                border: 1px solid rgba(177, 62, 115, 0.55);
-                border-radius: 8px;
-                color: white;
-                min-width: 72px;
-                padding: 8px 12px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background: #bf3f7a;
-            }
-            QPushButton:disabled {
-                background: rgba(213, 91, 145, 0.42);
-                border: 1px solid rgba(238, 172, 200, 0.45);
-                color: rgba(255, 255, 255, 0.76);
-            }
-            """
-        )
+        self._apply_theme_stylesheet(self.theme_settings)
 
     def _build_character_tab(
         self,
@@ -381,6 +367,7 @@ class SettingsDialog(QDialog):
         self._refresh_character_combo(
             current_character.id if current_character is not None else None
         )
+        self.character_combo.currentIndexChanged.connect(lambda _index: self._sync_theme_ai_controls())
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
@@ -407,6 +394,80 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.character_import_button)
         layout.addWidget(self.character_export_button)
         layout.addStretch(1)
+        container.setLayout(layout)
+        return container
+
+    def _build_theme_tab(self) -> QWidget:
+        tab = QWidget(self)
+        self.theme_color_edits: dict[str, QLineEdit] = {}
+        self.theme_color_buttons: dict[str, QPushButton] = {}
+        self.theme_ai_enabled_check = QCheckBox("启用 AI 选择配色", tab)
+        self.theme_ai_enabled_check.setChecked(self.theme_settings.ai_enabled)
+        self.theme_ai_enabled_check.toggled.connect(self._sync_theme_ai_controls)
+
+        self.theme_ai_generate_button = QPushButton("AI 生成配色", tab)
+        self.theme_ai_generate_button.clicked.connect(self._generate_ai_theme)
+        self.theme_reset_button = QPushButton("恢复默认配色", tab)
+        self.theme_reset_button.clicked.connect(self._reset_theme_colors)
+        self.theme_status_label = QLabel("", tab)
+        self.theme_status_label.setWordWrap(True)
+
+        button_row = QWidget(tab)
+        button_layout = QHBoxLayout()
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(10)
+        button_layout.addWidget(self.theme_ai_generate_button)
+        button_layout.addWidget(self.theme_reset_button)
+        button_layout.addStretch(1)
+        button_row.setLayout(button_layout)
+
+        form_layout = QFormLayout()
+        form_layout.setContentsMargins(16, 18, 16, 16)
+        form_layout.setSpacing(12)
+        for field, label, _default in THEME_COLOR_FIELDS:
+            edit, button = self._build_theme_color_control(
+                tab,
+                getattr(self.theme_settings, field),
+            )
+            self.theme_color_edits[field] = edit
+            self.theme_color_buttons[field] = button
+            form_layout.addRow(label, self._theme_color_row(edit, button))
+        self.theme_primary_edit = self.theme_color_edits["primary_color"]
+        self.theme_primary_button = self.theme_color_buttons["primary_color"]
+        self.theme_accent_edit = self.theme_color_edits["accent_color"]
+        self.theme_accent_button = self.theme_color_buttons["accent_color"]
+        self.theme_text_edit = self.theme_color_edits["text_color"]
+        self.theme_text_button = self.theme_color_buttons["text_color"]
+        form_layout.addRow("", self.theme_ai_enabled_check)
+        form_layout.addRow("", button_row)
+        form_layout.addRow("状态", self.theme_status_label)
+        tab.setLayout(form_layout)
+        self._sync_theme_ai_controls()
+        return tab
+
+    def _build_theme_color_control(
+        self,
+        parent: QWidget,
+        color: str,
+    ) -> tuple[QLineEdit, QPushButton]:
+        edit = QLineEdit(color, parent)
+        edit.setMaxLength(7)
+        edit.setPlaceholderText("#RRGGBB")
+        button = QPushButton("", parent)
+        button.setFixedWidth(42)
+        button.setToolTip("选择颜色")
+        button.setStyleSheet(build_color_button_stylesheet(color))
+        button.clicked.connect(lambda _checked=False, color_edit=edit: self._choose_theme_color(color_edit))
+        edit.textChanged.connect(lambda _text, color_edit=edit: self._handle_theme_color_changed(color_edit))
+        return edit, button
+
+    def _theme_color_row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
+        container = QWidget(self)
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(button)
+        layout.addWidget(edit, 1)
         container.setLayout(layout)
         return container
 
@@ -589,7 +650,7 @@ class SettingsDialog(QDialog):
             tab,
         )
         restart_hint.setWordWrap(True)
-        restart_hint.setStyleSheet("color: #9b4f72;")
+        self.system_restart_hint_label = restart_hint
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
@@ -662,7 +723,6 @@ class SettingsDialog(QDialog):
         self.memory_refresh_button = QPushButton("刷新", tab)
         self.memory_refresh_button.clicked.connect(self._load_memory_entries)
         self.memory_status_label = QLabel(MEMORY_READING_TEXT, tab)
-        self.memory_status_label.setStyleSheet("color: #9b4f72;")
 
         self.memory_table = QTableWidget(0, 4, tab)
         self.memory_table.setHorizontalHeaderLabels(["", "内容", "更新时间", "ID"])
@@ -692,7 +752,6 @@ class SettingsDialog(QDialog):
         self._sync_memory_select_all_check_geometry()
 
         self.memory_selection_label = QLabel("已选择 0 条", tab)
-        self.memory_selection_label.setStyleSheet("color: #7a3656;")
         self.memory_delete_button = QPushButton("删除选中", tab)
         self.memory_delete_button.setEnabled(False)
         self.memory_delete_button.clicked.connect(self._delete_memory_entry)
@@ -701,7 +760,6 @@ class SettingsDialog(QDialog):
         self.memory_clear_selection_button.clicked.connect(self._clear_memory_selection)
         self.memory_preview_label = QLabel("未选择记忆", tab)
         self.memory_preview_label.setWordWrap(True)
-        self.memory_preview_label.setStyleSheet("color: #6d4a5b;")
 
         self.memory_new_button = QPushButton("新增记忆", tab)
         self.memory_new_button.setCheckable(True)
@@ -1034,7 +1092,7 @@ class SettingsDialog(QDialog):
         self._style_memory_checkbox_container(container, row, checked)
 
     def _style_memory_checkbox_container(self, container: QWidget, row: int, checked: bool) -> None:
-        color = _memory_row_background_color(row, checked)
+        color = _memory_row_background_color(row, checked, self.theme_settings)
         container.setStyleSheet(f"background: {color};")
 
     def _sync_memory_select_all_check_geometry(self) -> None:
@@ -1106,7 +1164,7 @@ class SettingsDialog(QDialog):
             self.memory_preview_label.setText("")
 
     def _apply_memory_row_checked_style(self, row: int, checked: bool) -> None:
-        brush = _memory_row_background(row, checked)
+        brush = _memory_row_background(row, checked, self.theme_settings)
         for column in range(self.memory_table.columnCount()):
             item = self.memory_table.item(row, column)
             if item is not None:
@@ -1220,6 +1278,158 @@ class SettingsDialog(QDialog):
             return None
         return memories[0]
 
+    def _apply_theme_stylesheet(self, settings: ThemeSettings) -> None:
+        theme = settings.normalized()
+        self.theme_settings = theme
+        self.setStyleSheet(build_settings_dialog_stylesheet(theme))
+        inline_styles = {
+            "theme_status_label": f"color: {theme.muted_text_color};",
+            "memory_status_label": f"color: {theme.muted_text_color};",
+            "memory_selection_label": f"color: {theme.secondary_text_color};",
+            "memory_preview_label": f"color: {theme.text_color};",
+            "system_restart_hint_label": f"color: {theme.muted_text_color};",
+        }
+        for attr, style in inline_styles.items():
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QLabel):
+                widget.setStyleSheet(style)
+
+    def _choose_theme_color(self, edit: QLineEdit) -> None:
+        current_color = QColor(normalize_hex_color(edit.text(), DEFAULT_THEME_SETTINGS.primary_color))
+        color = QColorDialog.getColor(current_color, self, "选择主题颜色")
+        if not color.isValid():
+            return
+        edit.setText(color.name())
+
+    def _handle_theme_color_changed(self, edit: QLineEdit) -> None:
+        button = self._theme_button_for_edit(edit)
+        normalized = normalize_hex_color(edit.text(), "")
+        if button is not None and normalized:
+            button.setStyleSheet(build_color_button_stylesheet(normalized))
+        theme = self._selected_theme_settings(show_error=False)
+        if theme is not None:
+            self._apply_theme_stylesheet(theme)
+
+    def _theme_button_for_edit(self, edit: QLineEdit) -> QPushButton | None:
+        for field, color_edit in getattr(self, "theme_color_edits", {}).items():
+            button = getattr(self, "theme_color_buttons", {}).get(field)
+            if color_edit is edit and isinstance(button, QPushButton):
+                return button
+        return None
+
+    def _selected_theme_settings(self, *, show_error: bool = True) -> ThemeSettings | None:
+        if not hasattr(self, "theme_color_edits"):
+            return self.theme_settings
+        normalized_values: dict[str, str] = {}
+        for field, label, _default in THEME_COLOR_FIELDS:
+            value = self.theme_color_edits[field].text()
+            normalized = normalize_hex_color(value, "")
+            if not normalized:
+                if show_error:
+                    QMessageBox.warning(self, "主题颜色无效", f"{label}必须是 #RRGGBB 格式。")
+                return None
+            normalized_values[field] = normalized
+        return ThemeSettings(
+            **normalized_values,
+            ai_enabled=self.theme_ai_enabled_check.isChecked(),
+        ).normalized()
+
+    def _set_theme_controls(self, settings: ThemeSettings) -> None:
+        theme = settings.normalized()
+        for field, _label, _default in THEME_COLOR_FIELDS:
+            self.theme_color_edits[field].setText(getattr(theme, field))
+            self.theme_color_buttons[field].setStyleSheet(
+                build_color_button_stylesheet(getattr(theme, field))
+            )
+        self.theme_ai_enabled_check.setChecked(theme.ai_enabled)
+        self._apply_theme_stylesheet(theme)
+        self._sync_theme_ai_controls()
+
+    @Slot()
+    def _reset_theme_colors(self) -> None:
+        current_ai_enabled = self.theme_ai_enabled_check.isChecked()
+        self._set_theme_controls(ThemeSettings(ai_enabled=current_ai_enabled))
+        self.theme_status_label.setText("已恢复默认 Sakura 粉色配色。")
+
+    @Slot()
+    def _generate_ai_theme(self) -> None:
+        if self._theme_ai_thread is not None:
+            return
+        if not self.theme_ai_enabled_check.isChecked():
+            QMessageBox.information(self, "AI 配色未启用", "请先启用 AI 选择配色。")
+            return
+        api_settings = self._validated_api_settings()
+        if api_settings is None:
+            return
+        profile = self._selected_character_profile()
+        if profile is None:
+            QMessageBox.warning(self, "角色无效", "请先选择一个角色。")
+            return
+        if not profile.default_portrait_path.exists():
+            QMessageBox.warning(self, "立绘缺失", f"默认立绘不存在：{profile.default_portrait_path}")
+            return
+
+        self.theme_status_label.setText("正在根据默认立绘生成配色...")
+        self._set_theme_ai_busy(True)
+        thread = QThread(self)
+        worker = ThemeAiWorker(
+            api_settings,
+            profile,
+            ai_enabled=self.theme_ai_enabled_check.isChecked(),
+        )
+        worker.moveToThread(thread)
+        self._theme_ai_thread = thread
+        self._theme_ai_worker = worker
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_theme_ai_success)
+        worker.failed.connect(self._handle_theme_ai_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_theme_ai_state)
+        thread.start()
+
+    @Slot(object)
+    def _handle_theme_ai_success(self, settings: object) -> None:
+        if not isinstance(settings, ThemeSettings):
+            self._handle_theme_ai_failed("AI 返回的主题格式无效。")
+            return
+        self._set_theme_controls(settings)
+        self.theme_status_label.setText("AI 配色已生成并应用预览。")
+
+    @Slot(str)
+    def _handle_theme_ai_failed(self, message: str) -> None:
+        self.theme_status_label.setText(f"AI 配色失败，已保留当前配色：{message}")
+
+    def _set_theme_ai_busy(self, busy: bool) -> None:
+        if hasattr(self, "theme_ai_generate_button"):
+            self.theme_ai_generate_button.setEnabled(
+                not busy and self.theme_ai_enabled_check.isChecked()
+            )
+        if hasattr(self, "theme_reset_button"):
+            self.theme_reset_button.setEnabled(not busy)
+        save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
+        if save_button is not None:
+            save_button.setEnabled(not busy)
+
+    def _reset_theme_ai_state(self) -> None:
+        self._theme_ai_thread = None
+        self._theme_ai_worker = None
+        self._set_theme_ai_busy(False)
+
+    @Slot()
+    def _sync_theme_ai_controls(self) -> None:
+        if hasattr(self, "theme_ai_generate_button"):
+            profile = self._selected_character_profile()
+            has_default_portrait = (
+                profile is not None and profile.default_portrait_path.exists()
+            )
+            self.theme_ai_generate_button.setEnabled(
+                self.theme_ai_enabled_check.isChecked()
+                and self._theme_ai_thread is None
+                and has_default_portrait
+            )
+
     def accept(self) -> None:
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再保存设置。")
@@ -1229,6 +1439,9 @@ class SettingsDialog(QDialog):
             return
         if self._character_export_thread is not None:
             QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再保存设置。")
+            return
+        if self._theme_ai_thread is not None:
+            QMessageBox.information(self, "AI 配色中", "AI 配色仍在生成，请等待完成后再保存设置。")
             return
 
         accept_values = self._collect_accept_values()
@@ -1248,6 +1461,9 @@ class SettingsDialog(QDialog):
         tts_settings = self._validated_tts_settings()
         if tts_settings is None:
             return None
+        theme_settings = self._selected_theme_settings()
+        if theme_settings is None:
+            return None
         character_id = self._selected_character_id()
         if character_id is None:
             QMessageBox.warning(self, "配置无效", "请先导入并选择一个角色包。")
@@ -1264,6 +1480,7 @@ class SettingsDialog(QDialog):
             "portrait_scale_percent": self._selected_portrait_scale_percent(),
             "subtitle_typing_interval_ms": subtitle_typing_interval_ms,
             "reply_segment_pause_ms": reply_segment_pause_ms,
+            "theme_settings": theme_settings,
             "proactive_care_settings": ProactiveCareSettings(
                 enabled=self.proactive_screen_context_enabled_check.isChecked(),
                 screen_context_enabled=self.proactive_screen_context_enabled_check.isChecked(),
@@ -1289,6 +1506,7 @@ class SettingsDialog(QDialog):
         portrait_scale_percent = values["portrait_scale_percent"]
         subtitle_typing_interval_ms = values["subtitle_typing_interval_ms"]
         reply_segment_pause_ms = values["reply_segment_pause_ms"]
+        theme_settings = values["theme_settings"]
         proactive_care_settings = values["proactive_care_settings"]
         mcp_settings = values["mcp_settings"]
         debug_log_settings = values["debug_log_settings"]
@@ -1305,6 +1523,8 @@ class SettingsDialog(QDialog):
             return
         if not isinstance(reply_segment_pause_ms, int):
             return
+        if not isinstance(theme_settings, ThemeSettings):
+            return
         if not isinstance(proactive_care_settings, ProactiveCareSettings):
             return
         if not isinstance(mcp_settings, MCPRuntimeSettings):
@@ -1318,6 +1538,7 @@ class SettingsDialog(QDialog):
         self.result_portrait_scale_percent = portrait_scale_percent
         self.result_subtitle_typing_interval_ms = subtitle_typing_interval_ms
         self.result_reply_segment_pause_ms = reply_segment_pause_ms
+        self.result_theme_settings = theme_settings
         self.result_proactive_care_settings = proactive_care_settings
         self.result_mcp_settings = mcp_settings
         self.result_debug_log_settings = debug_log_settings
@@ -1333,6 +1554,9 @@ class SettingsDialog(QDialog):
         if self._character_export_thread is not None:
             QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再关闭设置。")
             return
+        if self._theme_ai_thread is not None:
+            QMessageBox.information(self, "AI 配色中", "AI 配色仍在生成，请等待完成后再关闭设置。")
+            return
         super().reject()
 
     def closeEvent(self, event):  # type: ignore[no-untyped-def]
@@ -1346,6 +1570,10 @@ class SettingsDialog(QDialog):
             return
         if self._character_export_thread is not None:
             QMessageBox.information(self, "导出中", "角色包导出仍在进行，请等待完成后再关闭设置。")
+            event.ignore()
+            return
+        if self._theme_ai_thread is not None:
+            QMessageBox.information(self, "AI 配色中", "AI 配色仍在生成，请等待完成后再关闭设置。")
             event.ignore()
             return
         super().closeEvent(event)
@@ -1723,6 +1951,7 @@ class SettingsDialog(QDialog):
             self.character_empty_label.setVisible(not has_character)
         self.character_combo.blockSignals(False)
         self._sync_character_archive_controls()
+        self._sync_theme_ai_controls()
 
 
 def _is_http_url(url: str) -> bool:
@@ -1753,23 +1982,32 @@ def _optional_path(value: str, base_dir: Path) -> Path | None:
     return base_dir / path
 
 
+def _image_file_to_data_url(path: Path) -> str:
+    data = path.read_bytes()
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    if not mime_type.startswith("image/"):
+        mime_type = "image/png"
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def _compact_memory_id(memory_id: str) -> str:
     if len(memory_id) <= 16:
         return memory_id
     return f"{memory_id[:8]}...{memory_id[-4:]}"
 
 
-def _memory_row_background(row: int, checked: bool) -> QBrush:
-    return QBrush(QColor(_memory_row_background_color(row, checked)))
+def _memory_row_background(row: int, checked: bool, theme: ThemeSettings) -> QBrush:
+    return QBrush(QColor(_memory_row_background_color(row, checked, theme)))
 
 
-def _memory_row_background_color(row: int, checked: bool) -> str:
+def _memory_row_background_color(row: int, checked: bool, theme: ThemeSettings) -> str:
+    """根据主题配色计算记忆表格行的背景色。"""
     if checked:
-        return "#f4c4da"
+        return mix(theme.panel_background_color, theme.primary_color, 0.22)
     if row % 2:
-        return "#fff4f9"
-    return "#fffafd"
-
+        return mix(theme.page_background_color, "#ffffff", 0.35)
+    return mix(theme.page_background_color, "#ffffff", 0.70)
 
 def _format_memory_time(value: str) -> str:
     text = value.strip()

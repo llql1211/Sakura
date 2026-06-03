@@ -113,6 +113,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         portrait_scale_percent=PORTRAIT_SCALE_DEFAULT_PERCENT,
         subtitle_typing_interval_ms=SPEECH_TYPING_INTERVAL_MS,
         reply_segment_pause_ms=REPLY_SEGMENT_PAUSE_MS,
+        theme_settings=settings_service.load_theme_settings(),
     )
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
@@ -123,6 +124,11 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         getattr(dialog, "result_subtitle_typing_interval_ms", SPEECH_TYPING_INTERVAL_MS),
         getattr(dialog, "result_reply_segment_pause_ms", REPLY_SEGMENT_PAUSE_MS),
     )
+    result_theme_settings = getattr(
+        dialog,
+        "result_theme_settings",
+        settings_service.load_theme_settings(),
+    )
     if (
         dialog.result_api_settings is None
         or dialog.result_tts_settings is None
@@ -131,6 +137,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         or dialog.result_mcp_settings is None
         or dialog.result_debug_log_settings is None
         or dialog.result_portrait_scale_percent is None
+        or result_theme_settings is None
         or dialog.character_registry is None
     ):
         QMessageBox.warning(None, "配置无效", "请先导入并选择一个角色包。")
@@ -147,6 +154,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
     )
     settings_service.save_mcp_runtime_settings(dialog.result_mcp_settings or MCPRuntimeSettings())
     settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
+    settings_service.save_theme_settings(result_theme_settings)
     settings_service.save_system_values(
         "ui",
         {

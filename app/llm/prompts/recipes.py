@@ -262,6 +262,40 @@ def build_proactive_scene_strategy_rules() -> str:
     return proactive_scene_strategy_block().body
 
 
+def build_theme_color_system_prompt(character_name: str) -> str:
+    """构建根据角色默认立绘提取 UI 主题色的提示词。"""
+
+    return render_blocks(
+        [
+            PromptBlock(
+                None,
+                "\n".join(
+                    [
+                        "你是桌面宠物 UI 主题配色助手。",
+                        "请观察用户提供的角色默认立绘，为桌宠界面选择一组温和、可读、适合长期使用的主题色。",
+                        f"角色名：{character_name.strip() or '当前角色'}",
+                        "必须返回一整个 JSON 对象；禁止项目符号、Markdown、解释文字或颜色名称说明。",
+                    ]
+                ),
+            ),
+            PromptBlock(
+                "输出要求",
+                "\n".join(
+                    [
+                        "- 只返回 JSON，不要使用 Markdown 代码块，不要输出解释。",
+                        "- JSON 字段必须且只能包含：primary_color、primary_hover_color、accent_color、text_color、secondary_text_color、muted_text_color、page_background_color、panel_background_color、input_background_color、bubble_background_color、border_color。",
+                        "- 所有颜色必须是 #RRGGBB 格式。",
+                        "- page_background_color、panel_background_color、input_background_color、bubble_background_color 应偏浅，适合作为长时间使用的桌宠界面背景。",
+                        "- text_color、secondary_text_color、muted_text_color 必须在浅色背景上可读。",
+                        "- primary_color 是主要按钮、角色名和选中态颜色；primary_hover_color 是按钮悬停色；accent_color 是强调色。",
+                        '示例：{"primary_color":"#d55b91","primary_hover_color":"#bf3f7a","accent_color":"#b13e73","text_color":"#3d2b35","secondary_text_color":"#7a3656","muted_text_color":"#9b4f72","page_background_color":"#fff6fa","panel_background_color":"#ffe8f1","input_background_color":"#ffffff","bubble_background_color":"#ffe8f1","border_color":"#eeacc8"}',
+                    ]
+                ),
+            ),
+        ]
+    )
+
+
 def build_proactive_web_research_rules() -> str:
     """构建主动感知后台 Web 搜索规则。"""
 
