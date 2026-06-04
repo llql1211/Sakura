@@ -2258,7 +2258,7 @@ def test_tts_migration_dialog_marks_fast_migration_done() -> None:
     bars = dialog.findChildren(QProgressBar)
     buttons = dialog.findChildren(QPushButton)
 
-    assert any("迁移完成，正在继续启动" in text for text in labels)
+    assert any("迁移完成，点击确定继续启动" in text for text in labels)
     assert any("100%（迁移完成）" in text for text in labels)
     assert bars and bars[0].value() == 100
     assert buttons and buttons[0].isEnabled()

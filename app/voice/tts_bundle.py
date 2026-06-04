@@ -259,9 +259,8 @@ def find_pending_bundle_migrations(base_dir: Path, provider: str | None = None) 
     migrations: list[TTSBundleMigration] = []
     for entry in _entries_for_provider(provider):
         target_dir = _short_bundle_install_dir(entry, base_dir)
-        if target_dir.exists():
-            if _is_installed_bundle_ready(target_dir):
-                _cleanup_migration_work_dir(TTSBundleMigration(entry=entry, source_dir=target_dir, target_dir=target_dir))
+        if _is_installed_bundle_ready(target_dir):
+            _cleanup_migration_work_dir(TTSBundleMigration(entry=entry, source_dir=target_dir, target_dir=target_dir))
             continue
         legacy_dir = _legacy_bundle_install_dir(entry, base_dir)
         if not _is_installed_bundle_ready(legacy_dir):
@@ -282,8 +281,10 @@ def migrate_bundle_to_short_path(
     """执行单个整合包迁移；失败时保留旧目录和中间目录供下次续迁。"""
 
     if migration.target_dir.exists():
-        _cleanup_migration_work_dir(migration)
-        return _resolve_extracted_root(migration.target_dir)
+        if _is_installed_bundle_ready(migration.target_dir):
+            _cleanup_migration_work_dir(migration)
+            return _resolve_extracted_root(migration.target_dir)
+        _remove_invalid_bundle_target(migration.target_dir)
     migration.target_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if _try_fast_migration_rename(migration):
@@ -494,6 +495,15 @@ def _cleanup_migration_work_dir(migration: TTSBundleMigration) -> None:
     work_dir = _migration_work_dir(migration)
     if work_dir.exists():
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _remove_invalid_bundle_target(target_dir: Path) -> None:
+    """移除 Sakura 管理的无效短目录，避免阻塞旧整合包迁移。"""
+
+    if target_dir.is_dir() and not target_dir.is_symlink():
+        shutil.rmtree(target_dir)
+        return
+    target_dir.unlink(missing_ok=True)
 
 
 def _try_fast_migration_rename(migration: TTSBundleMigration) -> bool:

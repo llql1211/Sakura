@@ -385,6 +385,37 @@ def test_tts_bundle_migration_skips_existing_short_dir() -> None:
     assert legacy_runtime.read_text(encoding="utf-8") == "legacy"
 
 
+def test_tts_bundle_migration_replaces_invalid_short_dir() -> None:
+    root = _runtime_root("migrate_invalid_short_target")
+    entry = tts_bundle.GPT_SOVITS_NVIDIA50
+    invalid_marker = root / "tts" / "g50" / "broken.txt"
+    invalid_marker.parent.mkdir(parents=True)
+    invalid_marker.write_text("broken", encoding="utf-8")
+    legacy_work_dir = (
+        root
+        / "data"
+        / "tts_bundles"
+        / "installed"
+        / entry.key
+        / "GPT-SoVITS-v2pro-20250604-nvidia50"
+    )
+    runtime_python = legacy_work_dir / "runtime" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("legacy", encoding="utf-8")
+
+    migrations = find_pending_bundle_migrations(root, "gpt-sovits")
+
+    assert len(migrations) == 1
+    assert migrations[0].target_dir == root / "tts" / "g50"
+
+    migrated = migrate_bundle_to_short_path(migrations[0])
+
+    assert migrated == (root / "tts" / "g50").resolve()
+    assert (migrated / "runtime" / "python.exe").read_text(encoding="utf-8") == "legacy"
+    assert not (migrated / "broken.txt").exists()
+    assert not legacy_work_dir.exists()
+
+
 def test_tts_bundle_migration_failure_preserves_legacy_install(monkeypatch: pytest.MonkeyPatch) -> None:
     root = _runtime_root("migrate_failure_preserves_legacy")
     entry = tts_bundle.GENIE_TTS

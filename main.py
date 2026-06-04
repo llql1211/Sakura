@@ -143,7 +143,7 @@ class TTSBundleMigrationDialog(QDialog):
             self.current_label.setText("迁移失败，点击继续启动。")
             self.confirm_button.setText("继续启动")
         else:
-            self.current_label.setText("迁移完成，正在继续启动...")
+            self.current_label.setText("迁移完成，点击确定继续启动。")
             self.progress_bar.setValue(100)
             if self.progress_label.text().startswith("0%"):
                 self.progress_label.setText("100%（迁移完成）")
