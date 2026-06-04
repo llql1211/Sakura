@@ -1354,6 +1354,7 @@ def test_settings_dialog_enabled_tts_skips_test_when_settings_unchanged(monkeypa
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
+    import app.ui.settings_dialog as settings_dialog_module
     from app.ui.settings_dialog import SettingsDialog
 
     QApplication = qtwidgets.QApplication
@@ -1371,6 +1372,11 @@ def test_settings_dialog_enabled_tts_skips_test_when_settings_unchanged(monkeypa
         text_lang=profile.voice.text_lang,
         timeout_seconds=1,
         work_dir=root / "tts" / "g50",
+    )
+    monkeypatch.setattr(
+        settings_dialog_module,
+        "default_provider_bundle_work_dir",
+        lambda _provider, _base_dir: root / "data" / "tts_bundles" / "installed" / "gpt_sovits_v2pro",
     )
     dialog = SettingsDialog(
         api_settings=ApiSettings(

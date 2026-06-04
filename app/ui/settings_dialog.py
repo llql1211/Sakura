@@ -424,7 +424,16 @@ class SettingsDialog(QDialog):
         layout.addWidget(tabs, 1)
         layout.addWidget(buttons)
         self.setLayout(layout)
+        self._capture_initial_tts_settings_from_controls()
         self._apply_theme_stylesheet(self.theme_settings)
+
+    def _capture_initial_tts_settings_from_controls(self) -> None:
+        settings = self._validated_tts_settings(
+            show_warnings=False,
+            validate_enabled=False,
+        )
+        if settings is not None:
+            self._initial_tts_settings = settings
 
     def _build_grouped_settings_tab(self, sections: list[tuple[str, QWidget]]) -> QWidget:
         content = QWidget(self)
@@ -2389,7 +2398,12 @@ class SettingsDialog(QDialog):
             timeout_seconds=self.api_timeout_spin.value(),
         )
 
-    def _validated_tts_settings(self) -> GPTSoVITSTTSSettings | None:
+    def _validated_tts_settings(
+        self,
+        *,
+        show_warnings: bool = True,
+        validate_enabled: bool = True,
+    ) -> GPTSoVITSTTSSettings | None:
         enabled = self.tts_enabled_check.isChecked()
         provider = str(self.tts_provider_combo.currentData() or TTS_PROVIDER_GPT_SOVITS)
         bundled = _is_bundled_tts_provider(provider)
@@ -2402,16 +2416,18 @@ class SettingsDialog(QDialog):
         selected_profile = self._selected_character_profile()
 
         if enabled and selected_profile is not None and selected_profile.voice is None:
-            self.tts_enabled_check.setChecked(False)
             enabled = False
-            QMessageBox.warning(
-                self,
-                "TTS 已关闭",
-                "当前角色没有语音包，TTS 已自动关闭。请先导入 .voice 语音包后再启用 TTS。",
-            )
+            if show_warnings:
+                self.tts_enabled_check.setChecked(False)
+                QMessageBox.warning(
+                    self,
+                    "TTS 已关闭",
+                    "当前角色没有语音包，TTS 已自动关闭。请先导入 .voice 语音包后再启用 TTS。",
+                )
 
         if enabled and not _is_http_url(api_url):
-            QMessageBox.warning(self, "配置无效", "TTS API URL 必须是有效的 http 或 https 地址。")
+            if show_warnings:
+                QMessageBox.warning(self, "配置无效", "TTS API URL 必须是有效的 http 或 https 地址。")
             return None
 
         if selected_profile is not None:
@@ -2453,11 +2469,12 @@ class SettingsDialog(QDialog):
                 timeout_seconds=self.tts_timeout_spin.value(),
                 tone_references=self.tts_settings.tone_references,
             )
-        if enabled:
+        if enabled and validate_enabled:
             try:
                 settings.validate()
             except TTSConfigError as exc:
-                QMessageBox.warning(self, "配置无效", str(exc))
+                if show_warnings:
+                    QMessageBox.warning(self, "配置无效", str(exc))
                 return None
         return settings
 
