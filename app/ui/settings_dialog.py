@@ -2063,7 +2063,12 @@ class SettingsDialog(QDialog):
 
     def _test_api_settings(self) -> None:
         settings = self._validated_api_settings()
-        if settings is None or self._api_test_thread is not None or self._api_model_probe_thread is not None:
+        if (
+            settings is None
+            or self._api_test_thread is not None
+            or self._api_model_probe_thread is not None
+            or self._tts_test_thread is not None
+        ):
             return
 
         self._start_api_settings_test(settings)
