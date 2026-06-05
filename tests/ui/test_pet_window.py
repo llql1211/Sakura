@@ -2268,6 +2268,7 @@ def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  
     root = case_root / "runtime"
     profile = _build_settings_dialog_character(root, "sakura", "Sakura")
     _build_settings_dialog_character(root, "nanami", "Nanami", with_voice=False)
+    _build_settings_dialog_character(root, "yuki", "Yuki", with_voice_models=False)
 
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
@@ -2299,6 +2300,8 @@ def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  
         "导出单角色包 (.char)",
         "导出语音包 (.voice)",
     ]
+    assert dialog.character_export_full_action.isEnabled()
+    assert dialog.character_export_card_action.isEnabled()
     assert dialog.character_export_voice_action.isEnabled()
 
     dialog.character_export_full_action.trigger()
@@ -2314,8 +2317,20 @@ def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  
     nanami_index = dialog.character_combo.findData("nanami")
     assert nanami_index >= 0
     dialog.character_combo.setCurrentIndex(nanami_index)
+    assert not dialog.character_export_full_action.isEnabled()
+    assert dialog.character_export_card_action.isEnabled()
     assert not dialog.character_export_voice_action.isEnabled()
-    assert "没有可导出的语音包" in dialog.character_export_voice_action.toolTip()
+    assert "没有完整语音模型" in dialog.character_export_full_action.toolTip()
+    assert "没有可导出的语音模型" in dialog.character_export_voice_action.toolTip()
+
+    yuki_index = dialog.character_combo.findData("yuki")
+    assert yuki_index >= 0
+    dialog.character_combo.setCurrentIndex(yuki_index)
+    assert not dialog.character_export_full_action.isEnabled()
+    assert dialog.character_export_card_action.isEnabled()
+    assert not dialog.character_export_voice_action.isEnabled()
+    assert "没有完整语音模型" in dialog.character_export_full_action.toolTip()
+    assert "没有可导出的语音模型" in dialog.character_export_voice_action.toolTip()
 
     dialog.deleteLater()
     app.processEvents()
@@ -5661,6 +5676,7 @@ def _build_settings_dialog_character(
     theme: dict[str, object] | None = None,
     *,
     with_voice: bool = True,
+    with_voice_models: bool = True,
 ):
     from app.config.character_loader import CharacterRegistry
 
@@ -5680,20 +5696,26 @@ def _build_settings_dialog_character(
     if with_voice:
         (character_dir / "voice" / "models").mkdir(parents=True, exist_ok=True)
         (character_dir / "voice" / "refs" / "tone_refs").mkdir(parents=True, exist_ok=True)
-        (character_dir / "voice" / "models" / "gpt.ckpt").write_bytes(b"gpt")
-        (character_dir / "voice" / "models" / "sovits.pth").write_bytes(b"sovits")
         (character_dir / "voice" / "refs" / "tone_refs" / "neutral.wav").write_bytes(b"wav")
         (character_dir / "voice" / "refs" / "ref.txt").write_text(
             "voice/refs/tone_refs/neutral.wav|JA|テスト|中性\n",
             encoding="utf-8",
         )
-        character_data["voice"] = {
-            "gpt_model": "voice/models/gpt.ckpt",
-            "sovits_model": "voice/models/sovits.pth",
+        voice_data = {
             "tone_refs": "voice/refs/ref.txt",
             "ref_lang": "ja",
             "text_lang": "ja",
         }
+        if with_voice_models:
+            (character_dir / "voice" / "models" / "gpt.ckpt").write_bytes(b"gpt")
+            (character_dir / "voice" / "models" / "sovits.pth").write_bytes(b"sovits")
+            voice_data.update(
+                {
+                    "gpt_model": "voice/models/gpt.ckpt",
+                    "sovits_model": "voice/models/sovits.pth",
+                }
+            )
+        character_data["voice"] = voice_data
     if theme is not None:
         character_data["theme"] = theme
     (character_dir / "character.json").write_text(
