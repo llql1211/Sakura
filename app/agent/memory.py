@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from app.storage.chat_history import ChatHistoryEntry
 
@@ -17,15 +19,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-os.environ.setdefault("MEM0_TELEMETRY", "False")
-
 MEM0_VENDOR_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "mem0"
 DEFAULT_MEMORY_SCOPE = "sakura"
 DEFAULT_COLLECTION_NAME = "sakura_memories"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_EMBEDDING_DIMS = 384
 DEFAULT_MEMORY_LIMIT = 20
+DEFAULT_HUGGINGFACE_ENDPOINT = "https://hf-mirror.com"
 _MEM0_CREATE_LOCK = threading.Lock()
+os.environ.setdefault("MEM0_TELEMETRY", "False")
+if not (os.environ.get("HF_ENDPOINT") or "").strip():
+    os.environ["HF_ENDPOINT"] = DEFAULT_HUGGINGFACE_ENDPOINT
 DEFAULT_MEMORY_LANGUAGE_INSTRUCTIONS = (
     "Sakura 的长期记忆必须使用简体中文记录。"
     "无论用户或助手消息使用什么语言，都要把可记忆事实翻译、归纳为自然的简体中文；"
@@ -155,6 +159,11 @@ class MemoryStore:
 
         return not _embedding_model_cached(DEFAULT_EMBEDDING_MODEL, self.base_dir)
 
+    def embedding_model_endpoint(self) -> str:
+        """返回当前嵌入模型下载端点，便于 UI 提示用户。"""
+
+        return _huggingface_endpoint()
+
     def preload(self, *, wait: bool = False) -> None:
         """提前启动 mem0 加载，避免首次打开设置或聊天时才初始化。"""
 
@@ -179,11 +188,19 @@ class MemoryStore:
             self._reload_generation += 1
             generation = self._reload_generation
             self._reload_error = ""
+            existing_memory = self._memory
+            reload_llm_only = self._supports_memory_llm_reload(existing_memory)
 
         if wait:
             try:
                 self._publish_status("reloading", "长期记忆系统正在根据新的 API 设置重载。")
-                memory = self._create_memory_client(api_settings)
+                if reload_llm_only:
+                    llm_config, llm = self._create_memory_llm(api_settings)
+                    memory = existing_memory
+                else:
+                    llm_config = None
+                    llm = None
+                    memory = self._create_memory_client(api_settings)
             except Exception as exc:
                 logger.exception("mem0 后台重载失败")
                 current_generation = False
@@ -197,8 +214,14 @@ class MemoryStore:
             applied = False
             with self._lock:
                 if generation == self._reload_generation:
-                    self._memory = memory
+                    if reload_llm_only and self._memory is not existing_memory:
+                        return
+                    if reload_llm_only:
+                        self._apply_memory_llm(memory, llm_config, llm)
+                    else:
+                        self._memory = memory
                     self._load_error = ""
+                    self._reload_error = ""
                     self._loading = False
                     self._reloading = False
                     applied = True
@@ -216,7 +239,13 @@ class MemoryStore:
 
         def reload() -> None:
             try:
-                memory = self._create_memory_client(api_settings)
+                if reload_llm_only:
+                    llm_config, llm = self._create_memory_llm(api_settings)
+                    memory = existing_memory
+                else:
+                    llm_config = None
+                    llm = None
+                    memory = self._create_memory_client(api_settings)
             except Exception as exc:
                 logger.exception("mem0 后台重载失败")
                 current_generation = False
@@ -232,7 +261,12 @@ class MemoryStore:
             with self._lock:
                 if generation != self._reload_generation:
                     return
-                self._memory = memory
+                if reload_llm_only and self._memory is not existing_memory:
+                    return
+                if reload_llm_only:
+                    self._apply_memory_llm(memory, llm_config, llm)
+                else:
+                    self._memory = memory
                 self._load_error = ""
                 self._reload_error = ""
                 self._loading = False
@@ -318,7 +352,12 @@ class MemoryStore:
     ) -> dict[str, Any]:
         query = _optional_text(arguments, "query") or _optional_text(arguments, "keyword")
         limit = _positive_int(arguments.get("limit") or arguments.get("top_k"), DEFAULT_MEMORY_LIMIT)
-        mem = self._get_memory(wait=wait)
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError as exc:
+            if wait:
+                raise
+            return self._failed_response(str(exc))
         if mem is None:
             return self._loading_response()
         raw = (
@@ -343,7 +382,12 @@ class MemoryStore:
     ) -> dict[str, Any]:
         _ = allow_sensitive
         content = _required_text(arguments, "content")
-        mem = self._get_memory(wait=wait)
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError as exc:
+            if wait:
+                raise
+            return self._failed_response(str(exc))
         if mem is None:
             return self._loading_response()
         metadata = _memory_metadata(arguments)
@@ -375,17 +419,32 @@ class MemoryStore:
         mem = self._get_memory()
         previous = _normalize_memory_record(mem.get(memory_id))
         mem.delete(memory_id)
-        return {"memory": previous or {"id": memory_id, "content": ""}}
+        cache_reset = self._reset_scope_curation_cache(mem, memory_ids=[memory_id])
+        return {"memory": previous or {"id": memory_id, "content": ""}, "curation_cache_reset": cache_reset}
 
     def forget_memory(self, arguments: dict[str, Any], *, wait: bool = True) -> dict[str, Any]:
         memory_id = _required_text(arguments, "id")
-        mem = self._get_memory(wait=wait)
+        try:
+            mem = self._get_memory(wait=wait)
+        except RuntimeError as exc:
+            if wait:
+                raise
+            return self._failed_response(str(exc))
         if mem is None:
             return self._loading_response()
         previous = _normalize_memory_record(mem.get(memory_id))
         mem.delete(memory_id)
+        cache_reset = self._reset_scope_curation_cache(mem, memory_ids=[memory_id])
         forgotten = previous or {"id": memory_id, "content": ""}
-        return {"forgotten": forgotten, "memory": forgotten}
+        return {"forgotten": forgotten, "memory": forgotten, "curation_cache_reset": cache_reset}
+
+    def reset_curation_cache(self, *, wait: bool = True) -> dict[str, int]:
+        """清理当前角色的 mem0 整理缓存，不影响 Sakura 自己的聊天历史文件。"""
+
+        mem = self._get_memory(wait=wait)
+        if mem is None:
+            return {"messages": 0, "history": 0}
+        return self._reset_scope_curation_cache(mem)
 
     def add_history_entries(self, entries: list[ChatHistoryEntry]) -> MemoryCurationCounts:
         messages = _entries_for_mem0(entries)
@@ -394,6 +453,56 @@ class MemoryStore:
         mem = self._get_memory()
         raw = mem.add(messages, user_id=self.scope_id, infer=True)
         return _count_mem0_events(raw, total=len(messages))
+
+    def _reset_scope_curation_cache(
+        self,
+        mem: Any,
+        *,
+        memory_ids: Iterable[str] | None = None,
+    ) -> dict[str, int]:
+        """清理 mem0 内部整理缓存，避免删除长期记忆后旧缓存继续参与抽取。"""
+
+        db = getattr(mem, "db", None)
+        connection = getattr(db, "connection", None)
+        if connection is None:
+            return {"messages": 0, "history": 0}
+
+        clean_memory_ids = [
+            memory_id
+            for memory_id in (str(item).strip() for item in (memory_ids or []))
+            if memory_id
+        ]
+        session_scope = _mem0_session_scope({"user_id": self.scope_id})
+        lock = getattr(db, "_lock", None)
+        context = lock if lock is not None else nullcontext()
+        deleted_messages = 0
+        deleted_history = 0
+
+        try:
+            with context:
+                connection.execute("BEGIN")
+                message_cursor = connection.execute(
+                    "DELETE FROM messages WHERE session_scope = ?",
+                    (session_scope,),
+                )
+                deleted_messages = max(0, int(message_cursor.rowcount or 0))
+                if clean_memory_ids:
+                    placeholders = ",".join("?" for _ in clean_memory_ids)
+                    history_cursor = connection.execute(
+                        f"DELETE FROM history WHERE memory_id IN ({placeholders})",
+                        clean_memory_ids,
+                    )
+                    deleted_history = max(0, int(history_cursor.rowcount or 0))
+                connection.execute("COMMIT")
+        except (sqlite3.Error, RuntimeError) as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            logger.warning("mem0 整理缓存清理失败：%s", exc)
+            return {"messages": 0, "history": 0}
+
+        return {"messages": deleted_messages, "history": deleted_history}
 
     def _get_memory(self, *, wait: bool = True) -> Any | None:
         with self._lock:
@@ -438,7 +547,7 @@ class MemoryStore:
         status_event = (
             self._set_status_locked(
                 "loading",
-                "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。",
+                "长期记忆系统正在初始化，首次启动会从 HuggingFace 镜像下载本地嵌入模型，请稍等。",
             )
             if report_dependency_loading
             else None
@@ -449,12 +558,16 @@ class MemoryStore:
                 mem = self._create_memory_client(api_settings)
             except Exception as exc:
                 logger.exception("mem0 初始化失败")
+                error_message = _format_memory_load_error(
+                    exc,
+                    embedding_download=report_dependency_loading,
+                )
                 with self._lock:
                     if generation == self._reload_generation:
-                        self._load_error = str(exc)
+                        self._load_error = error_message
                         self._loading = False
                 if report_dependency_loading:
-                    self._publish_status("failed", f"长期记忆系统初始化失败：{exc}")
+                    self._publish_status("failed", error_message)
                 return
             with self._lock:
                 if generation != self._reload_generation or self.api_settings != api_settings:
@@ -475,6 +588,34 @@ class MemoryStore:
             from mem0 import Memory
 
             return Memory.from_config(self.build_mem0_config(api_settings))
+
+    def _supports_memory_llm_reload(self, memory: Any | None) -> bool:
+        if memory is None:
+            return False
+        config = getattr(memory, "config", None)
+        return hasattr(memory, "llm") and hasattr(config, "llm")
+
+    def _create_memory_llm(self, api_settings: "ApiSettings") -> tuple[Any, Any]:
+        """只按新 API 设置重建 mem0 的 LLM，避免重开本地 Qdrant 客户端。"""
+
+        with _MEM0_CREATE_LOCK:
+            install_mem0_vendor()
+            from mem0.llms.configs import LlmConfig
+            from mem0.utils.factory import LlmFactory
+
+            llm_section = self.build_mem0_config(api_settings)["llm"]
+            llm_config = LlmConfig(
+                provider=llm_section["provider"],
+                config=dict(llm_section.get("config") or {}),
+            )
+            llm = LlmFactory.create(llm_config.provider, llm_config.config)
+            return llm_config, llm
+
+    def _apply_memory_llm(self, memory: Any, llm_config: Any, llm: Any) -> None:
+        if memory is None or llm_config is None or llm is None:
+            return
+        memory.config.llm = llm_config
+        memory.llm = llm
 
     def _set_status_locked(
         self,
@@ -522,6 +663,17 @@ class MemoryStore:
             "memories": [],
         }
 
+    def _failed_response(self, error: str) -> dict[str, Any]:
+        return {
+            "status": "failed",
+            "message": (
+                "长期记忆系统暂时不可用。请告诉主人普通聊天仍可继续，"
+                "不要重复调用记忆工具。"
+            ),
+            "error": error,
+            "memories": [],
+        }
+
 
 def _resolve_base_dir(base_dir: Path | None) -> Path:
     if base_dir is None:
@@ -537,16 +689,43 @@ def _normalize_scope_id(scope_id: str | None) -> str:
     return text if text and not any(ch.isspace() for ch in text) else DEFAULT_MEMORY_SCOPE
 
 
-def _local_embedding_model_kwargs(model_name: str, base_dir: Path | None = None) -> dict[str, Any]:
-    """本地已有 HuggingFace 缓存时禁止联网探测，避免设置页反复卡顿。"""
+def _mem0_session_scope(filters: dict[str, str]) -> str:
+    parts: list[str] = []
+    for key in sorted(("user_id", "agent_id", "run_id")):
+        value = filters.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    return "&".join(parts)
 
-    if _embedding_model_cached(model_name, base_dir):
-        return {"local_files_only": True}
-    return {}
+
+def _local_embedding_model_kwargs(model_name: str, base_dir: Path | None = None) -> dict[str, Any]:
+    """优先复用本地模型；缺失时下载到项目缓存并使用 HuggingFace 镜像。"""
+
+    cache_folder = _embedding_model_cache_folder(model_name, base_dir)
+    if cache_folder is not None:
+        return {"cache_folder": str(cache_folder), "local_files_only": True}
+    return {"cache_folder": str(_project_embedding_cache_folder(base_dir))}
 
 
 def _embedding_model_cached(model_name: str, base_dir: Path | None = None) -> bool:
     """判断本地是否已有完整嵌入模型缓存，避免半下载缓存触发离线加载失败。"""
+
+    return _embedding_model_cache_folder(model_name, base_dir) is not None
+
+
+def _embedding_model_cache_folder(model_name: str, base_dir: Path | None = None) -> Path | None:
+    """返回已命中的 HuggingFace 缓存根目录，供 SentenceTransformer 离线加载复用。"""
+
+    model_cache_name = "models--" + model_name.replace("/", "--")
+    for root in _embedding_model_cache_candidates(base_dir):
+        snapshot_dir = root / model_cache_name / "snapshots"
+        if _hub_snapshot_has_model_weights(snapshot_dir):
+            return root
+    return None
+
+
+def _embedding_model_cache_candidates(base_dir: Path | None = None) -> list[Path]:
+    """按加载优先级列出可能包含 hub 模型快照的缓存目录。"""
 
     cache_root = (
         os.environ.get("SENTENCE_TRANSFORMERS_HOME")
@@ -554,21 +733,47 @@ def _embedding_model_cached(model_name: str, base_dir: Path | None = None) -> bo
         or os.environ.get("TRANSFORMERS_CACHE")
     )
     cache_candidates: list[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        candidate = path.expanduser()
+        if candidate not in cache_candidates:
+            cache_candidates.append(candidate)
+
     if cache_root:
         cache_path = Path(cache_root)
-        cache_candidates.extend([cache_path, cache_path / "hub"])
+        add_candidate(cache_path)
+        add_candidate(cache_path / "hub")
     if base_dir is not None:
         runtime_cache = Path(base_dir) / "runtime" / "hf-cache"
-        cache_candidates.extend([runtime_cache, runtime_cache / "hub"])
-    default_hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    cache_candidates.append(default_hf_home / "hub")
+        add_candidate(runtime_cache)
+        add_candidate(runtime_cache / "hub")
+    hf_home = (os.environ.get("HF_HOME") or "").strip()
+    default_hf_home = Path(hf_home) if hf_home else Path.home() / ".cache" / "huggingface"
+    add_candidate(default_hf_home / "hub")
+    return cache_candidates
 
-    model_cache_name = "models--" + model_name.replace("/", "--")
-    for root in cache_candidates:
-        snapshot_dir = root / model_cache_name / "snapshots"
-        if _hub_snapshot_has_model_weights(snapshot_dir):
-            return True
-    return False
+
+def _project_embedding_cache_folder(base_dir: Path | None = None) -> Path:
+    """返回 Sakura 自己管理的 HuggingFace hub 缓存目录。"""
+
+    root = _resolve_base_dir(base_dir)
+    return root / "runtime" / "hf-cache" / "hub"
+
+
+def _huggingface_endpoint() -> str:
+    return (os.environ.get("HF_ENDPOINT") or DEFAULT_HUGGINGFACE_ENDPOINT).strip()
+
+
+def _format_memory_load_error(exc: Exception, *, embedding_download: bool) -> str:
+    raw_message = str(exc).strip() or exc.__class__.__name__
+    if not embedding_download:
+        return f"长期记忆系统初始化失败：{raw_message}"
+    endpoint = _huggingface_endpoint()
+    return (
+        "长期记忆系统初始化失败：本地嵌入模型下载失败，可能是网络无法访问 HuggingFace "
+        f"镜像（当前端点：{endpoint}）。请检查网络或代理后重试；普通聊天仍可继续。"
+        f"\n\n原始错误：{raw_message}"
+    )
 
 
 def _hub_snapshot_has_model_weights(snapshot_dir: Path) -> bool:

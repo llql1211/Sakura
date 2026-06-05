@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from app.agent.mcp.settings import MCPRuntimeSettings
+from app.config.character_loader import CharacterRegistry
 from app.config.settings_service import AppSettingsService, DebugLogSettings
 from app.config.yaml_config import load_yaml_mapping
 from app.llm.api_client import ApiSettings
@@ -17,7 +18,7 @@ from app.ui.theme import (
     build_pet_window_stylesheet,
     parse_ai_theme_response,
 )
-from app.voice.tts import TTS_PROVIDER_CUSTOM_GPT_SOVITS, GPTSoVITSTTSSettings
+from app.voice.tts import TTS_PROVIDER_CUSTOM_GPT_SOVITS, TTS_PROVIDER_NONE, GPTSoVITSTTSSettings
 
 
 class CharacterRegistryStub:
@@ -73,7 +74,7 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
             ref_audio_path=root / "ref.wav",
             ref_text_path=root / "ref.txt",
             ref_text="hello",
-            work_dir=root / "data" / "tts_bundles" / "installed" / "gpt_sovits_v2pro",
+            work_dir=root / "tts" / "gpt",
             ref_lang="ja",
             text_lang="ja",
             timeout_seconds=22,
@@ -98,7 +99,7 @@ def test_settings_service_saves_runtime_config_to_yaml() -> None:
 
     assert api["llm"]["model"] == "demo-model"
     assert api["tts"]["provider"] == "gpt-sovits"
-    assert api["tts"]["gpt_sovits"]["work_dir"] == "data/tts_bundles/installed/gpt_sovits_v2pro"
+    assert api["tts"]["gpt_sovits"]["work_dir"] == "tts/gpt"
     assert api["tts"]["gpt_sovits"]["timeout_seconds"] == 22
     assert characters["current_character_id"] == "nanami"
     assert system["mcp"]["windows_enabled"] is False
@@ -129,6 +130,8 @@ tts:
     settings = service.load_tts_settings(validate_enabled=False)
 
     assert settings.work_dir == root / "data" / "tts_bundles" / "installed" / "gpt_sovits_v2pro"
+    assert settings.python_path is None
+    assert settings.tts_config_path is None
 
     service.api_config_path.write_text(
         """
@@ -146,6 +149,48 @@ tts:
     assert legacy_settings.work_dir is None
 
 
+def test_settings_service_disables_tts_for_voice_less_character() -> None:
+    root = _runtime_root("yaml_tts_no_voice_character")
+    service = AppSettingsService(root)
+    service.api_config_path.parent.mkdir(parents=True)
+    service.api_config_path.write_text(
+        """
+tts:
+  provider: gpt-sovits
+  enabled: true
+  gpt_sovits:
+    api_url: http://127.0.0.1:9880/tts
+    ref_lang: ja
+    text_lang: ja
+""".lstrip(),
+        encoding="utf-8",
+    )
+    character_dir = root / "characters" / "demo"
+    character_dir.mkdir(parents=True)
+    (character_dir / "card.md").write_text("system prompt", encoding="utf-8")
+    (character_dir / "portrait.png").write_bytes(b"portrait")
+    (character_dir / "character.json").write_text(
+        json.dumps(
+            {
+                "id": "demo",
+                "display_name": "Demo",
+                "initial_message": "hello",
+                "card": "card.md",
+                "portrait": {"default": "portrait.png"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    profile = CharacterRegistry(root).get("demo")
+
+    settings = service.load_tts_settings(character_profile=profile)
+
+    assert not settings.enabled
+    assert settings.provider == TTS_PROVIDER_NONE
+    assert settings.character_name == "Demo"
+
+
 def test_settings_service_saves_and_loads_genie_tts_settings() -> None:
     root = _runtime_root("yaml_genie_tts")
     service = AppSettingsService(root)
@@ -156,7 +201,7 @@ def test_settings_service_saves_and_loads_genie_tts_settings() -> None:
         ref_audio_path=root / "ref.wav",
         ref_text_path=root / "ref.txt",
         ref_text="hello",
-        work_dir=root / "data" / "tts_bundles" / "installed" / "genie_tts_server",
+        work_dir=root / "tts" / "cpu",
         character_name="夜乃桜",
         onnx_model_dir=root / "data" / "tts_bundles" / "onnx" / "sakura",
         ref_lang="ja",
@@ -170,10 +215,10 @@ def test_settings_service_saves_and_loads_genie_tts_settings() -> None:
 
     assert saved["tts"]["provider"] == "genie-tts"
     assert saved["tts"]["genie_tts"]["api_url"] == "http://127.0.0.1:9881/"
-    assert saved["tts"]["genie_tts"]["work_dir"] == "data/tts_bundles/installed/genie_tts_server"
+    assert saved["tts"]["genie_tts"]["work_dir"] == "tts/cpu"
     assert saved["tts"]["genie_tts"]["onnx_model_dir"] == "data/tts_bundles/onnx/sakura"
     assert loaded.provider == "genie-tts"
-    assert loaded.work_dir == root / "data" / "tts_bundles" / "installed" / "genie_tts_server"
+    assert loaded.work_dir == root / "tts" / "cpu"
     assert loaded.onnx_model_dir == root / "data" / "tts_bundles" / "onnx" / "sakura"
     assert loaded.timeout_seconds == 33
 
@@ -189,6 +234,8 @@ def test_settings_service_saves_and_loads_custom_gpt_sovits_settings() -> None:
         ref_text_path=root / "ref.txt",
         ref_text="hello",
         work_dir=root / "external" / "GPT-SoVITS",
+        python_path=root / "external" / "miniforge3" / "envs" / "gpt-sovits" / "bin" / "python",
+        tts_config_path=root / "external" / "GPT-SoVITS" / "GPT_SoVITS" / "configs" / "tts_infer.yaml",
         ref_lang="ja",
         text_lang="ja",
         timeout_seconds=44,
@@ -201,9 +248,13 @@ def test_settings_service_saves_and_loads_custom_gpt_sovits_settings() -> None:
     assert saved["tts"]["provider"] == TTS_PROVIDER_CUSTOM_GPT_SOVITS
     assert saved["tts"]["gpt_sovits"]["api_url"] == "http://192.168.1.20:9880/tts"
     assert saved["tts"]["gpt_sovits"]["work_dir"] == "external/GPT-SoVITS"
+    assert saved["tts"]["gpt_sovits"]["python_path"] == "external/miniforge3/envs/gpt-sovits/bin/python"
+    assert saved["tts"]["gpt_sovits"]["tts_config_path"] == "external/GPT-SoVITS/GPT_SoVITS/configs/tts_infer.yaml"
     assert loaded.provider == TTS_PROVIDER_CUSTOM_GPT_SOVITS
     assert loaded.api_url == "http://192.168.1.20:9880/tts"
     assert loaded.work_dir == root / "external" / "GPT-SoVITS"
+    assert loaded.python_path == root / "external" / "miniforge3" / "envs" / "gpt-sovits" / "bin" / "python"
+    assert loaded.tts_config_path == root / "external" / "GPT-SoVITS" / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
     assert loaded.timeout_seconds == 44
 
 

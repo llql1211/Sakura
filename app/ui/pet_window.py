@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QRect,
+    QSize,
     Qt,
     QThread,
     QTimer,
@@ -18,11 +19,13 @@ from PySide6.QtCore import (
     Slot,
 )
 from PySide6.QtGui import (
+    QColor,
     QCursor,
     QFont,
     QIcon,
     QKeyEvent,
     QMouseEvent,
+    QPainter,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -56,9 +59,12 @@ from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.core.app_context import AppContext
 from app.config.character_loader import (
     DEFAULT_CHARACTER_ID,
+    THEME_SOURCE_PACKAGE,
     CharacterConfigError,
     CharacterProfile,
+    CharacterRegistry,
     load_character_system_prompt,
+    save_character_theme,
 )
 from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
 from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply_result
@@ -118,7 +124,7 @@ from app.ui import (
     capture_virtual_desktop_pixmap,
 )
 from app.ui.styles import pet_window_stylesheet
-from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings
+from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings, build_message_box_stylesheet
 from app.voice import VoicePlaybackController
 
 if TYPE_CHECKING:
@@ -133,6 +139,9 @@ MEMORY_STATUS_STARTUP_DELAY_MS = 1_000
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
+_UI_ASSETS_DIR = Path(__file__).with_name("assets")
+_SCREENSHOT_ICON_PATH = _UI_ASSETS_DIR / "screenshot-select.svg"
+_SCREENSHOT_ATTACHED_ICON_PATH = _UI_ASSETS_DIR / "screenshot-attached.svg"
 PROACTIVE_RECENT_CONVERSATION_LIMIT = 12
 PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT = 800
 PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT = (
@@ -146,6 +155,132 @@ REPLY_HISTORY_PREVIOUS_SYMBOL = "▲"
 REPLY_HISTORY_NEXT_SYMBOL = "▼"
 DEFAULT_STAGE_WIDTH = 860
 DEFAULT_STAGE_HEIGHT = 640
+# 立绘缩放时碰撞箱高度下限：底部 UI 区（气泡 128 + 输入框 52 + 间距 94 = 274px）
+# 加上立绘顶部约 146px 可见区，合计 ~420px。
+MIN_STAGE_HEIGHT = 420
+
+
+def _message_box_theme(parent: QWidget | None, theme_settings: ThemeSettings | None) -> ThemeSettings:
+    theme = theme_settings or getattr(parent, "theme_settings", DEFAULT_THEME_SETTINGS)
+    if not isinstance(theme, ThemeSettings):
+        theme = DEFAULT_THEME_SETTINGS
+    return theme.normalized()
+
+
+def show_themed_message_box(
+    parent: QWidget | None,
+    icon: QMessageBox.Icon,
+    title: str,
+    text: str,
+    *,
+    theme_settings: ThemeSettings | None = None,
+    buttons: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
+    default_button: QMessageBox.StandardButton = QMessageBox.StandardButton.Ok,
+) -> QMessageBox.StandardButton:
+    """使用当前 Sakura 主题显示 QMessageBox。"""
+
+    box = QMessageBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(buttons)
+    if default_button != QMessageBox.StandardButton.NoButton:
+        box.setDefaultButton(default_button)
+    box.setStyleSheet(build_message_box_stylesheet(_message_box_theme(parent, theme_settings)))
+    return QMessageBox.StandardButton(box.exec())
+
+
+def show_themed_information(
+    parent: QWidget | None,
+    title: str,
+    text: str,
+    *,
+    theme_settings: ThemeSettings | None = None,
+) -> QMessageBox.StandardButton:
+    return show_themed_message_box(
+        parent,
+        QMessageBox.Icon.Information,
+        title,
+        text,
+        theme_settings=theme_settings,
+    )
+
+
+def show_themed_warning(
+    parent: QWidget | None,
+    title: str,
+    text: str,
+    *,
+    theme_settings: ThemeSettings | None = None,
+) -> QMessageBox.StandardButton:
+    return show_themed_message_box(
+        parent,
+        QMessageBox.Icon.Warning,
+        title,
+        text,
+        theme_settings=theme_settings,
+    )
+
+
+def show_themed_critical(
+    parent: QWidget | None,
+    title: str,
+    text: str,
+    *,
+    theme_settings: ThemeSettings | None = None,
+) -> QMessageBox.StandardButton:
+    return show_themed_message_box(
+        parent,
+        QMessageBox.Icon.Critical,
+        title,
+        text,
+        theme_settings=theme_settings,
+    )
+
+
+class TTSReadyWarmupWorker(QObject):
+    """后台启动并检测 TTS 服务，避免首次朗读承担冷启动。"""
+
+    succeeded = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, provider: TTSProvider) -> None:
+        super().__init__()
+        self.provider = provider
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            ensure_ready = getattr(self.provider, "ensure_ready", None)
+            if not callable(ensure_ready):
+                return
+            debug_log("TTS", "开始后台预热 TTS 服务", {"provider": type(self.provider).__name__})
+            ok, message = ensure_ready()
+            if ok:
+                debug_log(
+                    "TTS",
+                    "后台预热 TTS 服务完成",
+                    {"provider": type(self.provider).__name__, "message": message},
+                )
+                self.succeeded.emit(message)
+            else:
+                debug_log(
+                    "TTS",
+                    "后台预热 TTS 服务失败",
+                    {"provider": type(self.provider).__name__, "message": message},
+                )
+                self.failed.emit(message)
+        except Exception as exc:  # noqa: BLE001
+            message = f"TTS 服务预热失败：{exc}"
+            debug_log(
+                "TTS",
+                "后台预热 TTS 服务异常",
+                {"provider": type(self.provider).__name__, "error": str(exc)},
+            )
+            self.failed.emit(message)
+        finally:
+            self.finished.emit()
 
 
 class PetWindow(QWidget):
@@ -161,6 +296,8 @@ class PetWindow(QWidget):
         self.startup_initializing = context.startup_initializing
         self.deferred_startup_thread: QThread | None = None
         self.deferred_startup_worker: QObject | None = None
+        self.tts_ready_warmup_thread: QThread | None = None
+        self.tts_ready_warmup_worker: QObject | None = None
         self.settings_service = context.settings_service
         self.character_registry = context.character_registry
         self.character_profile = context.character_profile
@@ -178,7 +315,10 @@ class PetWindow(QWidget):
         self.visual_observation_store = context.visual_observation_store
         self.mcp_settings = context.mcp_settings
         self.debug_log_settings = context.debug_log_settings
-        self.theme_settings = self.settings_service.load_theme_settings()
+        self.theme_settings = _theme_settings_for_character(
+            self.settings_service.load_theme_settings(),
+            self.character_profile,
+        )
         self.memory_curation_settings = context.memory_curation_settings
         self.memory_curation_state = context.memory_curation_state
         self.memory_curator = context.memory_curator
@@ -203,7 +343,8 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
-        self.drag_offset: QPoint | None = None
+        self.pending_history_clear_after_curation = False
+        self.drag_anchor: QPoint | None = None
         self.portrait_scale_percent = self._load_portrait_scale_percent()
         (
             self.subtitle_typing_interval_ms,
@@ -218,6 +359,8 @@ class PetWindow(QWidget):
         self.pending_screen_observation_event_reminder_id: str | None = None
         self.pending_visual_observation_jobs: list[VisualObservationJob] = []
         self.pending_event_visual_observation_jobs: list[VisualObservationJob] = []
+        self.plugin_chat_ui_widget_instances: list[QWidget] = []
+        self.hidden_to_tray = False
         self.screen_observation_followup_in_progress = False
         self.active_reminder_id: str | None = None
         self.active_reminder_text = ""
@@ -225,6 +368,7 @@ class PetWindow(QWidget):
         self.active_event: AgentEvent | None = None
         self.memory_status_message_active = False
         self.memory_status_last_message = ""
+        self.memory_failure_dialog_last_message = ""
         self.last_user_activity_at = time.perf_counter()
         self.last_proactive_care_at: float | None = None
         self.last_proactive_screen_context_at: float | None = None
@@ -367,6 +511,7 @@ class PetWindow(QWidget):
         self.speech_timer = self.subtitle_controller.speech_timer
         if not self.startup_initializing:
             QTimer.singleShot(0, self._warm_up_current_tts_playback)
+            QTimer.singleShot(0, self._start_current_tts_ready_warmup)
 
         bubble_header = QHBoxLayout()
         bubble_header.setContentsMargins(0, 0, 0, 0)
@@ -417,9 +562,11 @@ class PetWindow(QWidget):
         self.send_button.setFixedHeight(38)
         self.send_button.clicked.connect(self._handle_send_button_clicked)
 
-        self.screenshot_button = QPushButton("截图", self.input_bar)
+        self.screenshot_button = QToolButton(self.input_bar)
         self.screenshot_button.setObjectName("screenshotButton")
-        self.screenshot_button.setFixedHeight(38)
+        self.screenshot_button.setFixedSize(38, 38)
+        self.screenshot_button.setIcon(QIcon(str(_SCREENSHOT_ICON_PATH)))
+        self.screenshot_button.setIconSize(QSize(18, 18))
         self.screenshot_button.setProperty("screenshotAttached", False)
         self.screenshot_button.setToolTip("框选截图并附加到下一条消息；右键清除")
         self.screenshot_button.installEventFilter(self)
@@ -441,6 +588,7 @@ class PetWindow(QWidget):
         input_layout.addWidget(self.screenshot_button)
         input_layout.addWidget(self.send_button)
         self.input_bar.setLayout(input_layout)
+        self._sync_plugin_chat_ui_widgets()
 
         self._apply_theme_settings(self.theme_settings)
         self._apply_fonts()
@@ -466,12 +614,41 @@ class PetWindow(QWidget):
         application = QApplication.instance()
         if application is not None:
             application.aboutToQuit.connect(self.close_external_tools)
+            if sys.platform == "darwin":
+                application.installEventFilter(self)
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
         self._layout_stage()
 
+    def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().showEvent(event)
+        self._refresh_tray_menu()
+        self._schedule_native_topmost_sync()
+
+    def hideEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().hideEvent(event)
+        self._refresh_tray_menu()
+
+    def changeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().changeEvent(event)
+        if event.type() in {
+            QEvent.Type.ActivationChange,
+            QEvent.Type.WindowStateChange,
+        }:
+            self._schedule_native_topmost_sync()
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        if _is_screen_change_event(event):
+            self._schedule_screen_change_relayout()
+        return super().event(event)
+
     def eventFilter(self, watched, event) -> bool:  # type: ignore[no-untyped-def]
+        application = QApplication.instance()
+        if application is not None and watched is application:
+            if event.type() == QEvent.Type.ApplicationActivate:
+                self._handle_application_activated()
+            return super().eventFilter(watched, event)
         if watched is self.input_edit:
             if event.type() == QEvent.Type.KeyPress:
                 self._log_input_key_event(event)
@@ -484,9 +661,15 @@ class PetWindow(QWidget):
                 self._clear_manual_screen_observation()
                 return True
             return super().eventFilter(watched, event)
-        if isinstance(event, QMouseEvent):
+        if watched in {
+            self.label,
+            self.portrait_transition_label,
+            self.bubble,
+            self.name_label,
+            self.speech_label,
+        } and isinstance(event, QMouseEvent):
             if event.type() == QEvent.Type.MouseButtonPress:
-                return self._handle_mouse_press(event)
+                return self._handle_mouse_press(event, watched)
             if event.type() == QEvent.Type.MouseMove:
                 return self._handle_mouse_move(event)
             if event.type() == QEvent.Type.MouseButtonRelease:
@@ -545,9 +728,9 @@ class PetWindow(QWidget):
     def close_plugins(self) -> None:
         self.plugin_manager.shutdown_all()
 
-    def _handle_mouse_press(self, event: QMouseEvent) -> bool:
+    def _handle_mouse_press(self, event: QMouseEvent, source_widget: QWidget | None = None) -> bool:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.drag_anchor = self._drag_anchor_from_event(event, source_widget)
             event.accept()
             return True
         if event.button() == Qt.MouseButton.RightButton:
@@ -556,15 +739,15 @@ class PetWindow(QWidget):
         return False
 
     def _handle_mouse_move(self, event: QMouseEvent) -> bool:
-        if event.buttons() & Qt.MouseButton.LeftButton and self.drag_offset is not None:
-            self.move(event.globalPosition().toPoint() - self.drag_offset)
+        if event.buttons() & Qt.MouseButton.LeftButton and self.drag_anchor is not None:
+            self.move(event.globalPosition().toPoint() - self.drag_anchor)
             event.accept()
             return True
         return False
 
     def _handle_mouse_release(self, event: QMouseEvent) -> bool:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_offset = None
+            self.drag_anchor = None
             event.accept()
             return True
         if event.button() == Qt.MouseButton.RightButton:
@@ -572,6 +755,28 @@ class PetWindow(QWidget):
             event.accept()
             return True
         return False
+
+    def _drag_anchor_from_event(
+        self,
+        event: QMouseEvent,
+        source_widget: QWidget | None = None,
+    ) -> QPoint:
+        position = event.position().toPoint()
+        if source_widget is None or source_widget is self:
+            return position
+
+        map_to = getattr(source_widget, "mapTo", None)
+        if callable(map_to):
+            return map_to(self, position)
+        return position
+
+    def _schedule_screen_change_relayout(self) -> None:
+        QTimer.singleShot(0, self._restore_geometry_after_screen_change)
+
+    def _restore_geometry_after_screen_change(self) -> None:
+        self.resize(*self.stage_size)
+        self._layout_stage()
+        self._schedule_native_topmost_sync()
 
     def _apply_reply_segment(self, segment: ChatSegment) -> None:
         self.portrait_controller.apply_for_segment(segment)
@@ -712,8 +917,9 @@ class PetWindow(QWidget):
         self.input_bar.raise_()
 
     def _update_tray_icon_pixmap(self, pixmap: QPixmap) -> None:
+        _ = pixmap
         if hasattr(self, "tray_icon"):
-            self.tray_icon.setIcon(QIcon(pixmap) if not pixmap.isNull() else QIcon())
+            self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
 
     def _apply_fonts(self) -> None:
         text_font = _rounded_chinese_font(13, QFont.Weight.Bold)
@@ -767,8 +973,7 @@ class PetWindow(QWidget):
         self.input_backdrop.update()
 
     def _create_tray_icon(self) -> None:
-        pixmap = self.portrait_controller.pixmap
-        icon = QIcon(pixmap) if not pixmap.isNull() else QIcon()
+        icon = _build_status_tray_icon(self.theme_settings.primary_color)
         self.tray_icon = QSystemTrayIcon(icon, self)
         self.tray_icon.setToolTip(self.character_profile.display_name)
         self.tray_icon.setContextMenu(self._build_menu())
@@ -782,13 +987,22 @@ class PetWindow(QWidget):
             free_access_checked=self.free_access_enabled,
             always_on_top_checked=self.always_on_top_enabled,
             interactions_enabled=not getattr(self, "startup_initializing", False),
-            on_hide=self.hide,
+            window_visible=self.isVisible(),
+            on_hide=self._hide_to_tray,
+            on_show=self._show_from_tray,
             on_toggle_chinese_subtitles=self._toggle_chinese_subtitles,
             on_toggle_free_access=self._toggle_free_access,
             on_toggle_always_on_top=self._toggle_always_on_top,
             on_show_history=self.show_history,
             on_show_settings=self.show_settings,
         )
+
+    def _refresh_tray_menu(self) -> None:
+        if hasattr(self, "tray_icon"):
+            old_menu = self.tray_icon.contextMenu()
+            self.tray_icon.setContextMenu(self._build_menu())
+            if old_menu is not None:
+                old_menu.deleteLater()
 
     def _show_context_menu(self, position: QPoint) -> None:
         _ = position
@@ -891,7 +1105,7 @@ class PetWindow(QWidget):
         if self.worker_thread is not None:
             return
         if not self.screen_observation_enabled:
-            QMessageBox.information(self, "截图已关闭", "请先在设置中开启屏幕观察权限。")
+            show_themed_information(self, "截图已关闭", "请先在设置中开启屏幕观察权限。")
             return
 
         debug_log("PetWindow", "开始手动框选截图")
@@ -901,7 +1115,7 @@ class PetWindow(QWidget):
         try:
             desktop_pixmap, virtual_geometry = self._capture_virtual_desktop_pixmap()
         except RuntimeError as exc:
-            QMessageBox.warning(self, "截图失败", str(exc))
+            show_themed_warning(self, "截图失败", str(exc))
             debug_log("PetWindow", "手动框选截图启动失败", {"error": str(exc)})
             return
 
@@ -924,7 +1138,7 @@ class PetWindow(QWidget):
         try:
             observation = build_screen_observation_from_pixmap(pixmap)
         except RuntimeError as exc:
-            QMessageBox.warning(self, "截图失败", str(exc))
+            show_themed_warning(self, "截图失败", str(exc))
             debug_log("PetWindow", "手动框选截图编码失败", {"error": str(exc)})
             return
 
@@ -961,7 +1175,9 @@ class PetWindow(QWidget):
 
     def _update_manual_screenshot_button(self) -> None:
         attached = self.pending_manual_screen_observation is not None
-        self.screenshot_button.setText("截图✓" if attached else "截图")
+        self.screenshot_button.setText("")
+        icon_path = _SCREENSHOT_ATTACHED_ICON_PATH if attached else _SCREENSHOT_ICON_PATH
+        self.screenshot_button.setIcon(QIcon(str(icon_path)))
         self.screenshot_button.setProperty("screenshotAttached", attached)
         self.screenshot_button.style().unpolish(self.screenshot_button)
         self.screenshot_button.style().polish(self.screenshot_button)
@@ -1006,7 +1222,7 @@ class PetWindow(QWidget):
             self._end_interaction("ignored")
             return
         if manual_observation is not None and not self.screen_observation_enabled:
-            QMessageBox.information(self, "截图已关闭", "屏幕观察权限已关闭，本次截图不会发送。")
+            show_themed_information(self, "截图已关闭", "屏幕观察权限已关闭，本次截图不会发送。")
             self._clear_manual_screen_observation()
             self._end_interaction("ignored")
             return
@@ -1731,7 +1947,7 @@ class PetWindow(QWidget):
             self.messages.pop()
         self._record_history("error", message)
         self.subtitle_controller.cancel_reply_flow("……通信に失敗した。設定を確認して。")
-        QMessageBox.warning(self, "请求失败", message)
+        show_themed_warning(self, "请求失败", message)
         self._end_interaction("error")
 
     @Slot()
@@ -1810,6 +2026,8 @@ class PetWindow(QWidget):
             return
         if not self.memory_curation_settings.enabled:
             return
+        if self.pending_history_clear_after_curation:
+            return
         state = self.memory_curation_state.snapshot()
         if state.get("backfill_completed"):
             return
@@ -1887,7 +2105,7 @@ class PetWindow(QWidget):
         )
         if mode == "history_clear":
             if result.processed_entries > 0 and result.returned == 0:
-                QMessageBox.warning(
+                show_themed_warning(
                     self,
                     "整理失败",
                     "记忆整理没有写入任何结果，已保留聊天历史。请检查日志后再重试。",
@@ -1897,11 +2115,11 @@ class PetWindow(QWidget):
                 self.history_store.clear()
                 self.memory_curation_state.mark_history_cleared()
             except OSError as exc:
-                QMessageBox.warning(self, "清空失败", f"记忆已整理，但清空历史失败：{exc}")
+                show_themed_warning(self, "清空失败", f"记忆已整理，但清空历史失败：{exc}")
             else:
                 if self.history_window is not None:
                     self.history_window.refresh()
-                QMessageBox.information(self, "整理完成", result.summary())
+                show_themed_information(self, "整理完成", result.summary())
             return
 
         self.memory_curation_state.mark_processed(
@@ -1921,7 +2139,7 @@ class PetWindow(QWidget):
             },
         )
         if self.memory_curation_mode == "history_clear":
-            QMessageBox.warning(self, "整理失败", f"历史没有清空，原因：{message}")
+            show_themed_warning(self, "整理失败", f"历史没有清空，原因：{message}")
 
     @Slot()
     def _cleanup_memory_curation_worker(self) -> None:
@@ -1934,9 +2152,33 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
+        if self.pending_history_clear_after_curation:
+            self.pending_history_clear_after_curation = False
+            if self._start_pending_history_clear_after_curation():
+                return
         if self.history_window is not None:
             self.history_window.set_memory_save_busy(False)
         QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
+
+    def _start_pending_history_clear_after_curation(self) -> bool:
+        if not self._memory_curation_can_start():
+            return False
+        entries = self.history_store.load()
+        if not entries:
+            if self.history_window is not None:
+                self.history_window.refresh()
+            return False
+        if not self._memory_store_ready_for_history_clear():
+            self._show_memory_not_ready_for_history_clear()
+            return False
+        self._reset_memory_curation_cache_for_history_clear()
+        self._start_memory_curation(
+            entries,
+            mode="history_clear",
+            target_history_count=len(entries),
+            consumed_turns=self.memory_curation_state.pending_turns(),
+        )
+        return self.memory_curation_thread is not None
 
     @Slot(object)
     def apply_deferred_services(self, services: "DeferredStartupServices") -> None:
@@ -1954,11 +2196,14 @@ class PetWindow(QWidget):
         self.voice_playback_controller.set_provider(services.tts_provider)
         self._connect_tts_error_signal(services.tts_provider)
         self._warm_up_tts_playback(services.tts_provider)
+        self._start_tts_ready_warmup(services.tts_provider)
         self.tool_registry = services.tool_registry
         self.free_access_enabled = self.tool_registry.free_access_enabled
         self.agent_runtime.tools = services.tool_registry
+        self.agent_runtime.set_prompt_patches(services.plugin_manager.prompt_patches)
         self.mcp_tool_provider = services.mcp_tool_provider
         self.plugin_manager = services.plugin_manager
+        self._sync_plugin_chat_ui_widgets()
         self.mcp_settings = services.mcp_settings
 
         self.startup_initializing = False
@@ -2000,6 +2245,29 @@ class PetWindow(QWidget):
             self.tray_icon.setContextMenu(self._build_menu())
         debug_log("Startup", "后台启动服务失败", {"error": error})
         print(f"[Startup] 后台初始化失败：{error}")
+
+    def _sync_plugin_chat_ui_widgets(self) -> None:
+        layout = self.input_bar.layout() if hasattr(self, "input_bar") else None
+        if layout is None:
+            return
+        for widget in getattr(self, "plugin_chat_ui_widget_instances", []):
+            layout.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+        self.plugin_chat_ui_widget_instances = []
+
+        contributions = getattr(self.plugin_manager, "chat_ui_widgets", [])
+        for index, contribution in enumerate(sorted(contributions, key=lambda item: item.order)):
+            try:
+                widget = contribution.build(self.input_bar)
+            except Exception as exc:
+                widget = QLabel(f"{contribution.widget_id} 加载失败：{exc}", self.input_bar)
+                widget.setObjectName("pluginChatWidgetError")
+                widget.setToolTip(str(exc))
+            if not isinstance(widget, QWidget):
+                continue
+            layout.insertWidget(1 + index, widget)
+            self.plugin_chat_ui_widget_instances.append(widget)
 
     def _move_tts_provider_to_ui_thread(self, provider: TTSProvider) -> None:
         if not isinstance(provider, QObject):
@@ -2049,6 +2317,42 @@ class PetWindow(QWidget):
                     "error": str(exc),
                 },
             )
+
+    def _start_current_tts_ready_warmup(self) -> None:
+        self._start_tts_ready_warmup(self.tts_provider)
+
+    def _start_tts_ready_warmup(self, provider: TTSProvider) -> None:
+        if isinstance(provider, NullTTSProvider):
+            debug_log("TTS", "TTS 已关闭，跳过服务预热")
+            return
+        ensure_ready = getattr(provider, "ensure_ready", None)
+        if not callable(ensure_ready):
+            return
+        if self.tts_ready_warmup_thread is not None:
+            debug_log("TTS", "TTS 服务预热已在进行，跳过重复请求")
+            return
+
+        thread = QThread(self)
+        worker = TTSReadyWarmupWorker(provider)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.failed.connect(self._handle_tts_ready_warmup_failed)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_tts_ready_warmup_worker)
+        self.tts_ready_warmup_thread = thread
+        self.tts_ready_warmup_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _handle_tts_ready_warmup_failed(self, message: str) -> None:
+        self._show_tts_error(message)
+
+    @Slot()
+    def _cleanup_tts_ready_warmup_worker(self) -> None:
+        self.tts_ready_warmup_thread = None
+        self.tts_ready_warmup_worker = None
 
     def _apply_startup_initializing_state(self) -> None:
         self.input_edit.setPlaceholderText(STARTUP_INITIALIZING_TEXT)
@@ -2105,19 +2409,20 @@ class PetWindow(QWidget):
     def _show_memory_status_message(self, status: str, message: str) -> None:
         self.memory_status_message_active = True
         self.memory_status_last_message = message
+        if status == "failed":
+            self._show_memory_failure_dialog(message)
         if (
             not self.startup_initializing
             and not self.active_interaction_id
             and not self.reply_history_review_active
         ):
             self.subtitle_controller.show_text_immediately(message)
-        if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
-            icon = (
-                QSystemTrayIcon.MessageIcon.Critical
-                if status == "failed"
-                else QSystemTrayIcon.MessageIcon.Information
-            )
-            self.tray_icon.showMessage("Sakura 长期记忆", message, icon, MEMORY_STATUS_DISPLAY_MS)
+
+    def _show_memory_failure_dialog(self, message: str) -> None:
+        if getattr(self, "memory_failure_dialog_last_message", "") == message:
+            return
+        self.memory_failure_dialog_last_message = message
+        show_themed_warning(self, "记忆模型下载失败", message)
 
     @Slot()
     def _show_pending_memory_status_after_startup(self) -> None:
@@ -2132,13 +2437,7 @@ class PetWindow(QWidget):
         self.subtitle_controller.show_text_immediately(self.memory_status_last_message)
 
     def _show_memory_ready_message(self, message: str) -> None:
-        if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
-            self.tray_icon.showMessage(
-                "Sakura 长期记忆",
-                message,
-                QSystemTrayIcon.MessageIcon.Information,
-                MEMORY_STATUS_DISPLAY_MS,
-            )
+        _ = message
         if not self.memory_status_message_active:
             return
         self.memory_status_message_active = False
@@ -2175,10 +2474,27 @@ class PetWindow(QWidget):
 
     def toggle_visible(self) -> None:
         if self.isVisible():
-            self.hide()
+            self._hide_to_tray()
         else:
-            self.show()
-            self.raise_()
+            self._show_from_tray()
+
+    @Slot()
+    def _hide_to_tray(self) -> None:
+        self.hidden_to_tray = True
+        self.hide()
+        self._refresh_tray_menu()
+
+    @Slot()
+    def _show_from_tray(self) -> None:
+        self.hidden_to_tray = False
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._refresh_tray_menu()
+
+    def _handle_application_activated(self) -> None:
+        if getattr(self, "hidden_to_tray", False):
+            QTimer.singleShot(0, self._show_from_tray)
 
     @Slot()
     def show_history(self) -> None:
@@ -2199,12 +2515,20 @@ class PetWindow(QWidget):
 
     def _save_history_to_memory_and_clear(self) -> None:
         if self.memory_curation_thread is not None:
-            QMessageBox.information(self, "整理中", "记忆整理已经在进行中，请稍后再试。")
+            if self.memory_curation_mode in {"auto", "backfill"}:
+                self.pending_history_clear_after_curation = True
+                show_themed_information(
+                    self,
+                    "整理中",
+                    "当前正在自动整理记忆，结束后会继续清空并保存历史。",
+                )
+                return
+            show_themed_information(self, "整理中", "记忆整理已经在进行中，请稍后再试。")
             if self.history_window is not None:
                 self.history_window.set_memory_save_busy(False)
             return
         if self.worker_thread is not None:
-            QMessageBox.information(self, "正在回复", "当前聊天还没处理完，稍后再整理历史。")
+            show_themed_information(self, "正在回复", "当前聊天还没处理完，稍后再整理历史。")
             if self.history_window is not None:
                 self.history_window.set_memory_save_busy(False)
             return
@@ -2214,12 +2538,46 @@ class PetWindow(QWidget):
                 self.history_window.set_memory_save_busy(False)
                 self.history_window.refresh()
             return
+        if not self._memory_store_ready_for_history_clear():
+            self._show_memory_not_ready_for_history_clear()
+            if self.history_window is not None:
+                self.history_window.set_memory_save_busy(False)
+            return
+        self._reset_memory_curation_cache_for_history_clear()
         self._start_memory_curation(
             entries,
             mode="history_clear",
             target_history_count=len(entries),
             consumed_turns=self.memory_curation_state.pending_turns(),
         )
+
+    def _memory_store_ready_for_history_clear(self) -> bool:
+        is_ready = getattr(self.memory_store, "is_ready", None)
+        if not callable(is_ready):
+            return True
+        try:
+            return bool(is_ready())
+        except Exception as exc:  # noqa: BLE001
+            debug_log("Memory", "检查长期记忆就绪状态失败", {"error": str(exc)})
+            return False
+
+    def _show_memory_not_ready_for_history_clear(self) -> None:
+        message = getattr(self, "memory_status_last_message", "") or (
+            "长期记忆系统还在初始化。首次启动或覆盖更新后，"
+            "可能需要准备本地嵌入模型，请稍等就绪后再试。"
+        )
+        show_themed_information(self, "记忆初始化中", message)
+
+    def _reset_memory_curation_cache_for_history_clear(self) -> None:
+        reset_cache = getattr(self.memory_store, "reset_curation_cache", None)
+        if not callable(reset_cache):
+            return
+        try:
+            reset_counts = reset_cache()
+        except Exception as exc:  # noqa: BLE001
+            debug_log("Memory", "重置 mem0 整理缓存失败", {"error": str(exc)})
+            return
+        debug_log("Memory", "已重置 mem0 整理缓存", reset_counts)
 
     @Slot()
     def show_settings(self) -> None:
@@ -2231,7 +2589,7 @@ class PetWindow(QWidget):
                 character_profile=self.character_profile,
             )
         except (OSError, TTSConfigError) as exc:
-            QMessageBox.warning(self, "配置读取失败", f"TTS 配置读取失败，将使用默认值打开设置：{exc}")
+            show_themed_warning(self, "配置读取失败", f"TTS 配置读取失败，将使用默认值打开设置：{exc}")
             tts_settings = self._default_tts_settings()
 
         dialog = SettingsDialog(
@@ -2244,7 +2602,8 @@ class PetWindow(QWidget):
             self.mcp_settings,
             self.debug_log_settings,
             self.memory_store,
-            self.plugin_manager.tools_tabs,
+            getattr(self.plugin_manager, "tools_tabs", []),
+            getattr(self.plugin_manager, "settings_panels", []),
             parent=self,
             portrait_scale_percent=self.portrait_scale_percent,
             subtitle_typing_interval_ms=self.subtitle_typing_interval_ms,
@@ -2293,7 +2652,7 @@ class PetWindow(QWidget):
         try:
             selected_profile = dialog_character_registry.get(dialog.result_character_id)
         except CharacterConfigError as exc:
-            QMessageBox.critical(self, "角色配置无效", str(exc))
+            show_themed_critical(self, "角色配置无效", str(exc))
             return
 
         new_tts_provider = self._create_tts_provider_from_settings(dialog.result_tts_settings)
@@ -2301,10 +2660,20 @@ class PetWindow(QWidget):
             return
 
         api_changed = dialog.result_api_settings != self.api_client.settings
+        theme_write_mode = getattr(dialog, "result_theme_write_mode", "unchanged")
+        should_write_character_theme = _should_write_character_theme(theme_write_mode, selected_profile)
         try:
             if api_changed:
                 self.settings_service.save_api_settings(dialog.result_api_settings)
             self.settings_service.save_tts_settings(dialog.result_tts_settings)
+            if should_write_character_theme:
+                save_character_theme(
+                    selected_profile,
+                    result_theme_settings,
+                    source=THEME_SOURCE_PACKAGE,
+                )
+                dialog_character_registry = CharacterRegistry(self.base_dir)
+                selected_profile = dialog_character_registry.get(selected_profile.id)
             self.character_registry = dialog_character_registry
             self.settings_service.save_current_character_id(
                 self.character_registry,
@@ -2325,8 +2694,8 @@ class PetWindow(QWidget):
                     "reply_segment_pause_ms": result_reply_segment_pause_ms,
                 },
             )
-        except OSError as exc:
-            QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
+        except (CharacterConfigError, OSError) as exc:
+            show_themed_critical(self, "保存失败", f"无法保存设置：{exc}")
             return
 
         if api_changed:
@@ -2357,6 +2726,9 @@ class PetWindow(QWidget):
         if callable(connect_tts_error_signal):
             connect_tts_error_signal(new_tts_provider)
         self._warm_up_tts_playback(new_tts_provider)
+        start_tts_ready_warmup = getattr(self, "_start_tts_ready_warmup", None)
+        if callable(start_tts_ready_warmup):
+            start_tts_ready_warmup(new_tts_provider)
         self._apply_character(selected_profile)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
@@ -2365,7 +2737,9 @@ class PetWindow(QWidget):
             message += "\n\n长期记忆系统正在后台刷新 API 配置。"
         if mcp_restart_required:
             message += "\n\nWindows MCP 开关需要重启 Sakura 后才会生效。"
-        QMessageBox.information(self, "保存成功", message)
+        if getattr(dialog, "result_plugin_config_changed", False):
+            message += "\n\n插件启用状态需要重启 Sakura 后才会生效。"
+        show_themed_information(self, "保存成功", message)
 
     @Slot(bool)
     def _toggle_chinese_subtitles(self, checked: bool) -> None:
@@ -2383,7 +2757,7 @@ class PetWindow(QWidget):
         except OSError as exc:
             self.subtitle_language = previous_language
             self._apply_speech_font()
-            QMessageBox.warning(self, "保存失败", f"无法保存字幕设置：{exc}")
+            show_themed_warning(self, "保存失败", f"无法保存字幕设置：{exc}")
             return
 
         self._apply_speech_font()
@@ -2418,7 +2792,7 @@ class PetWindow(QWidget):
                 },
             )
         except OSError as exc:
-            QMessageBox.warning(self, "保存失败", f"无法保存自主看屏幕设置：{exc}")
+            show_themed_warning(self, "保存失败", f"无法保存自主看屏幕设置：{exc}")
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
 
@@ -2440,7 +2814,7 @@ class PetWindow(QWidget):
             self._save_system_config_values("ui", {"always_on_top_enabled": checked})
         except OSError as exc:
             self.always_on_top_enabled = previous_enabled
-            QMessageBox.warning(self, "保存失败", f"无法保存置顶设置：{exc}")
+            show_themed_warning(self, "保存失败", f"无法保存置顶设置：{exc}")
             return
 
         self._apply_window_flags()
@@ -2470,7 +2844,7 @@ class PetWindow(QWidget):
             return provider
         except TTSConfigError as exc:
             debug_log("PetWindow", "TTS 配置无效", {"error": str(exc)})
-            QMessageBox.critical(self, "TTS 配置无效", f"无法启用 TTS，当前语音配置保持不变：{exc}")
+            show_themed_critical(self, "TTS 配置无效", f"无法启用 TTS，当前语音配置保持不变：{exc}")
             return None
 
     def _retire_tts_provider(self, provider: TTSProvider) -> None:
@@ -2669,25 +3043,37 @@ class PetWindow(QWidget):
         self.setWindowFlags(self._window_flags())
         if was_visible:
             self.show()
-            self._sync_native_topmost_state()
+            self._schedule_native_topmost_sync()
+
+    def _schedule_native_topmost_sync(self) -> None:
+        if sys.platform not in {"win32", "darwin"}:
+            return
+        QTimer.singleShot(0, self._sync_native_topmost_state)
 
     def _sync_native_topmost_state(self) -> None:
-        if sys.platform != "win32" or not self.isVisible():
+        if not self.isVisible():
             return
-        try:
-            import ctypes
+        if sys.platform == "win32":
+            try:
+                import ctypes
 
-            hwnd = int(self.winId())
-            hwnd_topmost = -1
-            hwnd_notopmost = -2
-            swp_no_size = 0x0001
-            swp_no_move = 0x0002
-            swp_no_activate = 0x0010
-            insert_after = hwnd_topmost if self.always_on_top_enabled else hwnd_notopmost
-            flags = swp_no_size | swp_no_move | swp_no_activate
-            ctypes.windll.user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
-        except Exception as exc:  # noqa: BLE001
-            debug_log("PetWindow", "同步原生置顶状态失败", {"error": str(exc)})
+                hwnd = int(self.winId())
+                hwnd_topmost = -1
+                hwnd_notopmost = -2
+                swp_no_size = 0x0001
+                swp_no_move = 0x0002
+                swp_no_activate = 0x0010
+                insert_after = hwnd_topmost if self.always_on_top_enabled else hwnd_notopmost
+                flags = swp_no_size | swp_no_move | swp_no_activate
+                ctypes.windll.user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
+            except Exception as exc:  # noqa: BLE001
+                debug_log("PetWindow", "同步原生置顶状态失败", {"error": str(exc)})
+            return
+        if sys.platform == "darwin":
+            try:
+                _set_macos_window_topmost(int(self.winId()), self.always_on_top_enabled)
+            except Exception as exc:  # noqa: BLE001
+                debug_log("PetWindow", "同步 macOS 原生置顶状态失败", {"error": str(exc)})
 
     def _apply_portrait_scale_percent(self, portrait_scale_percent: int) -> None:
         self.portrait_scale_percent = normalize_portrait_scale_percent(portrait_scale_percent)
@@ -2721,6 +3107,8 @@ class PetWindow(QWidget):
         self.setStyleSheet(pet_window_stylesheet(self.theme_settings))
         if self.history_window is not None:
             self.history_window.set_theme_settings(self.theme_settings)
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
 
     def _apply_character(self, profile: CharacterProfile) -> None:
         previous_character_id = self.character_profile.id
@@ -2731,10 +3119,10 @@ class PetWindow(QWidget):
         self.setWindowTitle(profile.display_name)
         self.name_label.setText(profile.display_name)
         self.input_edit.setPlaceholderText(f"和{profile.display_name}说点什么...")
-        portrait_pixmap = self.portrait_controller.set_profile(profile)
+        self.portrait_controller.set_profile(profile)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setToolTip(profile.display_name)
-            self.tray_icon.setIcon(QIcon(portrait_pixmap) if not portrait_pixmap.isNull() else QIcon())
+            self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
 
         self.history_store = self._create_history_store(profile)
         self.visual_observation_store = self._create_visual_observation_store(profile)
@@ -3011,8 +3399,16 @@ def _stage_size_for_portrait_scale_percent(portrait_scale_percent: int) -> tuple
     scale = normalize_portrait_scale_percent(portrait_scale_percent) / 100
     return (
         DEFAULT_STAGE_WIDTH,
-        max(DEFAULT_STAGE_HEIGHT, round(DEFAULT_STAGE_HEIGHT * scale)),
+        max(MIN_STAGE_HEIGHT, round(DEFAULT_STAGE_HEIGHT * scale)),
     )
+
+
+def _is_screen_change_event(event: object) -> bool:
+    """兼容旧版 Qt：缺少 ScreenChangeInternal 枚举时直接忽略。"""
+
+    screen_change_type = getattr(QEvent.Type, "ScreenChangeInternal", None)
+    event_type = getattr(event, "type", None)
+    return screen_change_type is not None and callable(event_type) and event_type() == screen_change_type
 
 
 def _configure_reply_history_panel(panel: QFrame) -> None:
@@ -3025,3 +3421,113 @@ def _configure_reply_history_button(button: QToolButton, *, text: str, tooltip: 
     button.setText(text)
     button.setFixedSize(REPLY_HISTORY_BUTTON_SIZE, REPLY_HISTORY_BUTTON_SIZE)
     button.setToolTip(tooltip)
+    button.setAutoRaise(False)
+
+
+def _build_status_tray_icon(color_text: str) -> QIcon:
+    color = QColor(color_text)
+    if not color.isValid():
+        color = QColor(DEFAULT_THEME_SETTINGS.primary_color)
+
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    painter.drawEllipse(3, 3, 26, 26)
+    painter.setPen(QColor("#ffffff"))
+    painter.setFont(_rounded_chinese_font(18, QFont.Weight.ExtraBold))
+    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "S")
+    painter.end()
+
+    return QIcon(pixmap)
+
+
+def _should_write_character_theme(theme_write_mode: object, profile: CharacterProfile) -> bool:
+    return theme_write_mode in {"manual", "ai"}
+
+
+def _theme_settings_for_character(
+    saved_settings: ThemeSettings,
+    profile: CharacterProfile,
+) -> ThemeSettings:
+    if profile.theme_source == THEME_SOURCE_PACKAGE:
+        return (profile.theme_settings or DEFAULT_THEME_SETTINGS).normalized()
+    return saved_settings.normalized()
+
+
+def _set_macos_window_topmost(window_id: int, enabled: bool) -> None:
+    """同步 macOS NSWindow 层级，确保置顶窗口能跟随当前 Space。"""
+
+    import ctypes
+    import ctypes.util
+
+    objc = ctypes.CDLL(ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib")
+    sel_register_name = objc.sel_registerName
+    sel_register_name.argtypes = [ctypes.c_char_p]
+    sel_register_name.restype = ctypes.c_void_p
+
+    def selector(name: bytes) -> int:
+        return int(sel_register_name(name))
+
+    def message(restype: object, *argtypes: object) -> object:
+        return ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)(
+            ("objc_msgSend", objc)
+        )
+
+    send_bool = message(ctypes.c_bool, ctypes.c_void_p)
+    send_ptr = message(ctypes.c_void_p)
+    send_level = message(None, ctypes.c_long)
+    send_hides_on_deactivate = message(None, ctypes.c_bool)
+    send_ulong = message(ctypes.c_ulong)
+    send_collection = message(None, ctypes.c_ulong)
+
+    obj = ctypes.c_void_p(window_id)
+    sel_window = selector(b"window")
+    sel_responds_to_selector = selector(b"respondsToSelector:")
+    if send_bool(obj, ctypes.c_void_p(sel_responds_to_selector), ctypes.c_void_p(sel_window)):
+        ns_window = send_ptr(obj, ctypes.c_void_p(sel_window))
+        if not ns_window:
+            return
+    else:
+        ns_window = window_id
+
+    ns_window_ptr = ctypes.c_void_p(int(ns_window))
+    ns_window_collection_behavior_can_join_all_spaces = 1 << 0
+    ns_window_collection_behavior_move_to_active_space = 1 << 1
+    ns_window_collection_behavior_full_screen_auxiliary = 1 << 8
+    ns_floating_window_level = 3
+    ns_modal_panel_window_level = 8
+
+    level = ns_modal_panel_window_level if enabled else ns_floating_window_level
+    send_level(ns_window_ptr, ctypes.c_void_p(selector(b"setLevel:")), level)
+
+    sel_set_hides_on_deactivate = selector(b"setHidesOnDeactivate:")
+    if send_bool(
+        ns_window_ptr,
+        ctypes.c_void_p(sel_responds_to_selector),
+        ctypes.c_void_p(sel_set_hides_on_deactivate),
+    ):
+        send_hides_on_deactivate(
+            ns_window_ptr,
+            ctypes.c_void_p(sel_set_hides_on_deactivate),
+            not enabled,
+        )
+
+    collection_behavior = int(send_ulong(ns_window_ptr, ctypes.c_void_p(selector(b"collectionBehavior"))))
+    if enabled:
+        collection_behavior |= (
+            ns_window_collection_behavior_can_join_all_spaces
+            | ns_window_collection_behavior_full_screen_auxiliary
+        )
+        collection_behavior &= ~ns_window_collection_behavior_move_to_active_space
+    else:
+        collection_behavior &= ~ns_window_collection_behavior_can_join_all_spaces
+        collection_behavior |= ns_window_collection_behavior_move_to_active_space
+    send_collection(
+        ns_window_ptr,
+        ctypes.c_void_p(selector(b"setCollectionBehavior:")),
+        collection_behavior,
+    )

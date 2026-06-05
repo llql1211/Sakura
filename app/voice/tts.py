@@ -26,6 +26,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from app.config.character_loader import CharacterProfile
 from app.llm.chat_reply import DEFAULT_TONE
 from app.core.debug_log import debug_log
+from app.voice.runtime_compat import find_usable_runtime_python, format_runtime_python_issue
 
 
 TTSCallback = Callable[[], None]
@@ -39,6 +40,7 @@ TTS_PROVIDER_CUSTOM_GPT_SOVITS = "custom-gpt-sovits"
 TTS_PROVIDER_GENIE = "genie-tts"
 DEFAULT_GPT_SOVITS_API_URL = "http://127.0.0.1:9880/tts"
 DEFAULT_GENIE_TTS_API_URL = "http://127.0.0.1:9881/"
+_LOCAL_SERVICE_STARTUP_TIMEOUT_MAX = 180
 _SUPPORTED_TTS_PROVIDERS = {
     TTS_PROVIDER_GPT_SOVITS,
     TTS_PROVIDER_CUSTOM_GPT_SOVITS,
@@ -230,6 +232,8 @@ class GPTSoVITSTTSSettings:
     gpt_model_path: Path | None = None
     sovits_model_path: Path | None = None
     work_dir: Path | None = None
+    python_path: Path | None = None
+    tts_config_path: Path | None = None
     character_name: str = ""
     onnx_model_dir: Path | None = None
     ref_lang: str = "ja"
@@ -248,6 +252,8 @@ class GPTSoVITSTTSSettings:
         timeout_seconds: int,
         provider: str = TTS_PROVIDER_GPT_SOVITS,
         work_dir: Path | None = None,
+        python_path: Path | None = None,
+        tts_config_path: Path | None = None,
         onnx_model_dir: Path | None = None,
         validate_enabled: bool = True,
     ) -> "GPTSoVITSTTSSettings":
@@ -264,6 +270,8 @@ class GPTSoVITSTTSSettings:
                 text_lang=text_lang,
                 timeout_seconds=timeout_seconds,
                 work_dir=work_dir,
+                python_path=python_path,
+                tts_config_path=tts_config_path,
                 character_name=character_profile.display_name or character_profile.id,
                 onnx_model_dir=onnx_model_dir,
             )
@@ -287,6 +295,8 @@ class GPTSoVITSTTSSettings:
             gpt_model_path=voice.gpt_model_path,
             sovits_model_path=voice.sovits_model_path,
             work_dir=work_dir,
+            python_path=python_path,
+            tts_config_path=tts_config_path,
             character_name=character_profile.display_name or character_profile.id,
             onnx_model_dir=onnx_model_dir,
             ref_lang=ref_lang,
@@ -303,6 +313,10 @@ class GPTSoVITSTTSSettings:
             raise TTSConfigError("缺少 TTS API URL。")
         if self.provider not in _SUPPORTED_TTS_PROVIDERS:
             raise TTSConfigError(f"不支持的 TTS Provider：{self.provider}")
+        if self.python_path is not None and not self.python_path.exists():
+            raise TTSConfigError(f"TTS Python 不存在：{self.python_path}")
+        if self.tts_config_path is not None and not self.tts_config_path.exists():
+            raise TTSConfigError(f"GPT-SoVITS 推理配置不存在：{self.tts_config_path}")
         if self.gpt_model_path is not None and not self.gpt_model_path.exists():
             raise TTSConfigError(f"GPT 模型不存在：{self.gpt_model_path}")
         if self.sovits_model_path is not None and not self.sovits_model_path.exists():
@@ -688,7 +702,8 @@ class GPTSoVITSTTSProvider(QObject):
             return False
 
         timeout = min(self.settings.timeout_seconds, 3)
-        if GPTSoVITSTTSProvider._probe_service_port(self, host, port, timeout):
+        probe_purpose = "pre_start_check" if self.settings.work_dir is not None else "availability_check"
+        if GPTSoVITSTTSProvider._probe_service_port(self, host, port, timeout, purpose=probe_purpose):
             GPTSoVITSTTSProvider._adopt_existing_local_service(self, host, port)
             self._service_checked = True
             debug_log("TTS", "服务探测成功", {"api_url": self.settings.api_url})
@@ -701,7 +716,8 @@ class GPTSoVITSTTSProvider(QObject):
         if not GPTSoVITSTTSProvider._start_local_service(self, fail_callback):
             return False
 
-        deadline = time.monotonic() + max(3, min(self.settings.timeout_seconds, 30))
+        # 大模型首次加载可能超过 30 秒，按用户配置等待，避免刚加载完成就被杀掉。
+        deadline = time.monotonic() + max(3, min(self.settings.timeout_seconds, _LOCAL_SERVICE_STARTUP_TIMEOUT_MAX))
         while time.monotonic() < deadline:
             exit_code = self._server_process.poll() if self._server_process is not None else None
             if exit_code is not None:
@@ -711,7 +727,7 @@ class GPTSoVITSTTSProvider(QObject):
                     f"请查看启动日志：{log_path}"
                 )
                 return False
-            if GPTSoVITSTTSProvider._probe_service_port(self, host, port, timeout):
+            if GPTSoVITSTTSProvider._probe_service_port(self, host, port, timeout, purpose="startup_wait"):
                 self._service_checked = True
                 debug_log(
                     "TTS",
@@ -758,20 +774,31 @@ class GPTSoVITSTTSProvider(QObject):
             return
         self._adopt_existing_local_service(host, port)
 
-    def _probe_service_port(self, host: str, port: int, timeout: int) -> bool:
+    def _probe_service_port(self, host: str, port: int, timeout: int, *, purpose: str = "availability_check") -> bool:
+        service_name = _tts_service_display_name(self.settings.provider)
+        payload = {
+            "api_url": self.settings.api_url,
+            "host": host,
+            "port": port,
+            "purpose": purpose,
+        }
         try:
             debug_log(
                 "TTS",
-                "探测 GPT-SoVITS 端口",
-                {"api_url": self.settings.api_url, "host": host, "port": port},
+                f"探测 {service_name} 端口",
+                payload,
             )
             with socket.create_connection((host, port), timeout=timeout):
                 pass
         except TimeoutError:
-            debug_log("TTS", "服务探测超时", {"api_url": self.settings.api_url})
+            debug_log("TTS", _probe_failure_message(service_name, purpose, timeout=True), payload)
             return False
         except OSError as exc:
-            debug_log("TTS", "服务不可用", {"reason": str(exc), "api_url": self.settings.api_url})
+            debug_log(
+                "TTS",
+                _probe_failure_message(service_name, purpose, timeout=False),
+                {**payload, "reason": str(exc)},
+            )
             return False
         return True
 
@@ -780,13 +807,21 @@ class GPTSoVITSTTSProvider(QObject):
         if work_dir is None:
             return False
         work_dir = work_dir.resolve()
-        python_exe = work_dir / "runtime" / "python.exe"
+        runtime_dir = work_dir / "runtime"
+        python_exe = self.settings.python_path
+        if python_exe is not None:
+            python_exe = python_exe.resolve()
+        else:
+            python_exe = find_usable_runtime_python(runtime_dir)
         api_script = work_dir / "api_v2.py"
         if not work_dir.is_dir():
             fail_callback(f"GPT-SoVITS 工作目录不存在：{work_dir}")
             return False
+        if python_exe is None:
+            fail_callback(f"GPT-SoVITS 运行时不可用：{format_runtime_python_issue(runtime_dir)}")
+            return False
         if not python_exe.is_file():
-            fail_callback(f"GPT-SoVITS 运行时不存在：{python_exe}")
+            fail_callback(f"GPT-SoVITS Python 不存在：{python_exe}")
             return False
         if not api_script.is_file():
             fail_callback(f"GPT-SoVITS 启动脚本不存在：{api_script}")
@@ -809,7 +844,10 @@ class GPTSoVITSTTSProvider(QObject):
                 log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 GPT-SoVITS：{work_dir}\n")
                 log_file.flush()
                 kwargs["stdout"] = log_file
-                self._server_process = subprocess.Popen([str(python_exe), str(api_script)], **kwargs)
+                self._server_process = subprocess.Popen(
+                    _build_gpt_sovits_start_command(python_exe, api_script, self.settings),
+                    **kwargs,
+                )
         except OSError as exc:
             debug_log("TTS", "本地 GPT-SoVITS 服务启动失败", {"work_dir": str(work_dir), "error": str(exc)})
             fail_callback(f"GPT-SoVITS 服务启动失败：{exc}")
@@ -1319,7 +1357,8 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
             return False
 
         timeout = min(self.settings.timeout_seconds, 3)
-        if GenieTTSProvider._probe_service_port(self, host, port, timeout):
+        probe_purpose = "pre_start_check" if self.settings.work_dir is not None else "availability_check"
+        if GenieTTSProvider._probe_service_port(self, host, port, timeout, purpose=probe_purpose):
             if GenieTTSProvider._probe_genie_api(self, timeout):
                 GenieTTSProvider._adopt_existing_local_service(self, host, port)
                 self._service_checked = True
@@ -1341,7 +1380,7 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
                 {"old_api_url": old_api_url, "api_url": self.settings.api_url},
             )
             if (
-                GenieTTSProvider._probe_service_port(self, host, port, timeout)
+                GenieTTSProvider._probe_service_port(self, host, port, timeout, purpose=probe_purpose)
                 and GenieTTSProvider._probe_genie_api(self, timeout)
             ):
                 GenieTTSProvider._adopt_existing_local_service(self, host, port)
@@ -1356,13 +1395,13 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
         if not GenieTTSProvider._start_local_service(self, fail_callback, host, port):
             return False
 
-        deadline = time.monotonic() + max(3, min(self.settings.timeout_seconds, 30))
+        deadline = time.monotonic() + max(3, min(self.settings.timeout_seconds, _LOCAL_SERVICE_STARTUP_TIMEOUT_MAX))
         while time.monotonic() < deadline:
             if self._server_process is not None and self._server_process.poll() is not None:
                 fail_callback(f"Genie TTS 本地服务进程已退出，退出码：{self._server_process.poll()}")
                 return False
             if (
-                GenieTTSProvider._probe_service_port(self, host, port, timeout)
+                GenieTTSProvider._probe_service_port(self, host, port, timeout, purpose="startup_wait")
                 and GenieTTSProvider._probe_genie_api(self, timeout)
             ):
                 self._service_checked = True
@@ -1382,12 +1421,13 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
         if work_dir is None:
             return False
         work_dir = work_dir.resolve()
-        python_exe = work_dir / "runtime" / "python.exe"
+        runtime_dir = work_dir / "runtime"
+        python_exe = find_usable_runtime_python(runtime_dir)
         if not work_dir.is_dir():
             fail_callback(f"Genie TTS 工作目录不存在：{work_dir}")
             return False
-        if not python_exe.is_file():
-            fail_callback(f"Genie TTS 运行时不存在：{python_exe}")
+        if python_exe is None:
+            fail_callback(f"Genie TTS 运行时不可用：{format_runtime_python_issue(runtime_dir)}")
             return False
 
         if self._server_process is not None and self._server_process.poll() is None:
@@ -1516,9 +1556,10 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
         if converter_script is None:
             fail_callback(f"Genie TTS 工作目录缺少 convert.py/convery.py：{self.settings.work_dir}")
             return False
-        python_exe = converter_script.parent / "runtime" / "python.exe"
-        if not python_exe.is_file():
-            fail_callback(f"Genie TTS 转换运行时不存在：{python_exe}")
+        runtime_dir = converter_script.parent / "runtime"
+        python_exe = find_usable_runtime_python(runtime_dir)
+        if python_exe is None:
+            fail_callback(f"Genie TTS 转换运行时不可用：{format_runtime_python_issue(runtime_dir)}")
             return False
 
         onnx_dir.mkdir(parents=True, exist_ok=True)
@@ -1667,7 +1708,8 @@ def _command_line_matches_local_tts(
         return False
 
     normalized_command = _normalize_process_text(command_line)
-    python_exe = _normalize_process_text(str(work_dir.resolve() / "runtime" / "python.exe"))
+    configured_python = settings.python_path.resolve() if settings.python_path is not None else None
+    python_exe = _normalize_process_text(str(configured_python or work_dir.resolve() / "runtime" / "python.exe"))
     if python_exe not in normalized_command:
         return False
 
@@ -1768,6 +1810,28 @@ def _build_genie_start_command(python_exe: Path, host: str, port: int) -> list[s
     return [str(python_exe), "-c", start_code]
 
 
+def _build_gpt_sovits_start_command(
+    python_exe: Path,
+    api_script: Path,
+    settings: GPTSoVITSTTSSettings,
+) -> list[str]:
+    cmd = [str(python_exe), str(api_script)]
+    if settings.tts_config_path is not None:
+        cmd.extend(["-c", str(settings.tts_config_path)])
+
+    parsed_url = urlparse(settings.api_url)
+    if parsed_url.hostname:
+        host = "127.0.0.1" if parsed_url.hostname == "localhost" else parsed_url.hostname
+        cmd.extend(["-a", host])
+    try:
+        port = parsed_url.port
+    except ValueError:
+        port = None
+    if port is not None:
+        cmd.extend(["-p", str(port)])
+    return cmd
+
+
 def _probe_tcp_port(host: str, port: int, timeout: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -1831,6 +1895,21 @@ def _can_bind_local_port(host: str, port: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _tts_service_display_name(provider: str) -> str:
+    normalized = _normalize_tts_provider(provider)
+    if normalized == TTS_PROVIDER_GENIE:
+        return "Genie TTS"
+    return "GPT-SoVITS"
+
+
+def _probe_failure_message(service_name: str, purpose: str, *, timeout: bool) -> str:
+    if purpose == "startup_wait":
+        return f"本地 {service_name} 服务尚未就绪，继续等待"
+    if purpose == "pre_start_check":
+        return f"{service_name} 服务当前未响应，准备尝试启动本地服务"
+    return "服务探测超时" if timeout else "服务不可用"
 
 
 def _local_tts_service_log_path(provider: str) -> Path:

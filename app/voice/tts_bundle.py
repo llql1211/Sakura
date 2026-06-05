@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
+import os
 import platform
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -13,9 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from app.voice.runtime_compat import current_platform_label, current_system_name, find_usable_runtime_python
+
 
 ProgressCallback = Callable[[int], None]
 StatusCallback = Callable[[str], None]
+MigrationProgressCallback = Callable[["TTSBundleMigrationProgress"], None]
 
 class DownloadCancelledError(Exception):
     """用户主动取消下载时抛出此异常，调用方据此判断是用户取消而非真正的错误。"""
@@ -37,17 +43,52 @@ class UrlOpenCallable(Protocol):
 class TTSBundleEntry:
     key: str
     label: str
-    filename: str
-    download_url: str
-    size: int
-    sha256: str
+    filename: str = ""
+    download_url: str = ""
+    size: int = 0
+    sha256: str = ""
     provider: str = "gpt-sovits"
+    supported_systems: tuple[str, ...] = ()
+    install_method: str = "archive"
+    installer_script: str | None = None
+    work_dir_name: str | None = None
+    python_path_name: str | None = None
+    tts_config_path_name: str | None = None
+
+
+@dataclass(frozen=True)
+class TTSBundleInstallResult:
+    work_dir: Path
+    provider: str
+    python_path: Path | None = None
+    tts_config_path: Path | None = None
 
 
 @dataclass(frozen=True)
 class GPUInfo:
     name: str
     vram_gb: float
+
+
+@dataclass(frozen=True)
+class TTSBundleMigration:
+    """内置 TTS 整合包从旧深目录迁移到短目录所需的信息。"""
+
+    entry: TTSBundleEntry
+    source_dir: Path
+    target_dir: Path
+
+
+@dataclass(frozen=True)
+class TTSBundleMigrationProgress:
+    """TTS 整合包迁移进度。"""
+
+    entry: TTSBundleEntry
+    current_file: str
+    completed_files: int
+    total_files: int
+    copied_bytes: int
+    total_bytes: int
 
 
 GENIE_TTS = TTSBundleEntry(
@@ -61,6 +102,7 @@ GENIE_TTS = TTSBundleEntry(
     size=1041915345,
     sha256="8f06077b6102aa29f1c9473926db9a74890d627f077393aa8ebb928b52f15de1",
     provider="genie-tts",
+    supported_systems=("windows",),
 )
 GPT_SOVITS_STANDARD = TTSBundleEntry(
     key="gpt_sovits_v2pro",
@@ -72,6 +114,7 @@ GPT_SOVITS_STANDARD = TTSBundleEntry(
     ),
     size=8185086602,
     sha256="bd60d0796553ff05d8568136e199c13e0dc22ebe2ed24273134e34ed6f215cd6",
+    supported_systems=("windows",),
 )
 GPT_SOVITS_NVIDIA50 = TTSBundleEntry(
     key="gpt_sovits_nvidia50",
@@ -83,11 +126,37 @@ GPT_SOVITS_NVIDIA50 = TTSBundleEntry(
     ),
     size=8835144925,
     sha256="97b4edcd451c42357db7e26e6c1c877ca5d85144fe97beaff6d7005d35bee008",
+    supported_systems=("windows",),
+)
+GPT_SOVITS_MACOS_INSTALLER = TTSBundleEntry(
+    key="gpt_sovits_macos",
+    label="GPT-SoVITS macOS 源码安装包",
+    provider="custom-gpt-sovits",
+    supported_systems=("macos",),
+    install_method="script",
+    installer_script="scripts/install_gpt_sovits_macos.sh",
+    work_dir_name="GPT-SoVITS",
+    python_path_name="miniforge3/envs/gpt-sovits310/bin/python",
+    tts_config_path_name="GPT-SoVITS/GPT_SoVITS/configs/tts_infer_sakura_macos.yaml",
 )
 GPT_SOVITS_BUNDLES = (GPT_SOVITS_STANDARD, GPT_SOVITS_NVIDIA50)
-TTS_BUNDLES = (GENIE_TTS, GPT_SOVITS_STANDARD, GPT_SOVITS_NVIDIA50)
+TTS_BUNDLES = (GENIE_TTS, GPT_SOVITS_STANDARD, GPT_SOVITS_NVIDIA50, GPT_SOVITS_MACOS_INSTALLER)
 MIN_GPT_SOVITS_VRAM_GB = 6.0
 _GPT_SOVITS_VRAM_TOLERANCE_GB = 0.25
+_SYSTEM_LABELS = {
+    "windows": "Windows",
+    "macos": "macOS",
+    "linux": "Linux",
+}
+_SHORT_BUNDLE_DIRS = {
+    GENIE_TTS.key: "cpu",
+    GPT_SOVITS_STANDARD.key: "gpt",
+    GPT_SOVITS_NVIDIA50.key: "g50",
+}
+_MIGRATING_DIR_NAME = ".migrating"
+_MIGRATION_STATE_FILE = ".sakura_migration.json"
+_MIGRATION_TEMP_SUFFIX = ".__sakura_tmp__"
+_MIGRATION_COPY_CHUNK_SIZE = 16 * 1024 * 1024
 
 
 def format_platform_summary() -> str:
@@ -136,12 +205,22 @@ def list_nvidia_gpus() -> list[GPUInfo]:
 
 
 def format_gpu_summary(gpus: list[GPUInfo]) -> str:
+    if not compatible_tts_bundles():
+        return (
+            f"当前平台 {current_platform_label()} 暂无可一键下载的 TTS 整合包；"
+            "可在设置中选择“自定义 GPT-SoVITS（macOS/Linux）”接入本机源码版运行环境。"
+        )
     if not gpus:
+        recommended = recommend_tts_bundle(gpus)
+        if recommended is not None and recommended != GENIE_TTS:
+            return f"未检测到 NVIDIA GPU，将推荐 {format_bundle_label(recommended)}。"
         return "未检测到 NVIDIA GPU，将推荐 Genie TTS CPU 整合包。"
     return "\n".join(f"#{i} NVIDIA | {gpu.name} | {gpu.vram_gb} GB" for i, gpu in enumerate(gpus, start=1))
 
 
 def format_bundle_size(entry: TTSBundleEntry) -> str:
+    if entry.install_method == "script":
+        return "在线安装"
     gb = entry.size / 1_000_000_000
     if gb >= 1:
         return f"约 {gb:.1f} GB"
@@ -149,36 +228,75 @@ def format_bundle_size(entry: TTSBundleEntry) -> str:
 
 
 def format_bundle_label(entry: TTSBundleEntry) -> str:
-    return f"{entry.label}（{format_bundle_size(entry)}）"
+    details = [format_bundle_size(entry)]
+    if entry.supported_systems:
+        details.append(f"仅 {format_supported_systems(entry.supported_systems)}")
+    return f"{entry.label}（{'，'.join(details)}）"
 
 
-def recommend_gpt_sovits_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry:
+def format_supported_systems(supported_systems: tuple[str, ...]) -> str:
+    if not supported_systems:
+        return "全部平台"
+    return "、".join(_SYSTEM_LABELS.get(system, system) for system in supported_systems)
+
+
+def is_bundle_supported(entry: TTSBundleEntry) -> bool:
+    supported_systems = tuple(system.lower() for system in entry.supported_systems)
+    return not supported_systems or current_system_name() in supported_systems
+
+
+def compatible_tts_bundles() -> tuple[TTSBundleEntry, ...]:
+    return tuple(entry for entry in TTS_BUNDLES if is_bundle_supported(entry))
+
+
+def recommend_gpt_sovits_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry | None:
+    compatible_gpt_bundles = tuple(entry for entry in GPT_SOVITS_BUNDLES if is_bundle_supported(entry))
+    if not compatible_gpt_bundles:
+        return None
     gpus = list_nvidia_gpus() if gpus is None else gpus
-    if any(_is_rtx_50_series(gpu.name) for gpu in gpus):
+    if GPT_SOVITS_NVIDIA50 in compatible_gpt_bundles and any(_is_rtx_50_series(gpu.name) for gpu in gpus):
         return GPT_SOVITS_NVIDIA50
+    if GPT_SOVITS_STANDARD not in compatible_gpt_bundles:
+        return compatible_gpt_bundles[0]
     return GPT_SOVITS_STANDARD
 
 
-def recommend_tts_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry:
+def recommend_tts_bundle(gpus: list[GPUInfo] | None = None) -> TTSBundleEntry | None:
+    compatible_bundles = compatible_tts_bundles()
+    if not compatible_bundles:
+        return None
     gpus = list_nvidia_gpus() if gpus is None else gpus
     capable_nvidia = [gpu for gpu in gpus if _has_gpt_sovits_vram(gpu)]
     if not capable_nvidia:
-        return GENIE_TTS
-    if any(_is_rtx_50_series(gpu.name) for gpu in capable_nvidia):
+        return GENIE_TTS if GENIE_TTS in compatible_bundles else compatible_bundles[0]
+    if GPT_SOVITS_NVIDIA50 in compatible_bundles and any(_is_rtx_50_series(gpu.name) for gpu in capable_nvidia):
         return GPT_SOVITS_NVIDIA50
-    return GPT_SOVITS_STANDARD
+    return GPT_SOVITS_STANDARD if GPT_SOVITS_STANDARD in compatible_bundles else compatible_bundles[0]
 
 
 def default_bundle_work_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
     """返回整合包对应的工作目录；已安装时解析真实解压根目录，未安装时返回预期目录。"""
 
-    installed_dir = base_dir / "data" / "tts_bundles" / "installed" / entry.key
-    if installed_dir.is_dir():
+    if entry.install_method == "script":
+        installed_dir = base_dir / "data" / "tts_bundles" / "installed" / entry.key
+        if entry.work_dir_name:
+            return installed_dir / entry.work_dir_name
+        return installed_dir
+
+    short_dir = _short_bundle_install_dir(entry, base_dir)
+    if _is_installed_bundle_ready(short_dir):
         try:
-            return _resolve_extracted_root(installed_dir)
+            return _resolve_extracted_root(short_dir)
         except OSError:
             pass
-    return installed_dir / Path(entry.filename).stem
+
+    legacy_dir = _legacy_bundle_install_dir(entry, base_dir)
+    if _is_installed_bundle_ready(legacy_dir):
+        try:
+            return _resolve_extracted_root(legacy_dir)
+        except OSError:
+            pass
+    return short_dir
 
 
 def default_provider_bundle_work_dir(provider: str, base_dir: Path) -> Path | None:
@@ -186,26 +304,199 @@ def default_provider_bundle_work_dir(provider: str, base_dir: Path) -> Path | No
 
     normalized = provider.strip().lower().replace("_", "-")
     if normalized in {"genie", "genie-tts", "genietts"}:
-        return default_bundle_work_dir(GENIE_TTS, base_dir)
+        return default_bundle_work_dir(GENIE_TTS, base_dir) if is_bundle_supported(GENIE_TTS) else None
     if normalized not in {"gpt-sovits", "gpt-so-vits", "gptsovits"}:
         return None
 
+    if not any(is_bundle_supported(entry) for entry in GPT_SOVITS_BUNDLES):
+        return None
     for entry in GPT_SOVITS_BUNDLES:
-        installed_dir = base_dir / "data" / "tts_bundles" / "installed" / entry.key
-        if _is_installed_bundle_ready(installed_dir):
+        if not is_bundle_supported(entry):
+            continue
+        if _is_bundle_installed(entry, base_dir):
             return default_bundle_work_dir(entry, base_dir)
     recommended = recommend_gpt_sovits_bundle()
-    return default_bundle_work_dir(recommended, base_dir)
+    return default_bundle_work_dir(recommended, base_dir) if recommended is not None else None
 
 
 def is_provider_bundle_work_dir(path: Path, base_dir: Path) -> bool:
     """判断路径是否位于内置 TTS 整合包安装目录下。"""
 
+    resolved = path.resolve()
+    for root in (
+        (base_dir / "tts").resolve(),
+        (base_dir / "data" / "tts_bundles" / "installed").resolve(),
+    ):
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def find_pending_bundle_migrations(base_dir: Path, provider: str | None = None) -> list[TTSBundleMigration]:
+    """查找需要从旧深目录迁移到短目录的内置 TTS 整合包。"""
+
+    migrations: list[TTSBundleMigration] = []
+    for entry in _entries_for_provider(provider):
+        target_dir = _short_bundle_install_dir(entry, base_dir)
+        if _is_installed_bundle_ready(target_dir):
+            _cleanup_migration_work_dir(TTSBundleMigration(entry=entry, source_dir=target_dir, target_dir=target_dir))
+            continue
+        legacy_dir = _legacy_bundle_install_dir(entry, base_dir)
+        if not _is_installed_bundle_ready(legacy_dir):
+            continue
+        try:
+            source_dir = _resolve_extracted_root(legacy_dir)
+        except OSError:
+            continue
+        migrations.append(TTSBundleMigration(entry=entry, source_dir=source_dir, target_dir=target_dir))
+    return migrations
+
+
+def migrate_bundle_to_short_path(
+    migration: TTSBundleMigration,
+    *,
+    on_progress: MigrationProgressCallback | None = None,
+) -> Path:
+    """执行单个整合包迁移；失败时保留旧目录和中间目录供下次续迁。"""
+
+    if migration.target_dir.exists():
+        if _is_installed_bundle_ready(migration.target_dir):
+            _cleanup_migration_work_dir(migration)
+            return _resolve_extracted_root(migration.target_dir)
+        _remove_invalid_bundle_target(migration.target_dir)
+    migration.target_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if _try_fast_migration_rename(migration):
+        source_parent = migration.source_dir.parent
+        _remove_empty_legacy_parents(source_parent)
+        return migration.target_dir.resolve()
+
+    work_dir = _migration_work_dir(migration)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    plan = _migration_file_plan(migration.source_dir)
+    total_files = len(plan)
+    total_bytes = sum(size for _relative, size in plan)
+    copied_files = 0
+    copied_bytes = 0
+    _write_migration_state(
+        migration,
+        total_files=total_files,
+        total_bytes=total_bytes,
+        completed_files=0,
+        copied_bytes=0,
+        current_file="",
+    )
+
+    for relative_path, size in plan:
+        source = migration.source_dir / relative_path
+        target = work_dir / relative_path
+        current_file = relative_path.as_posix()
+        if _migration_target_file_ready(source, target, size):
+            copied_files += 1
+            copied_bytes += size
+            _emit_migration_progress(
+                on_progress,
+                migration,
+                current_file=current_file,
+                completed_files=copied_files,
+                total_files=total_files,
+                copied_bytes=copied_bytes,
+                total_bytes=total_bytes,
+            )
+            _write_migration_state(
+                migration,
+                total_files=total_files,
+                total_bytes=total_bytes,
+                completed_files=copied_files,
+                copied_bytes=copied_bytes,
+                current_file=current_file,
+            )
+            continue
+
+        _copy_file_resumable(source, target)
+        copied_files += 1
+        copied_bytes += size
+        _emit_migration_progress(
+            on_progress,
+            migration,
+            current_file=current_file,
+            completed_files=copied_files,
+            total_files=total_files,
+            copied_bytes=copied_bytes,
+            total_bytes=total_bytes,
+        )
+        _write_migration_state(
+            migration,
+            total_files=total_files,
+            total_bytes=total_bytes,
+            completed_files=copied_files,
+            copied_bytes=copied_bytes,
+            current_file=current_file,
+        )
+
+    _migration_state_path(work_dir).unlink(missing_ok=True)
+    work_dir.replace(migration.target_dir)
+    source_parent = migration.source_dir.parent
+    shutil.rmtree(migration.source_dir, ignore_errors=True)
+    _remove_empty_legacy_parents(source_parent)
+    return migration.target_dir.resolve()
+
+
+def normalize_bundle_work_dir(path: Path | None, base_dir: Path) -> Path | None:
+    """把旧内置整合包路径归一到已迁移后的短路径。"""
+
+    if path is None:
+        return None
     try:
-        path.resolve().relative_to((base_dir / "data" / "tts_bundles" / "installed").resolve())
-    except ValueError:
-        return False
-    return True
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for entry in TTS_BUNDLES:
+        target_dir = _short_bundle_install_dir(entry, base_dir)
+        if not _is_installed_bundle_ready(target_dir):
+            continue
+        legacy_dir = _legacy_bundle_install_dir(entry, base_dir)
+        try:
+            resolved.relative_to(legacy_dir.resolve())
+        except ValueError:
+            continue
+        return _resolve_extracted_root(target_dir)
+    return path
+
+
+def install_tts_bundle(
+    entry: TTSBundleEntry,
+    base_dir: Path,
+    *,
+    check_cancel: Callable[[], None] | None = None,
+    on_progress: ProgressCallback | None = None,
+    on_status: StatusCallback | None = None,
+    urlopen: UrlOpenCallable = urllib.request.urlopen,
+    extractor: Callable[[Path, Path], str | None] | None = None,
+) -> TTSBundleInstallResult:
+    if entry.install_method == "archive":
+        work_dir = download_and_extract_bundle(
+            entry,
+            base_dir,
+            check_cancel=check_cancel,
+            on_progress=on_progress,
+            on_status=on_status,
+            urlopen=urlopen,
+            extractor=extractor,
+        )
+        return TTSBundleInstallResult(work_dir=work_dir, provider=entry.provider)
+    if entry.install_method == "script":
+        return _run_script_bundle_installer(
+            entry,
+            base_dir,
+            check_cancel=check_cancel,
+            on_progress=on_progress,
+            on_status=on_status,
+        )
+    raise RuntimeError(f"不支持的 TTS 整合包安装方式：{entry.install_method}")
 
 
 def download_and_extract_bundle(
@@ -218,9 +509,18 @@ def download_and_extract_bundle(
     urlopen: UrlOpenCallable = urllib.request.urlopen,
     extractor: Callable[[Path, Path], str | None] | None = None,
 ) -> Path:
-    bundle_base = base_dir / "data" / "tts_bundles"
-    downloads_dir = bundle_base / "downloads"
-    installed_dir = bundle_base / "installed" / entry.key
+    if entry.install_method != "archive":
+        raise RuntimeError(f"{entry.label} 不是压缩包整合包，请使用安装器入口。")
+    if not is_bundle_supported(entry):
+        raise RuntimeError(
+            f"{entry.label} 不支持当前平台：{current_platform_label()}；"
+            f"支持平台：{format_supported_systems(entry.supported_systems)}。"
+        )
+
+    bundle_base = base_dir / "tts"
+    downloads_dir = bundle_base / "_dl"
+    tmp_dir = bundle_base / "_tmp" / entry.key
+    installed_dir = _short_bundle_install_dir(entry, base_dir)
     downloads_dir.mkdir(parents=True, exist_ok=True)
     archive = downloads_dir / entry.filename
 
@@ -232,36 +532,419 @@ def download_and_extract_bundle(
     _emit_progress(on_progress, _DOWNLOAD_PROGRESS_END)
 
     _emit_status(on_status, "extract")
-    if installed_dir.exists():
-        shutil.rmtree(installed_dir, ignore_errors=True)
-    installed_dir.mkdir(parents=True, exist_ok=True)
+    _reset_extract_dir(tmp_dir)
     extract = extractor or _extract_archive
-    error = extract(archive, installed_dir)
+    error = extract(archive, tmp_dir)
     if error is not None:
         raise RuntimeError(f"解压 TTS 整合包失败：{error}")
+    work_dir = _replace_installed_bundle_from_extract(tmp_dir, installed_dir)
     _emit_status(on_status, "cleanup")
     _cleanup_archive(archive)
     _emit_progress(on_progress, 100)
-    return _resolve_extracted_root(installed_dir)
+    return work_dir
 
 
 def cleanup_stale_download_archives(base_dir: Path) -> list[Path]:
     """清理旧版本解压成功后遗留在下载目录里的整合包压缩包。"""
-    bundle_base = base_dir / "data" / "tts_bundles"
-    downloads_dir = bundle_base / "downloads"
-    installed_base = bundle_base / "installed"
-    if not downloads_dir.is_dir():
-        return []
 
     cleaned: list[Path] = []
     for entry in TTS_BUNDLES:
-        archive = downloads_dir / entry.filename
-        installed_dir = installed_base / entry.key
-        if not archive.is_file() or not _is_installed_bundle_ready(installed_dir):
+        if entry.install_method != "archive" or not entry.filename:
             continue
-        _cleanup_archive(archive)
-        cleaned.append(archive)
+        if not _is_bundle_installed(entry, base_dir):
+            continue
+        for downloads_dir in (base_dir / "tts" / "_dl", base_dir / "data" / "tts_bundles" / "downloads"):
+            archive = downloads_dir / entry.filename
+            if not archive.is_file():
+                continue
+            _cleanup_archive(archive)
+            cleaned.append(archive)
     return cleaned
+
+
+def _run_script_bundle_installer(
+    entry: TTSBundleEntry,
+    base_dir: Path,
+    *,
+    check_cancel: Callable[[], None] | None,
+    on_progress: ProgressCallback | None,
+    on_status: StatusCallback | None,
+) -> TTSBundleInstallResult:
+    if not is_bundle_supported(entry):
+        raise RuntimeError(
+            f"{entry.label} 不支持当前平台：{current_platform_label()}；"
+            f"支持平台：{format_supported_systems(entry.supported_systems)}。"
+        )
+    if not entry.installer_script:
+        raise RuntimeError(f"{entry.label} 缺少安装脚本。")
+
+    script = _resolve_installer_script(entry.installer_script, base_dir)
+    bundle_base = base_dir / "data" / "tts_bundles"
+    installed_dir = bundle_base / "installed" / entry.key
+    install_tmp_dir = bundle_base / "tmp" / entry.key
+    downloads_dir = bundle_base / "downloads"
+    if install_tmp_dir.exists():
+        shutil.rmtree(install_tmp_dir, ignore_errors=True)
+    install_tmp_dir.mkdir(parents=True, exist_ok=True)
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+
+    _emit_status(on_status, "install")
+    _emit_progress(on_progress, 0)
+    env = os.environ.copy()
+    env["SAKURA_TTS_INSTALL_DIR"] = str(install_tmp_dir)
+    env["SAKURA_TTS_DOWNLOADS_DIR"] = str(downloads_dir)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    cmd = ["bash", str(script), str(install_tmp_dir)]
+    popen_kwargs: dict[str, Any] = {
+        "args": cmd,
+        "cwd": str(base_dir),
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = _WIN_NO_WINDOW
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    process: subprocess.Popen[str] | None = None
+    tail: list[str] = []
+    try:
+        process = subprocess.Popen(**popen_kwargs)
+        assert process.stdout is not None
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if line:
+                    tail.append(line)
+                    tail = tail[-20:]
+                    _handle_installer_progress_line(line, on_progress=on_progress, on_status=on_status)
+                if check_cancel is not None:
+                    check_cancel()
+        except Exception:
+            _terminate_process_tree(process)
+            raise
+        finally:
+            process.stdout.close()
+
+        return_code = process.wait()
+        if return_code != 0:
+            detail = "\n".join(tail) or f"exit {return_code}"
+            raise RuntimeError(f"{entry.label} 安装失败：\n{detail}"[:2000])
+
+        _build_script_install_result(entry, install_tmp_dir)
+        _replace_installed_bundle_dir(install_tmp_dir, installed_dir)
+        result = _build_script_install_result(entry, installed_dir)
+        _emit_status(on_status, "cleanup")
+        _emit_progress(on_progress, 100)
+        return result
+    except Exception:
+        if process is not None:
+            _terminate_process_tree(process)
+        shutil.rmtree(install_tmp_dir, ignore_errors=True)
+        raise
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if sys.platform == "win32":
+        process.terminate()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.terminate()
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if sys.platform == "win32":
+        process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.kill()
+    process.wait()
+
+
+def _replace_installed_bundle_dir(source_dir: Path, target_dir: Path) -> None:
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = target_dir.with_name(f".{target_dir.name}.previous")
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    had_previous = target_dir.exists()
+    if had_previous:
+        target_dir.rename(backup_dir)
+    try:
+        shutil.move(str(source_dir), str(target_dir))
+    except Exception:
+        if had_previous and backup_dir.exists() and not target_dir.exists():
+            backup_dir.rename(target_dir)
+        raise
+    if had_previous:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _resolve_installer_script(relative_script: str, base_dir: Path) -> Path:
+    candidates = [base_dir / relative_script, _project_root() / relative_script]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"未找到 TTS 整合包安装脚本：{relative_script}")
+
+
+def _handle_installer_progress_line(
+    line: str,
+    *,
+    on_progress: ProgressCallback | None,
+    on_status: StatusCallback | None,
+) -> None:
+    match = re.search(r"::sakura-progress\s+status=([a-z_]+)\s+progress=(\d+)", line)
+    if match is None:
+        return
+    _emit_status(on_status, match.group(1))
+    _emit_progress(on_progress, int(match.group(2)))
+
+
+def _build_script_install_result(entry: TTSBundleEntry, installed_dir: Path) -> TTSBundleInstallResult:
+    work_dir = installed_dir / entry.work_dir_name if entry.work_dir_name else installed_dir
+    python_path = installed_dir / entry.python_path_name if entry.python_path_name else None
+    tts_config_path = installed_dir / entry.tts_config_path_name if entry.tts_config_path_name else None
+    if not work_dir.is_dir():
+        raise RuntimeError(f"{entry.label} 安装后未找到工作目录：{work_dir}")
+    if not (work_dir / "api_v2.py").is_file():
+        raise RuntimeError(f"{entry.label} 安装后未找到 api_v2.py：{work_dir}")
+    if python_path is not None and not python_path.is_file():
+        raise RuntimeError(f"{entry.label} 安装后未找到 Python：{python_path}")
+    if tts_config_path is not None and not tts_config_path.is_file():
+        raise RuntimeError(f"{entry.label} 安装后未找到推理配置：{tts_config_path}")
+    return TTSBundleInstallResult(
+        work_dir=work_dir.resolve(),
+        provider=entry.provider,
+        python_path=python_path.resolve() if python_path is not None else None,
+        tts_config_path=tts_config_path.resolve() if tts_config_path is not None else None,
+    )
+
+
+def _entries_for_provider(provider: str | None) -> tuple[TTSBundleEntry, ...]:
+    if provider is None:
+        return tuple(entry for entry in TTS_BUNDLES if entry.install_method == "archive")
+    normalized = provider.strip().lower().replace("_", "-")
+    if normalized in {"genie", "genie-tts", "genietts"}:
+        return (GENIE_TTS,)
+    if normalized in {"gpt-sovits", "gpt-so-vits", "gptsovits"}:
+        return GPT_SOVITS_BUNDLES
+    return ()
+
+
+def _short_bundle_install_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
+    short_name = _SHORT_BUNDLE_DIRS.get(entry.key, entry.key)
+    return base_dir / "tts" / short_name
+
+
+def _legacy_bundle_install_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
+    return base_dir / "data" / "tts_bundles" / "installed" / entry.key
+
+
+def _is_bundle_installed(entry: TTSBundleEntry, base_dir: Path) -> bool:
+    return (
+        _is_installed_bundle_ready(_short_bundle_install_dir(entry, base_dir))
+        or _is_installed_bundle_ready(_legacy_bundle_install_dir(entry, base_dir))
+    )
+
+
+def _replace_installed_bundle_from_extract(tmp_dir: Path, installed_dir: Path) -> Path:
+    root = _resolve_extracted_root(tmp_dir)
+    if installed_dir.exists():
+        shutil.rmtree(installed_dir, ignore_errors=True)
+    installed_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if root == tmp_dir.resolve():
+        installed_dir.mkdir(parents=True, exist_ok=True)
+        for child in list(tmp_dir.iterdir()):
+            shutil.move(str(child), str(installed_dir / child.name))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return installed_dir.resolve()
+
+    shutil.move(str(root), str(installed_dir))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return installed_dir.resolve()
+
+
+def _migration_work_dir(migration: TTSBundleMigration) -> Path:
+    return migration.target_dir.parent / _MIGRATING_DIR_NAME / migration.entry.key
+
+
+def _migration_state_path(work_dir: Path) -> Path:
+    return work_dir / _MIGRATION_STATE_FILE
+
+
+def _cleanup_migration_work_dir(migration: TTSBundleMigration) -> None:
+    work_dir = _migration_work_dir(migration)
+    if work_dir.exists():
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _remove_invalid_bundle_target(target_dir: Path) -> None:
+    """移除 Sakura 管理的无效短目录，避免阻塞旧整合包迁移。"""
+
+    if target_dir.is_dir() and not target_dir.is_symlink():
+        shutil.rmtree(target_dir)
+        return
+    target_dir.unlink(missing_ok=True)
+
+
+def _try_fast_migration_rename(migration: TTSBundleMigration) -> bool:
+    """同盘且没有续迁目录时优先尝试目录改名，失败则交给可恢复复制。"""
+
+    if _migration_work_dir(migration).exists():
+        return False
+    try:
+        if migration.source_dir.resolve().anchor != migration.target_dir.resolve().anchor:
+            return False
+        migration.source_dir.rename(migration.target_dir)
+    except OSError:
+        return False
+    _cleanup_migration_work_dir(migration)
+    return True
+
+
+def _migration_file_plan(source_dir: Path) -> list[tuple[Path, int]]:
+    plan: list[tuple[Path, int]] = []
+    for path in sorted(source_dir.rglob("*"), key=lambda item: item.relative_to(source_dir).as_posix()):
+        if not path.is_file():
+            continue
+        if path.name == _MIGRATION_STATE_FILE or path.name.endswith(_MIGRATION_TEMP_SUFFIX):
+            continue
+        relative_path = path.relative_to(source_dir)
+        plan.append((relative_path, path.stat().st_size))
+    return plan
+
+
+def _write_migration_state(
+    migration: TTSBundleMigration,
+    *,
+    total_files: int,
+    total_bytes: int,
+    completed_files: int,
+    copied_bytes: int,
+    current_file: str,
+) -> None:
+    work_dir = _migration_work_dir(migration)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "entry_key": migration.entry.key,
+        "source_dir": str(migration.source_dir),
+        "target_dir": str(migration.target_dir),
+        "work_dir": str(work_dir),
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+        "completed_files": completed_files,
+        "copied_bytes": copied_bytes,
+        "current_file": current_file,
+        "updated_at": time.time(),
+    }
+    _migration_state_path(work_dir).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _migration_target_file_ready(source: Path, target: Path, expected_size: int) -> bool:
+    if not target.is_file():
+        return False
+    try:
+        source_stat = source.stat()
+        target_stat = target.stat()
+    except OSError:
+        return False
+    if target_stat.st_size != expected_size or target_stat.st_size != source_stat.st_size:
+        return False
+    # Windows/FAT/压缩包解压后的 mtime 精度可能有误差，大小一致即可续迁跳过。
+    return True
+
+
+def _copy_file_resumable(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_target = target.with_name(f"{target.name}{_MIGRATION_TEMP_SUFFIX}")
+    tmp_target.unlink(missing_ok=True)
+    try:
+        with source.open("rb") as src, tmp_target.open("wb") as dst:
+            while True:
+                chunk = src.read(_MIGRATION_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                time.sleep(0)
+        shutil.copystat(source, tmp_target)
+        os.replace(tmp_target, target)
+    except Exception:
+        tmp_target.unlink(missing_ok=True)
+        raise
+
+
+def _emit_migration_progress(
+    callback: MigrationProgressCallback | None,
+    migration: TTSBundleMigration,
+    *,
+    current_file: str,
+    completed_files: int,
+    total_files: int,
+    copied_bytes: int,
+    total_bytes: int,
+) -> None:
+    if callback is None:
+        return
+    callback(
+        TTSBundleMigrationProgress(
+            entry=migration.entry,
+            current_file=current_file,
+            completed_files=completed_files,
+            total_files=total_files,
+            copied_bytes=copied_bytes,
+            total_bytes=total_bytes,
+        )
+    )
+
+
+def _remove_empty_legacy_parents(path: Path) -> None:
+    tts_bundles_dir: Path | None = None
+    for parent in path.parents:
+        if parent.name == "tts_bundles":
+            tts_bundles_dir = parent
+            break
+    if tts_bundles_dir is None:
+        return
+
+    current = path
+    while True:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        if current == tts_bundles_dir:
+            return
+        current = current.parent
+
+    # 迁移后只清理旧整合包运行时相关的空目录；ONNX 属于用户生成数据，保留在 data 下。
+    for candidate in (
+        tts_bundles_dir / "downloads",
+        tts_bundles_dir / "installed",
+        tts_bundles_dir,
+    ):
+        try:
+            candidate.rmdir()
+        except OSError:
+            continue
 
 
 def _is_rtx_50_series(name: str) -> bool:
@@ -287,7 +970,7 @@ def _is_installed_bundle_ready(installed_dir: Path) -> bool:
         root = _resolve_extracted_root(installed_dir)
     except OSError:
         return False
-    return (root / "runtime" / "python.exe").is_file()
+    return find_usable_runtime_python(root / "runtime") is not None
 
 
 def _emit_progress(callback: ProgressCallback | None, value: int) -> None:
@@ -524,6 +1207,8 @@ def _format_py7zr_failure_error(py7zz_error: str, cli_error: str | None, exc: Ex
 
 
 def _resolve_extracted_root(extract_to: Path) -> Path:
+    if (extract_to / "runtime" / "python.exe").is_file():
+        return extract_to.resolve()
     children = [path for path in extract_to.iterdir() if not path.name.startswith(".")]
     if len(children) == 1 and children[0].is_dir():
         return children[0].resolve()

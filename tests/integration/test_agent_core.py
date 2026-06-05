@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -370,6 +371,18 @@ def test_memory_store_preload_only_creates_runtime_once() -> None:
     assert store.is_ready()
 
 
+def test_memory_store_returns_failed_response_for_nonblocking_memory_tools() -> None:
+    store = MemoryStore(base_dir=_runtime_root_path("memory_failed_nonblocking"))
+    store._load_error = "Cannot send a request, as the client has been closed."
+
+    result = store.search_memory({"query": "偏好"}, wait=False)
+
+    assert result["status"] == "failed"
+    assert "普通聊天仍可继续" in result["message"]
+    assert result["memories"] == []
+    assert "client has been closed" in result["error"]
+
+
 def test_memory_store_reload_keeps_old_runtime_until_new_runtime_is_ready() -> None:
     old_settings = ApiSettings("https://old.example.com/v1", "old-key", "old-model")
     new_settings = ApiSettings("https://new.example.com/v1", "new-key", "new-model")
@@ -398,6 +411,88 @@ def test_memory_store_reload_keeps_old_runtime_until_new_runtime_is_ready() -> N
         if store._memory is not old_runtime:
             break
         time.sleep(0.05)
+    assert store._memory == {"settings": new_settings}
+
+
+def test_memory_store_reload_existing_runtime_replaces_only_llm() -> None:
+    old_settings = ApiSettings("https://old.example.com/v1", "old-key", "old-model")
+    new_settings = ApiSettings("https://new.example.com/v1", "new-key", "new-model")
+
+    class HotReloadMemoryStore(MemoryStore):
+        def __init__(self) -> None:
+            super().__init__(
+                base_dir=_runtime_root_path("memory_reload_llm_only"),
+                api_settings=old_settings,
+            )
+            self.create_memory_calls = 0
+            self.create_llm_calls = 0
+
+        def _create_memory_client(self, api_settings=None):  # type: ignore[no-untyped-def]
+            self.create_memory_calls += 1
+            return {"settings": api_settings}
+
+        def _create_memory_llm(self, api_settings):  # type: ignore[no-untyped-def]
+            self.create_llm_calls += 1
+            return {"settings": api_settings}, {"settings": api_settings}
+
+    store = HotReloadMemoryStore()
+    old_config = {"settings": old_settings}
+    old_llm = {"settings": old_settings}
+    runtime = SimpleNamespace(config=SimpleNamespace(llm=old_config), llm=old_llm)
+    store._memory = runtime
+
+    store.reload_api_settings(new_settings, wait=True)
+
+    assert store._memory is runtime
+    assert store.create_memory_calls == 0
+    assert store.create_llm_calls == 1
+    assert runtime.config.llm == {"settings": new_settings}
+    assert runtime.llm == {"settings": new_settings}
+    assert store._reload_error == ""
+
+
+def test_memory_store_reload_llm_failure_keeps_old_runtime_llm() -> None:
+    old_settings = ApiSettings("https://old.example.com/v1", "old-key", "old-model")
+    new_settings = ApiSettings("https://new.example.com/v1", "new-key", "new-model")
+
+    class FailingLlmReloadMemoryStore(MemoryStore):
+        def _create_memory_llm(self, api_settings):  # type: ignore[no-untyped-def]
+            raise RuntimeError("llm failed")
+
+    store = FailingLlmReloadMemoryStore(
+        base_dir=_runtime_root_path("memory_reload_llm_failure"),
+        api_settings=old_settings,
+    )
+    old_config = {"settings": old_settings}
+    old_llm = {"settings": old_settings}
+    runtime = SimpleNamespace(config=SimpleNamespace(llm=old_config), llm=old_llm)
+    store._memory = runtime
+
+    store.reload_api_settings(new_settings, wait=True)
+
+    assert store._memory is runtime
+    assert runtime.config.llm is old_config
+    assert runtime.llm is old_llm
+    assert store._reload_error == "llm failed"
+
+
+def test_memory_store_reload_without_runtime_still_creates_memory_client() -> None:
+    new_settings = ApiSettings("https://new.example.com/v1", "new-key", "new-model")
+
+    class ColdReloadMemoryStore(MemoryStore):
+        def __init__(self) -> None:
+            super().__init__(base_dir=_runtime_root_path("memory_reload_cold"))
+            self.create_memory_calls = 0
+
+        def _create_memory_client(self, api_settings=None):  # type: ignore[no-untyped-def]
+            self.create_memory_calls += 1
+            return {"settings": api_settings}
+
+    store = ColdReloadMemoryStore()
+
+    store.reload_api_settings(new_settings, wait=True)
+
+    assert store.create_memory_calls == 1
     assert store._memory == {"settings": new_settings}
 
 
@@ -443,7 +538,37 @@ def test_memory_store_uses_local_embedding_cache_when_available(monkeypatch) -> 
 
     config = store.build_mem0_config()
 
-    assert config["embedder"]["config"]["model_kwargs"] == {"local_files_only": True}
+    assert config["embedder"]["config"]["model_kwargs"] == {
+        "cache_folder": str(cache_root / "hub"),
+        "local_files_only": True,
+    }
+
+
+def test_memory_store_passes_project_embedding_cache_folder(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = _runtime_root_path("memory_project_embedding_cache")
+    cache_folder = root / "runtime" / "hf-cache" / "hub"
+    snapshot = (
+        cache_folder
+        / "models--sentence-transformers--all-MiniLM-L6-v2"
+        / "snapshots"
+        / "revision"
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "model.safetensors").write_text("fake", encoding="utf-8")
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("SENTENCE_TRANSFORMERS_HOME", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_CACHE", raising=False)
+
+    store = MemoryStore(base_dir=root)
+
+    config = store.build_mem0_config()
+
+    assert store.needs_embedding_model_download() is False
+    assert config["embedder"]["config"]["model_kwargs"] == {
+        "cache_folder": str(cache_folder),
+        "local_files_only": True,
+    }
 
 
 def test_memory_store_ignores_incomplete_local_embedding_cache(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -467,7 +592,9 @@ def test_memory_store_ignores_incomplete_local_embedding_cache(monkeypatch) -> N
 
     config = store.build_mem0_config()
 
-    assert config["embedder"]["config"]["model_kwargs"] == {}
+    assert config["embedder"]["config"]["model_kwargs"] == {
+        "cache_folder": str(root / "runtime" / "hf-cache" / "hub"),
+    }
 
 
 def test_memory_store_create_update_search_and_delete() -> None:
