@@ -5608,6 +5608,49 @@ def _minimal_tts_settings() -> GPTSoVITSTTSSettings:
     )
 
 
+def test_tts_ready_warmup_worker_calls_ensure_ready_success() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtCore")
+    from app.ui.pet_window import TTSReadyWarmupWorker
+
+    events: list[tuple[str, str]] = []
+
+    class FakeProvider:
+        def ensure_ready(self) -> tuple[bool, str]:
+            events.append(("called", ""))
+            return True, "ready"
+
+    worker = TTSReadyWarmupWorker(FakeProvider())  # type: ignore[arg-type]
+    worker.succeeded.connect(lambda message: events.append(("succeeded", message)))
+    worker.failed.connect(lambda message: events.append(("failed", message)))
+    worker.finished.connect(lambda: events.append(("finished", "")))
+
+    worker.run()
+
+    assert events == [("called", ""), ("succeeded", "ready"), ("finished", "")]
+
+
+def test_tts_ready_warmup_worker_reports_failure() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtCore")
+    from app.ui.pet_window import TTSReadyWarmupWorker
+
+    events: list[tuple[str, str]] = []
+
+    class FakeProvider:
+        def ensure_ready(self) -> tuple[bool, str]:
+            return False, "启动失败"
+
+    worker = TTSReadyWarmupWorker(FakeProvider())  # type: ignore[arg-type]
+    worker.succeeded.connect(lambda message: events.append(("succeeded", message)))
+    worker.failed.connect(lambda message: events.append(("failed", message)))
+    worker.finished.connect(lambda: events.append(("finished", "")))
+
+    worker.run()
+
+    assert events == [("failed", "启动失败"), ("finished", "")]
+
+
 def test_tts_test_worker_keeps_provider_after_success(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6.QtCore")

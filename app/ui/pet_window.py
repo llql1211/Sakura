@@ -238,6 +238,51 @@ def show_themed_critical(
     )
 
 
+class TTSReadyWarmupWorker(QObject):
+    """后台启动并检测 TTS 服务，避免首次朗读承担冷启动。"""
+
+    succeeded = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, provider: TTSProvider) -> None:
+        super().__init__()
+        self.provider = provider
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            ensure_ready = getattr(self.provider, "ensure_ready", None)
+            if not callable(ensure_ready):
+                return
+            debug_log("TTS", "开始后台预热 TTS 服务", {"provider": type(self.provider).__name__})
+            ok, message = ensure_ready()
+            if ok:
+                debug_log(
+                    "TTS",
+                    "后台预热 TTS 服务完成",
+                    {"provider": type(self.provider).__name__, "message": message},
+                )
+                self.succeeded.emit(message)
+            else:
+                debug_log(
+                    "TTS",
+                    "后台预热 TTS 服务失败",
+                    {"provider": type(self.provider).__name__, "message": message},
+                )
+                self.failed.emit(message)
+        except Exception as exc:  # noqa: BLE001
+            message = f"TTS 服务预热失败：{exc}"
+            debug_log(
+                "TTS",
+                "后台预热 TTS 服务异常",
+                {"provider": type(self.provider).__name__, "error": str(exc)},
+            )
+            self.failed.emit(message)
+        finally:
+            self.finished.emit()
+
+
 class PetWindow(QWidget):
     memory_status_changed = Signal(str, str)
 
@@ -251,6 +296,8 @@ class PetWindow(QWidget):
         self.startup_initializing = context.startup_initializing
         self.deferred_startup_thread: QThread | None = None
         self.deferred_startup_worker: QObject | None = None
+        self.tts_ready_warmup_thread: QThread | None = None
+        self.tts_ready_warmup_worker: QObject | None = None
         self.settings_service = context.settings_service
         self.character_registry = context.character_registry
         self.character_profile = context.character_profile
@@ -462,6 +509,7 @@ class PetWindow(QWidget):
         self.speech_timer = self.subtitle_controller.speech_timer
         if not self.startup_initializing:
             QTimer.singleShot(0, self._warm_up_current_tts_playback)
+            QTimer.singleShot(0, self._start_current_tts_ready_warmup)
 
         bubble_header = QHBoxLayout()
         bubble_header.setContentsMargins(0, 0, 0, 0)
@@ -2093,6 +2141,7 @@ class PetWindow(QWidget):
         self.voice_playback_controller.set_provider(services.tts_provider)
         self._connect_tts_error_signal(services.tts_provider)
         self._warm_up_tts_playback(services.tts_provider)
+        self._start_tts_ready_warmup(services.tts_provider)
         self.tool_registry = services.tool_registry
         self.free_access_enabled = self.tool_registry.free_access_enabled
         self.agent_runtime.tools = services.tool_registry
@@ -2213,6 +2262,42 @@ class PetWindow(QWidget):
                     "error": str(exc),
                 },
             )
+
+    def _start_current_tts_ready_warmup(self) -> None:
+        self._start_tts_ready_warmup(self.tts_provider)
+
+    def _start_tts_ready_warmup(self, provider: TTSProvider) -> None:
+        if isinstance(provider, NullTTSProvider):
+            debug_log("TTS", "TTS 已关闭，跳过服务预热")
+            return
+        ensure_ready = getattr(provider, "ensure_ready", None)
+        if not callable(ensure_ready):
+            return
+        if self.tts_ready_warmup_thread is not None:
+            debug_log("TTS", "TTS 服务预热已在进行，跳过重复请求")
+            return
+
+        thread = QThread(self)
+        worker = TTSReadyWarmupWorker(provider)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.failed.connect(self._handle_tts_ready_warmup_failed)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_tts_ready_warmup_worker)
+        self.tts_ready_warmup_thread = thread
+        self.tts_ready_warmup_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _handle_tts_ready_warmup_failed(self, message: str) -> None:
+        self._show_tts_error(message)
+
+    @Slot()
+    def _cleanup_tts_ready_warmup_worker(self) -> None:
+        self.tts_ready_warmup_thread = None
+        self.tts_ready_warmup_worker = None
 
     def _apply_startup_initializing_state(self) -> None:
         self.input_edit.setPlaceholderText(STARTUP_INITIALIZING_TEXT)
@@ -2537,6 +2622,9 @@ class PetWindow(QWidget):
         if callable(connect_tts_error_signal):
             connect_tts_error_signal(new_tts_provider)
         self._warm_up_tts_playback(new_tts_provider)
+        start_tts_ready_warmup = getattr(self, "_start_tts_ready_warmup", None)
+        if callable(start_tts_ready_warmup):
+            start_tts_ready_warmup(new_tts_provider)
         self._apply_character(selected_profile)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
