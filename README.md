@@ -40,7 +40,7 @@ Release 里常见的文件含义如下：
 解压完整包后，进入解压出来的项目目录。`runtime` 文件夹自带了 Python，但依赖包还是要装一次：
 
 - **Windows 用户：** 双击 `install.bat`，等待完成（约 5-15 分钟）。
-- **Mac 用户：** 可尝试双击 `install.command`，或在终端进入项目目录后运行 `bash scripts/install.sh`。但 Mac 没有实机测试过，遇到问题请优先反馈日志。
+- **Mac 用户：** 可尝试双击 `install.command`，或在终端进入项目目录后运行 `bash scripts/install.sh`。从源码运行、依赖踩坑、Apple Silicon/Rosetta 架构问题以及 GPT-SoVITS 语音搭建，详见 **[docs/MACOS_SETUP.md](docs/MACOS_SETUP.md)**（已在 Apple Silicon 实机测试）。
 - **Linux 用户：** 当前没有正式发布包；如果从源码运行，进入项目目录后运行 `bash scripts/install.sh`。
 
 > 如果是直接拉取的源码，需要先从 Release 页面下载对应平台的预编译依赖包（`sakura-runtime-*.zip`），把里面的 `runtime` 文件夹放到项目根目录，再运行安装脚本。

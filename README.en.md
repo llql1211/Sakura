@@ -10,6 +10,9 @@ A desktop companion Agent — chats, changes expressions, speaks, remembers what
 
 **Prerequisites:** Python 3.10+.
 
+> **On macOS?** See [docs/MACOS_SETUP.md](docs/MACOS_SETUP.md) for the macOS path
+> (architecture/Rosetta notes, SSL cert fix, `.char` extraction, and GPT-SoVITS voice setup).
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1

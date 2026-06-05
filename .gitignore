@@ -1,5 +1,8 @@
 .env
 
+# macOS
+.DS_Store
+
 __pycache__/
 *.py[cod]
 *$py.class
