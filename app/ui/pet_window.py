@@ -3013,7 +3013,7 @@ class PetWindow(QWidget):
         system_values = self._load_system_config_values("ui")
         if "free_access_enabled" in system_values:
             return _parse_bool(system_values.get("free_access_enabled"), default=True)
-        return False
+        return True
 
     def _load_always_on_top_enabled(self) -> bool:
         """从 system_config.yaml 加载主窗口置顶设置，默认不置顶。"""

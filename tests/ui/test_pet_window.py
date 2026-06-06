@@ -810,6 +810,25 @@ def test_pet_window_loads_always_on_top_disabled_by_default() -> None:
     assert MinimalWindow({"always_on_top_enabled": "on"})._load_always_on_top_enabled() is True
 
 
+def test_pet_window_defaults_free_access_to_enabled() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _load_free_access_enabled = PetWindow._load_free_access_enabled
+
+        def __init__(self, values):  # type: ignore[no-untyped-def]
+            self.values = values
+
+        def _load_system_config_values(self, section: str):  # type: ignore[no-untyped-def]
+            assert section == "ui"
+            return self.values
+
+    assert MinimalWindow({})._load_free_access_enabled() is True
+    assert MinimalWindow({"free_access_enabled": False})._load_free_access_enabled() is False
+    assert MinimalWindow({"free_access_enabled": "off"})._load_free_access_enabled() is False
+    assert MinimalWindow({"free_access_enabled": "invalid"})._load_free_access_enabled() is True
+
+
 def test_pet_window_defaults_autonomous_screen_observation_to_enabled() -> None:
     from app.ui.pet_window import PetWindow
 
