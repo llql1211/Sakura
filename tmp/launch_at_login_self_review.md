@@ -21,6 +21,7 @@
 - `app/ui/pet_window.py`：普通设置页仅在开关变化时应用登录项并持久化。
 - `tests/unit/test_launch_at_login.py`：覆盖 macOS LaunchAgent、Windows Run、Linux XDG autostart、unsupported 平台。
 - `tests/unit/test_settings_service.py`、`tests/ui/test_pet_window.py`：覆盖配置持久化、设置页结果和 PetWindow 保存链路。
+- `tests/unit/test_visual_observation.py`：修复脱敏测试的固定日期耦合，避免测试记录因超过 7 天保留期被立即裁剪。
 - `tmp/launch_at_login_self_review.md`：迁移后的自查文档。
 
 ## 平台行为
@@ -36,6 +37,7 @@
 - 没有带入原工作区里的长期记忆失败弹窗延迟显示改动。
 - 没有带入 `.DS_Store`、其它 `tmp/` 文件或原工作区未跟踪噪声。
 - 没有发现为了自启动而引入的大范围重构；改动集中在平台适配、设置持久化、设置 UI、应用启动和测试。
+- 全量测试中暴露的 visual observation 脱敏测试失败不是自启动链路问题；根因是测试使用固定的 `2026-05-31` 时间戳，当前日期超过 7 天保留期后记录会被正常裁剪。已将该测试改为运行时当前时间。
 
 ## 已知边界和风险
 
@@ -62,19 +64,22 @@ git diff --check
 
 ```bash
 /Users/nothing/Sakura/sakura-macos-tts-fix/.venv/bin/python -m pytest tests/unit/test_launch_at_login.py tests/unit/test_settings_service.py tests/unit/test_bootstrap.py tests/ui/test_pet_window.py -q
-# 168 passed in 3.32s
+# 168 passed in 2.52s
 ```
 
-全量测试当前仍有 1 个失败：
+已通过 visual observation 脱敏回归测试：
+
+```bash
+/Users/nothing/Sakura/sakura-macos-tts-fix/.venv/bin/python -m pytest tests/unit/test_visual_observation.py::test_visual_observation_store_redacts_sensitive_text_and_omits_images -q
+# 1 passed in 0.05s
+```
+
+已通过全量测试：
 
 ```bash
 /Users/nothing/Sakura/sakura-macos-tts-fix/.venv/bin/python -m pytest -q
-# 1 failed, 535 passed in 10.29s
-# FAILED tests/unit/test_visual_observation.py::test_visual_observation_store_redacts_sensitive_text_and_omits_images
-# AssertionError: assert '[REDACTED]' in ''
+# 536 passed in 4.60s
 ```
-
-这个失败点在 visual observation 的敏感文本脱敏测试，不在开机自启动链路中；从当前结果看，自启动相关改动没有引入聚焦测试回归。
 
 ## 建议
 
