@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 import uuid
 import wave
 from pathlib import Path
+
+import pytest
 
 if importlib.util.find_spec("PySide6") is None:
     pyside_module = types.ModuleType("PySide6")
@@ -302,6 +305,7 @@ def test_sink_player_start_returns_false_on_invalid_wav() -> None:
     assert ok is False
 
 
+@pytest.mark.skipif(os.environ.get("CI") == "true", reason="QAudioSink requires audio device on headless CI")
 def test_sink_player_start_returns_true_for_valid_wav() -> None:
     """合法 wav 应让 start() 返回 True。"""
     root = _runtime_root("sink_start_ok")
