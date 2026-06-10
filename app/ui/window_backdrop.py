@@ -98,6 +98,12 @@ class MacOSVisualEffectBackdrop:
             objc.sel_registerName.restype = ctypes.c_void_p
             objc.sel_registerName.argtypes = [ctypes.c_char_p]
 
+            # Objective-C runtime: ivar 直接写入（绕过 HFA-4 struct 传参问题）
+            objc.class_getInstanceVariable.restype = ctypes.c_void_p
+            objc.class_getInstanceVariable.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            objc.ivar_getOffset.restype = ctypes.c_size_t
+            objc.ivar_getOffset.argtypes = [ctypes.c_void_p]
+
             def msg_send(obj, sel_name, *args):
                 sel = objc.sel_registerName(sel_name.encode())
                 if not args:
@@ -131,8 +137,11 @@ class MacOSVisualEffectBackdrop:
                 self._fallback.apply(window, tint)
                 return
 
-            # alloc + init（不用 initWithFrame:，因为 NSRect 在 arm64 上是 HFA-4，
-            # ctypes 无法正确按值传递 HFA struct 给 objc_msgSend）
+            # ── alloc + init ──
+            # 不用 initWithFrame:，因为 NSRect 在 arm64 上是 HFA-4（4×double），
+            # ctypes (Python ≤3.12) 不支持 HFA 调用约定，会把数组当指针传，
+            # 导致 NSVisualEffectView 收到垃圾 frame。
+            # 改用 init 创建零 frame，再通过 _frame ivar 直接写入正确尺寸。
             alloc = msg_send(ns_visual_effect_class, "alloc")
             effect_view = msg_send(alloc, "init")
             if not effect_view:
@@ -141,8 +150,29 @@ class MacOSVisualEffectBackdrop:
 
             self._effect_view = ctypes.c_void_p(effect_view)
 
-            # 关闭 autoresizing mask，改用 NSLayoutConstraint 固定四边
-            msg_send(self._effect_view, "setTranslatesAutoresizingMaskIntoConstraints:", ctypes.c_bool(False))
+            # ── 通过 _frame ivar 直接写入 frame（绕过 objc_msgSend 的 HFA-4 限制）──
+            # 从 Qt widget 获取尺寸（纯标量调用，无 struct 传参）
+            frame_w = float(window.width())
+            frame_h = float(window.height())
+
+            nsview_class = objc.objc_getClass(b"NSView")
+            frame_ivar = objc.class_getInstanceVariable(nsview_class, b"_frame")
+            frame_offset = objc.ivar_getOffset(frame_ivar)
+
+            # NSRect = { origin.x, origin.y, size.width, size.height } = 4 doubles
+            # 直接写入对象内存中 _frame ivar 的位置
+            obj_base = ctypes.cast(ctypes.c_void_p(effect_view), ctypes.POINTER(ctypes.c_byte))
+            frame_ptr = ctypes.cast(
+                ctypes.addressof(obj_base.contents) + frame_offset,
+                ctypes.POINTER(ctypes.c_double),
+            )
+            frame_ptr[0] = 0.0  # origin.x
+            frame_ptr[1] = 0.0  # origin.y
+            frame_ptr[2] = frame_w  # size.width
+            frame_ptr[3] = frame_h  # size.height
+
+            # setAutoresizingMask: NSViewWidthSizable | NSViewHeightizable
+            msg_send(self._effect_view, "setAutoresizingMask:", ctypes.c_ulong(2 | 16))
 
             # setMaterial: NSVisualEffectMaterialPopover
             msg_send(
@@ -167,7 +197,6 @@ class MacOSVisualEffectBackdrop:
 
             # addSubview:positioned:relativeTo: — 把 effect view 放在最底层，
             # Qt 渲染的内容在上，frosted glass 效果透过 Qt 的透明区域显示。
-            # 普通 addSubview: 会放在最顶层，盖住 Qt 内容导致白色方块。
             # NSViewBelow = 1
             msg_send(
                 ctypes.c_void_p(content_view),
@@ -176,43 +205,6 @@ class MacOSVisualEffectBackdrop:
                 ctypes.c_long(1),
                 ctypes.c_void_p(0),
             )
-
-            # ── NSLayoutConstraint 固定四边 ──
-            # 所有参数都是 c_void_p / c_long，无 NSRect/NSSize/NSPoint struct 传参。
-            constraint_class = objc.objc_getClass(b"NSLayoutConstraint")
-            if constraint_class:
-                ev = self._effect_view
-                cv = ctypes.c_void_p(content_view)
-                c_long = ctypes.c_long
-
-                # 创建四条 edge 约束: effectView.edge = contentView.edge
-                constraints = []
-                for attr in (1, 2, 3, 4):  # Leading, Trailing, Top, Bottom
-                    c = msg_send(
-                        constraint_class,
-                        "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
-                        ev, c_long(attr), c_long(0), cv, c_long(attr), ctypes.c_double(1.0), ctypes.c_double(0.0),
-                    )
-                    if c:
-                        constraints.append(c)
-
-                if constraints:
-                    # NSArray arrayWithObjects:count: — 纯标量参数，arm64 安全
-                    n = len(constraints)
-                    ArrT = ctypes.c_void_p * n
-                    arr = ArrT(*constraints)
-                    arr_ptr = ctypes.cast(arr, ctypes.c_void_p)
-                    ns_array = msg_send(
-                        objc.objc_getClass(b"NSArray"),
-                        "arrayWithObjects:count:",
-                        arr_ptr, ctypes.c_ulong(n),
-                    )
-                    if ns_array:
-                        msg_send(
-                            constraint_class,
-                            "activateConstraints:",
-                            ctypes.c_void_p(ns_array),
-                        )
 
             # 确保 effect view 启用 layer
             msg_send(self._effect_view, "setWantsLayer:", ctypes.c_bool(True))
