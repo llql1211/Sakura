@@ -165,8 +165,17 @@ class MacOSVisualEffectBackdrop:
                 ctypes.c_long(self._NS_VISUAL_EFFECT_STATE_ACTIVE),
             )
 
-            # addSubview: 添加到 contentView
-            msg_send(ctypes.c_void_p(content_view), "addSubview:", self._effect_view)
+            # addSubview:positioned:relativeTo: — 把 effect view 放在最底层，
+            # Qt 渲染的内容在上，frosted glass 效果透过 Qt 的透明区域显示。
+            # 普通 addSubview: 会放在最顶层，盖住 Qt 内容导致白色方块。
+            # NSViewBelow = 1
+            msg_send(
+                ctypes.c_void_p(content_view),
+                "addSubview:positioned:relativeTo:",
+                self._effect_view,
+                ctypes.c_long(1),
+                ctypes.c_void_p(0),
+            )
 
             # ── NSLayoutConstraint 固定四边 ──
             # 所有参数都是 c_void_p / c_long，无 NSRect/NSSize/NSPoint struct 传参。
