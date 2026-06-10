@@ -666,6 +666,8 @@ class SettingsDialog(QDialog):
         self.setLayout(layout)
         self._capture_initial_tts_settings_from_controls()
         self._apply_theme_stylesheet(self.theme_settings)
+        # 初始化外观效果下拉框等控件为当前主题值
+        self._set_theme_controls(self.theme_settings)
 
     def _capture_initial_tts_settings_from_controls(self) -> None:
         settings = self._validated_tts_settings(

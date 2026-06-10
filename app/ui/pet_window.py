@@ -3810,13 +3810,20 @@ class PetWindow(QWidget):
         if window is None:
             return
 
-        # 移除旧 backdrop
+        # 模式未变则跳过，避免频繁删除/创建导致白色闪烁
+        if type(window._backdrop) is type(backdrop):  # noqa: SLF001
+            return
+
+        # 模式真正变化：先隐藏窗口避免过渡闪现白框
+        visible = window.isVisible()
+        if visible:
+            window.hide()
+
         try:
             window._backdrop.remove(window)  # noqa: SLF001
         except Exception:  # noqa: BLE001
             pass
 
-        # 替换 backdrop
         window._backdrop = backdrop  # noqa: SLF001
 
         # 控制软件模糊背景层显隐
@@ -3831,10 +3838,11 @@ class PetWindow(QWidget):
             else:
                 bg.hide()
 
-        # 窗口可见则立刻应用新 backdrop
-        if window.isVisible():
+        # 重新应用新 backdrop 并显示
+        if visible:
             tint = self._card_tint()
             backdrop.apply(window, tint)
+            window.show()
 
     # ── 角色切换 ─────────────────────────────────────────────────────
 
