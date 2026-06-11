@@ -51,6 +51,9 @@ from app.config.character_archive import (
     import_character_voice_archive,
 )
 from app.config.settings_service import (
+    BACKCHANNEL_MAX_DELAY_MS,
+    BACKCHANNEL_MIN_DELAY_MS,
+    BackchannelSettings,
     BUBBLE_AUTO_HIDE_MAX_DELAY_SECONDS,
     BUBBLE_AUTO_HIDE_MIN_DELAY_SECONDS,
     BubbleSettings,
@@ -443,6 +446,7 @@ class SettingsDialog(QDialog):
         theme_settings: ThemeSettings | None = None,
         startup_settings: StartupSettings | None = None,
         bubble_settings: BubbleSettings | None = None,
+        backchannel_settings: BackchannelSettings | None = None,
         on_layout_preview: Callable[[int, int, int, int, int], None] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -450,6 +454,7 @@ class SettingsDialog(QDialog):
         self.tts_settings = tts_settings
         self.startup_settings = startup_settings or StartupSettings()
         self.bubble_settings = bubble_settings or BubbleSettings()
+        self.backchannel_settings = (backchannel_settings or BackchannelSettings()).normalized()
         self._initial_api_settings = api_settings
         self._initial_tts_settings = tts_settings
         self._initial_character_id = current_character.id if current_character is not None else None
@@ -503,6 +508,7 @@ class SettingsDialog(QDialog):
         self.result_debug_log_settings: DebugLogSettings | None = None
         self.result_startup_settings: StartupSettings | None = None
         self.result_bubble_settings: BubbleSettings | None = None
+        self.result_backchannel_settings: BackchannelSettings | None = None
         self.result_theme_settings: ThemeSettings | None = None
         self.result_theme_write_mode: Literal["unchanged", "manual", "ai", "reset", "character"] = "unchanged"
         self.result_plugin_config_changed = False
@@ -581,6 +587,7 @@ class SettingsDialog(QDialog):
                 debug_log_settings or DebugLogSettings(),
                 self.startup_settings,
                 self.bubble_settings,
+                self.backchannel_settings,
             ),
             "系统",
         )
@@ -1255,6 +1262,7 @@ class SettingsDialog(QDialog):
         debug_settings: DebugLogSettings,
         startup_settings: StartupSettings,
         bubble_settings: BubbleSettings,
+        backchannel_settings: BackchannelSettings,
     ) -> QWidget:
         tab = QWidget(self)
         self.launch_at_login_check = QCheckBox("登录时自动启动 Sakura", tab)
@@ -1307,6 +1315,37 @@ class SettingsDialog(QDialog):
         )
         self.bubble_auto_hide_check.toggled.connect(self._sync_bubble_auto_hide_controls)
 
+        normalized_backchannel = backchannel_settings.normalized()
+        self.backchannel_enabled_check = QCheckBox("启用本地快速接话", tab)
+        self.backchannel_enabled_check.setChecked(normalized_backchannel.enabled)
+        self.backchannel_enabled_check.setToolTip(
+            "用户发消息后，主回复返回前先显示一句角色化过渡反应。"
+        )
+        self.backchannel_tts_enabled_check = QCheckBox("接话语音（缺失时用当前 TTS 合成）", tab)
+        self.backchannel_tts_enabled_check.setChecked(normalized_backchannel.tts_enabled)
+        self.backchannel_tts_enabled_check.setToolTip(
+            "需要同时启用全局 TTS；保存后会预生成当前角色缺失的接话语音。"
+        )
+        self.backchannel_delay_spin = _NoWheelSpinBox(tab)
+        self.backchannel_delay_spin.setRange(BACKCHANNEL_MIN_DELAY_MS, BACKCHANNEL_MAX_DELAY_MS)
+        self.backchannel_delay_spin.setSuffix(" 毫秒")
+        self.backchannel_delay_spin.setValue(normalized_backchannel.delay_ms)
+        self.backchannel_probability_spin = QDoubleSpinBox(tab)
+        self.backchannel_probability_spin.setRange(0.0, 1.0)
+        self.backchannel_probability_spin.setSingleStep(0.05)
+        self.backchannel_probability_spin.setDecimals(2)
+        self.backchannel_probability_spin.setValue(normalized_backchannel.probability)
+        self.backchannel_enabled_check.toggled.connect(self._sync_backchannel_controls)
+        # TTS tab 先于系统 tab 构建,此处 tts_enabled_check 已存在;
+        # 全局 TTS 开关变化时重算接话语音复选框的可用态。
+        tts_enabled_check = getattr(self, "tts_enabled_check", None)
+        if tts_enabled_check is not None:
+            tts_enabled_check.toggled.connect(
+                lambda _checked: self._sync_backchannel_controls(
+                    self.backchannel_enabled_check.isChecked()
+                )
+            )
+
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
         form_layout.setSpacing(12)
@@ -1318,8 +1357,13 @@ class SettingsDialog(QDialog):
         form_layout.addRow("回复分段停顿", self.reply_segment_pause_spin)
         form_layout.addRow("", self.bubble_auto_hide_check)
         form_layout.addRow("气泡无操作时长", self.bubble_auto_hide_delay_spin)
+        form_layout.addRow("", self.backchannel_enabled_check)
+        form_layout.addRow("", self.backchannel_tts_enabled_check)
+        form_layout.addRow("接话延迟", self.backchannel_delay_spin)
+        form_layout.addRow("接话触发概率", self.backchannel_probability_spin)
         self._system_form_layout = form_layout
         self._sync_bubble_auto_hide_controls(self.bubble_auto_hide_check.isChecked())
+        self._sync_backchannel_controls(self.backchannel_enabled_check.isChecked())
         tab.setLayout(form_layout)
         return tab
 
@@ -1343,6 +1387,26 @@ class SettingsDialog(QDialog):
             getattr(self, "_system_form_layout", None),
             (self.bubble_auto_hide_delay_spin,),
             enabled,
+        )
+
+    @Slot(bool)
+    def _sync_backchannel_controls(self, enabled: bool) -> None:
+        """接话层关闭时，不允许调整从属参数;接话语音还需全局 TTS 总开关。"""
+        self._set_form_widgets_enabled(
+            getattr(self, "_system_form_layout", None),
+            (
+                self.backchannel_delay_spin,
+                self.backchannel_probability_spin,
+            ),
+            enabled,
+        )
+        # 接话语音依赖全局 TTS:总开关关闭时勾选只会"设置了但不生效",直接禁用。
+        tts_check = getattr(self, "tts_enabled_check", None)
+        tts_on = tts_check.isChecked() if tts_check is not None else True
+        self._set_form_widgets_enabled(
+            getattr(self, "_system_form_layout", None),
+            (self.backchannel_tts_enabled_check,),
+            enabled and tts_on,
         )
 
     def _sync_tts_enabled_controls(self, enabled: bool) -> None:
@@ -2280,6 +2344,13 @@ class SettingsDialog(QDialog):
                 auto_hide_enabled=self.bubble_auto_hide_check.isChecked(),
                 auto_hide_delay_seconds=self.bubble_auto_hide_delay_spin.value(),
             ),
+            "backchannel_settings": BackchannelSettings(
+                enabled=self.backchannel_enabled_check.isChecked(),
+                mode="rules",
+                delay_ms=self.backchannel_delay_spin.value(),
+                probability=self.backchannel_probability_spin.value(),
+                tts_enabled=self.backchannel_tts_enabled_check.isChecked(),
+            ),
         }
 
     def _complete_accept(self, values: dict[str, object]) -> None:
@@ -2299,6 +2370,7 @@ class SettingsDialog(QDialog):
         debug_log_settings = values["debug_log_settings"]
         startup_settings = values["startup_settings"]
         bubble_settings = values["bubble_settings"]
+        backchannel_settings = values["backchannel_settings"]
 
         if not isinstance(api_settings, ApiSettings):
             return
@@ -2323,6 +2395,8 @@ class SettingsDialog(QDialog):
         if not isinstance(startup_settings, StartupSettings):
             return
         if not isinstance(bubble_settings, BubbleSettings):
+            return
+        if not isinstance(backchannel_settings, BackchannelSettings):
             return
 
         try:
@@ -2360,6 +2434,7 @@ class SettingsDialog(QDialog):
         self.result_debug_log_settings = debug_log_settings
         self.result_startup_settings = startup_settings
         self.result_bubble_settings = bubble_settings
+        self.result_backchannel_settings = backchannel_settings.normalized()
         self.result_plugin_config_changed = plugin_config_changed
         super().accept()
 
