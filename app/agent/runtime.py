@@ -247,16 +247,20 @@ class AgentRuntime:
                         visible_browser_mode=visible_browser_guard_active,
                     )
                 )
+                dialogue_temperature, dialogue_extra_params = (
+                    self.api_client.resolve_dialogue_params()
+                )
                 turn = self.api_client.complete_with_tools(
                     system_prompt,
                     working_messages,
                     tools=tool_defs,
                     tool_choice="auto",
-                    temperature=0.8,
+                    temperature=dialogue_temperature,
                     # Some OpenAI-compatible providers return pseudo tool-call JSON
                     # in message.content instead of native tool_calls when
                     # response_format=json_object is combined with tools.
                     structured_response=not bool(tool_defs),
+                    **dialogue_extra_params,
                 )
             except ApiRequestError as exc:
                 if messages_contain_image(working_messages) and is_vision_unsupported_error(exc):

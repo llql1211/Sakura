@@ -411,6 +411,39 @@ QTabBar::tab:selected {{
     color: {theme.accent_color};
     font-weight: 700;
 }}
+QListWidget#settingsNavList {{
+    background: {rgba(theme.panel_background_color, 179)};
+    border: 1px solid {rgba(theme.border_color, 138)};
+    border-radius: 8px;
+    padding: 6px;
+    outline: 0;
+    color: {theme.secondary_text_color};
+    font-size: 14px;
+}}
+QListWidget#settingsNavList::item {{
+    padding: 8px 12px;
+    margin: 2px 0;
+    border-radius: 6px;
+}}
+QListWidget#settingsNavList::item:hover {{
+    background: {rgba(theme.panel_background_color, 205)};
+}}
+QListWidget#settingsNavList::item:selected,
+QListWidget#settingsNavList::item:selected:active,
+QListWidget#settingsNavList::item:selected:!active {{
+    background: {theme.input_background_color};
+    color: {theme.accent_color};
+    font-weight: 700;
+}}
+QStackedWidget#settingsNavStack {{
+    background: transparent;
+    border: none;
+}}
+QWidget#settingsNavPage {{
+    background: {rgba(theme.panel_background_color, 179)};
+    border: 1px solid {rgba(theme.border_color, 138)};
+    border-radius: 8px;
+}}
 QScrollArea#settingsScrollArea {{
     background: transparent;
     border: none;
