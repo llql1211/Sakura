@@ -70,6 +70,45 @@ class BubbleSettings:
         )
 
 
+BACKCHANNEL_MIN_DELAY_MS = 100
+BACKCHANNEL_MAX_DELAY_MS = 5000
+BACKCHANNEL_DEFAULT_DELAY_MS = 600
+BACKCHANNEL_MODES = ("off", "rules")
+BACKCHANNEL_DEFAULT_MODE = "rules"
+
+
+@dataclass(frozen=True)
+class BackchannelSettings:
+    """本地快速接话层配置(feats/backchannel-layer/FEAT.md §8)。
+
+    默认关闭;v1 仅实现 rules 模式(hybrid 留枚举位)。
+    timeout_ms 留待 hybrid 分类器引入时再加(规则分类同步且 <10ms,无超时语义)。
+    """
+
+    enabled: bool = False
+    mode: str = BACKCHANNEL_DEFAULT_MODE
+    delay_ms: int = BACKCHANNEL_DEFAULT_DELAY_MS
+    probability: float = 1.0
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self.mode != "off"
+
+    def normalized(self) -> "BackchannelSettings":
+        mode = self.mode if self.mode in BACKCHANNEL_MODES else BACKCHANNEL_DEFAULT_MODE
+        delay = max(
+            BACKCHANNEL_MIN_DELAY_MS,
+            min(BACKCHANNEL_MAX_DELAY_MS, int(self.delay_ms)),
+        )
+        probability = max(0.0, min(1.0, float(self.probability)))
+        return BackchannelSettings(
+            enabled=bool(self.enabled),
+            mode=mode,
+            delay_ms=delay,
+            probability=probability,
+        )
+
+
 @dataclass(frozen=True)
 class AppSettingsService:
     """集中管理运行配置；唯一持久化来源是 data/config/*.yaml。"""
@@ -369,6 +408,26 @@ class AppSettingsService:
         data["ui"] = ui
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_backchannel_settings(self) -> BackchannelSettings:
+        section = self._system_section("backchannel")
+        return BackchannelSettings(
+            enabled=_bool_value(section.get("enabled"), False),
+            mode=str(section.get("mode", BACKCHANNEL_DEFAULT_MODE) or BACKCHANNEL_DEFAULT_MODE),
+            delay_ms=_int_value(section.get("delay_ms"), BACKCHANNEL_DEFAULT_DELAY_MS),
+            probability=_float_value(section.get("probability"), 1.0),
+        ).normalized()
+
+    def save_backchannel_settings(self, settings: BackchannelSettings) -> None:
+        normalized = settings.normalized()
+        data = load_yaml_mapping(self.system_config_path)
+        data["backchannel"] = {
+            "enabled": bool(normalized.enabled),
+            "mode": normalized.mode,
+            "delay_ms": int(normalized.delay_ms),
+            "probability": float(normalized.probability),
+        }
+        save_yaml_mapping(self.system_config_path, data)
+
     def load_memory_curation_settings(self):
         from app.agent.memory_curator import MemoryCurationSettings
 
@@ -445,6 +504,13 @@ def _path_for_config(path: Path | None, base_dir: Path) -> str:
 def _int_value(value: Any, default: int) -> int:
     try:
         return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_value(value: Any, default: float) -> float:
+    try:
+        return float(str(value).strip())
     except (TypeError, ValueError):
         return default
 

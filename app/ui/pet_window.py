@@ -83,6 +83,10 @@ from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
 from app.core.debug_log import debug_log, summarize_messages
 from app.config.settings_service import BubbleSettings, StartupSettings
+from app.backchannel.classifier import RuleClassifier
+from app.backchannel.controller import BackchannelController
+from app.backchannel.manifest import BackchannelManifestError, load_backchannel_manifest
+from app.backchannel.resolver import BackchannelChoice
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
     set_launch_at_login_enabled,
@@ -687,6 +691,15 @@ class PetWindow(QWidget):
             delay_seconds=self.bubble_settings.auto_hide_delay_seconds,
             parent=self,
         )
+        # 本地快速接话层:等待主 LLM 期间显示一句角色化过渡反应(默认关闭)。
+        self.backchannel_settings = self.settings_service.load_backchannel_settings()
+        self.backchannel_controller = BackchannelController(
+            RuleClassifier(),
+            self._display_backchannel,
+            settings=self.backchannel_settings,
+            parent=self,
+        )
+        self._load_backchannel_manifest_for(self.character_profile)
         self._sync_plugin_chat_ui_widgets()
 
         self._apply_theme_settings(self.theme_settings)
@@ -972,12 +985,58 @@ class PetWindow(QWidget):
         self._schedule_native_topmost_sync()
 
     def _apply_reply_segment(self, segment: ChatSegment) -> None:
+        # 正式回复开始:放弃尚未触发的接话(已显示的接话被正式字幕自然覆盖)。
+        self._cancel_backchannel()
         self.portrait_controller.apply_for_segment(segment)
         self._sync_reply_history_index_for_segment(segment)
         # 新台词开始：保持气泡显示并暂停自动隐藏倒计时。
         controller = getattr(self, "bubble_auto_hide", None)
         if controller is not None:
             controller.notify_speaking()
+
+    def _cancel_backchannel(self) -> None:
+        controller = getattr(self, "backchannel_controller", None)
+        if controller is not None:
+            controller.cancel()
+
+    def _load_backchannel_manifest_for(self, profile: CharacterProfile) -> None:
+        """加载当前角色的接话清单;缺失/非法即停用该功能(角色级 opt-out)。"""
+        controller = getattr(self, "backchannel_controller", None)
+        if controller is None:
+            return
+        path = profile.backchannel_manifest_path
+        if path is None:
+            controller.set_manifest(None)
+            return
+        try:
+            manifest = load_backchannel_manifest(path, profile=profile)
+        except BackchannelManifestError as exc:
+            debug_log("Backchannel", "接话清单加载失败,功能停用", {"error": str(exc)})
+            controller.set_manifest(None)
+            return
+        controller.set_manifest(manifest if manifest else None)
+
+    def _display_backchannel(self, choice: BackchannelChoice) -> None:
+        """显示接话:只走轻量字幕+立绘路径。
+
+        临时段绝不进入回复历史(_remember_reply_history_segments)、聊天记录
+        (_record_history)、LLM messages 上下文或分段播放队列(FEAT.md §3)。
+        """
+        segment = ChatSegment(
+            ja=choice.variant.ja,
+            zh=choice.variant.zh,
+            tone=choice.template.tone,
+            portrait=choice.template.portrait,
+        )
+        controller = getattr(self, "bubble_auto_hide", None)
+        if controller is not None:
+            # 唤回可能已被自动隐藏的气泡;倒计时由正式回复完成时的 notify_settled 重启。
+            controller.notify_speaking()
+        self.portrait_controller.apply_for_segment(segment)
+        self.subtitle_controller.set_speech(
+            segment.display_text(self.subtitle_language), pulse=True
+        )
+        self._log_interaction_stage("backchannel_shown", {"template": choice.template.id})
 
     def _remember_reply_history_segments(self, segments: list[ChatSegment]) -> None:
         clean_segments = [segment for segment in segments if segment.text.strip()]
@@ -1545,6 +1604,10 @@ class PetWindow(QWidget):
         self._log_interaction_stage("input_cleared")
         self.subtitle_controller.cancel_reply_flow("......")
         self._log_interaction_stage("placeholder_reply_shown")
+        # 等待期接话:延迟后若主回复尚未到达,显示一句角色化过渡反应。
+        backchannel = getattr(self, "backchannel_controller", None)
+        if backchannel is not None:
+            backchannel.schedule(text)
 
         visual_observation_jobs: list[VisualObservationJob] = []
         if manual_observation is not None:
@@ -2257,6 +2320,7 @@ class PetWindow(QWidget):
 
     @Slot(str)
     def _handle_error(self, message: str) -> None:
+        self._cancel_backchannel()
         self._log_interaction_stage("worker_error", {"message": message})
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages.pop()
@@ -3901,6 +3965,7 @@ class PetWindow(QWidget):
         self.name_label.setText(profile.display_name)
         self.input_edit.setPlaceholderText(f"和{profile.display_name}说点什么...")
         self.portrait_controller.set_profile(profile)
+        self._load_backchannel_manifest_for(profile)
         if hasattr(self, "tray_icon"):
             self.tray_icon.setToolTip(profile.display_name)
             self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
