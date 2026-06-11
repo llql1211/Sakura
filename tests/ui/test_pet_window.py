@@ -6182,9 +6182,15 @@ class _DummyEditableInput:
     def __init__(self, text: str) -> None:
         self._text = text
         self.cleared = False
+        self.enabled = True
+        self.placeholder = ""
+        self.properties: dict[str, object] = {}
 
     def text(self) -> str:
         return self._text
+
+    def hasFocus(self) -> bool:
+        return False
 
     def clear(self) -> None:
         self.cleared = True
@@ -6192,6 +6198,15 @@ class _DummyEditableInput:
 
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = enabled
+
+    def setPlaceholderText(self, text: str) -> None:
+        self.placeholder = text
+
+    def property(self, name: str) -> object:
+        return self.properties.get(name)
+
+    def setProperty(self, name: str, value: object) -> None:
+        self.properties[name] = value
 
 
 class _DummyTimer:
@@ -6203,6 +6218,7 @@ class _DummyButton:
     def __init__(self) -> None:
         self.enabled = True
         self.text = ""
+        self.properties: dict[str, object] = {}
 
     def setVisible(self, _visible: bool) -> None:
         pass
@@ -6212,6 +6228,12 @@ class _DummyButton:
 
     def setText(self, text: str) -> None:
         self.text = text
+
+    def property(self, name: str) -> object:
+        return self.properties.get(name)
+
+    def setProperty(self, name: str, value: object) -> None:
+        self.properties[name] = value
 
 
 class _DummySubtitleController:
@@ -6258,6 +6280,18 @@ class _DummyBubbleAutoHide:
         self.speaking_count += 1
 
 
+class _DummyInputBarAnimator:
+    def __init__(self) -> None:
+        self.sync_count = 0
+        self.feedback_count = 0
+
+    def sync(self) -> None:
+        self.sync_count += 1
+
+    def play_send_feedback(self) -> None:
+        self.feedback_count += 1
+
+
 def test_manual_screenshot_empty_input_sends_default_text() -> None:
     window, requests, history = _build_minimal_manual_screenshot_window("")
 
@@ -6271,6 +6305,10 @@ def test_manual_screenshot_empty_input_sends_default_text() -> None:
     assert window.subtitle_controller.waiting_started == 1
     assert window.subtitle_controller.cancelled_with == []
     assert window.bubble_auto_hide.speaking_count == 1
+    assert window.input_edit.placeholder == "Sakura正在思考中…"
+    assert window.input_edit.properties["replyWaiting"] is True
+    assert window.send_button.properties["replyWaiting"] is True
+    assert window.input_bar_animator.sync_count == 1
     assert window.pending_manual_screen_observation is None
     assert history
     assert "data:image/jpeg;base64" not in history[0][1]
@@ -6338,20 +6376,60 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
 
     class MinimalBusyWindow:
         _set_busy = PetWindow._set_busy
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
 
     window = MinimalBusyWindow()
+    window.character_profile = type("CharacterProfile", (), {"display_name": "Sakura"})()
+    window.startup_initializing = False
     window.input_edit = _DummyEditableInput("")
     window.screenshot_button = _DummyButton()
     window.send_button = _DummyButton()
     window.confirm_action_button = _DummyButton()
     window.cancel_action_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
     window._log_interaction_stage = lambda *_args, **_kwargs: None
 
     window._set_busy(True)
+    assert window.input_edit.enabled
     assert not window.screenshot_button.enabled
+    assert not window.send_button.enabled
+    assert window.send_button.text == "等待"
+    assert window.input_edit.placeholder == "Sakura正在思考中…"
+    assert window.input_edit.properties["replyWaiting"] is True
+    assert window.send_button.properties["replyWaiting"] is True
+    assert window.input_bar_animator.sync_count == 1
 
     window._set_busy(False)
     assert window.screenshot_button.enabled
+    assert window.send_button.enabled
+    assert window.send_button.text == "发送"
+    assert window.input_edit.placeholder == "和Sakura说点什么..."
+    assert window.input_edit.properties["replyWaiting"] is False
+    assert window.send_button.properties["replyWaiting"] is False
+    assert window.input_bar_animator.sync_count == 2
+
+
+def test_input_bar_pinned_while_waiting_reply() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalInputBarWindow:
+        _input_bar_pinned = PetWindow._input_bar_pinned
+        _any_dialog_open = lambda _self: False
+
+    window = MinimalInputBarWindow()
+    window.input_edit = _DummyEditableInput("")
+    window.pending_tool_action = None
+    window.reply_waiting_ui_active = False
+
+    assert not window._input_bar_pinned()
+
+    window.reply_waiting_ui_active = True
+
+    assert window._input_bar_pinned()
 
 
 def test_progress_reply_displays_and_records_assistant_message() -> None:
@@ -7067,6 +7145,11 @@ def _build_minimal_manual_screenshot_window(text: str):
     class MinimalManualScreenshotWindow:
         send_message = PetWindow.send_message
         _show_waiting_reply_placeholder = PetWindow._show_waiting_reply_placeholder
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
         _record_user_message = PetWindow._record_user_message
 
     window = MinimalManualScreenshotWindow()
@@ -7084,6 +7167,10 @@ def _build_minimal_manual_screenshot_window(text: str):
     window.screen_observation_enabled = True
     window.messages = []
     window.active_interaction_id = ""
+    window.startup_initializing = False
+    window.character_profile = type("CharacterProfile", (), {"display_name": "Sakura"})()
+    window.send_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
     window.subtitle_controller = _DummySubtitleController()
     window.bubble_auto_hide = _DummyBubbleAutoHide()
     window._mark_user_activity = lambda: None
@@ -7880,6 +7967,14 @@ def test_pet_input_stylesheet_has_solid_visual_effect_state() -> None:
     assert '#inputBar[visualEffectMode="solid"]' in stylesheet
     assert '#petInput[visualEffectMode="solid"]' in stylesheet
     assert '#petInput[visualEffectMode="solid"]:focus' in stylesheet
+
+
+def test_pet_input_stylesheet_has_waiting_send_button_state() -> None:
+    stylesheet = build_pet_window_stylesheet(DEFAULT_THEME_SETTINGS)
+
+    assert '#petInput[replyWaiting="true"]' not in stylesheet
+    assert "waitingBreath" not in stylesheet
+    assert '#sendButton[replyWaiting="true"]:disabled' in stylesheet
 
 
 def test_pet_window_applies_visual_effect_dynamic_property() -> None:

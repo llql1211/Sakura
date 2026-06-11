@@ -106,23 +106,22 @@ class SubtitleController(QObject):
             self.stop_waiting_indicator()
             return
         if self._reply_segments_active():
-            if clean_segments:
-                self.queued_reply_segment_batches.append(clean_segments)
-                self._log_stage(
-                    "reply_segments_queued",
-                    {
-                        "queued_batch_count": len(self.queued_reply_segment_batches),
-                        "segment_count": len(clean_segments),
-                    },
-                )
-                debug_log(
-                    "PetWindow",
-                    "当前回复未播完，后续分段已排队",
-                    {
-                        "queued_batch_count": len(self.queued_reply_segment_batches),
-                        "segments": [_segment_debug_payload(segment) for segment in clean_segments],
-                    },
-                )
+            self.queued_reply_segment_batches.append(clean_segments)
+            self._log_stage(
+                "reply_segments_queued",
+                {
+                    "queued_batch_count": len(self.queued_reply_segment_batches),
+                    "segment_count": len(clean_segments),
+                },
+            )
+            debug_log(
+                "PetWindow",
+                "当前回复未播完，后续分段已排队",
+                {
+                    "queued_batch_count": len(self.queued_reply_segment_batches),
+                    "segments": [_segment_debug_payload(segment) for segment in clean_segments],
+                },
+            )
             return
 
         self._start_reply_segments_now(clean_segments)
