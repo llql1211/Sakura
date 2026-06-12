@@ -177,6 +177,14 @@ class StoragePaths:
     def migration_backup_dir(self) -> Path:
         return self._data / "migration_backup"
 
+    # ---- 单实例锁 ----
+    def instance_lock(self) -> Path:
+        return self._data / "sakura.lock"
+
+    def qdrant_lock(self) -> Path:
+        """qdrant 内部锁文件位置；仅用于自检报告残留，不由 Sakura 管理。"""
+        return self.memory_dir / "qdrant" / ".lock"
+
     # ---- 辅助 ----
     def ensure_dirs(self) -> None:
         """确保所有存储目录存在。"""

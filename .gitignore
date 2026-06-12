@@ -39,6 +39,8 @@ data/notes/
 data/tts_bundles/
 data/logs/
 data/cache/
+data/sakura.lock
+data/migration_backup/
 tts/
 data/config/api.yaml
 data/config/characters.yaml

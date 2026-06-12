@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QProgr
 from app.core.app_context import AppContext
 from app.core.bootstrap import build_deferred_services, build_initial_app_context
 from app.core.debug_log import debug_log
+from app.core.instance import SingleInstanceGuard
+from app.core.selfcheck import run_startup_self_check
 from app.config.character_loader import CharacterConfigError
 from app.config.settings_service import AppSettingsService, StartupSettings
 from app.agent.mcp import MCPRuntimeSettings
@@ -255,6 +257,25 @@ def main() -> int:
     app.setApplicationName("Sakura Desktop Pet")
     app.setQuitOnLastWindowClosed(False)
     _force_light_palette(app)
+
+    # 单实例锁：防止双开并发写历史/配置、争抢记忆库锁。
+    # guard 需存活到进程结束（main 栈帧持有），崩溃残留锁由 QLockFile stale 检测接管。
+    instance_guard = SingleInstanceGuard(BASE_DIR)
+    if not instance_guard.acquire():
+        QMessageBox.warning(
+            None,
+            "Sakura 已在运行",
+            f"{instance_guard.holder_description()}正在运行中。\n"
+            "请先退出已有实例（可在系统托盘中找到它）。",
+        )
+        return 0
+    app.aboutToQuit.connect(instance_guard.release)
+
+    # 启动自检：仅"数据目录不可写"阻断启动，其余问题降级为日志警告
+    self_check = run_startup_self_check(BASE_DIR)
+    if self_check.fatal_issues:
+        QMessageBox.critical(None, "启动检查未通过", self_check.fatal_message())
+        return 1
 
     try:
         context = build_initial_app_context(BASE_DIR)
