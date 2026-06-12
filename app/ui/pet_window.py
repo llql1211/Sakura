@@ -1284,6 +1284,15 @@ class PetWindow(QWidget):
                 "接话音频播放请求失败",
                 {"template": choice.template.id, "error": str(exc)},
             )
+            # 正常路径的音频文件由 provider 播后/丢弃时统一清理
+            # (_finish_current_audio / discard_prepared → _schedule_audio_cleanup);
+            # 这里是唯一的缝隙:播放请求异常时句柄未入队,文件无人接管。
+            discard_prepared = getattr(self.tts_provider, "discard_prepared", None)
+            if callable(discard_prepared):
+                try:
+                    discard_prepared(handle)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _handle_backchannel_audio_finished(self, handle: TTSPreparedAudio) -> None:
         if getattr(self, "_active_backchannel_audio", None) is handle:

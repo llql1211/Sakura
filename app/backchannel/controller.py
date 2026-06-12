@@ -91,6 +91,8 @@ class BackchannelController(QObject):
             return
         self._armed = False
         label = self._classifier.classify(self._pending_text)
+        # phase 参数有意不传:相位(repeated_issue/tool_running/long_wait)
+        # 由后续迭代的会话相位跟踪器提供,v1 相位条目仅随清单预置。
         choice = self._resolver.resolve(label)
         if choice is not None:
             self._display(choice)

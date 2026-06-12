@@ -2605,7 +2605,8 @@ class SettingsDialog(QDialog):
             ),
             "backchannel_settings": BackchannelSettings(
                 enabled=self.backchannel_enabled_check.isChecked(),
-                mode="rules",
+                # mode 设置页不暴露,保存时保留 YAML 中已配置的值(如手工配置的 off)
+                mode=self.backchannel_settings.mode,
                 delay_ms=self.backchannel_delay_spin.value(),
                 probability=self.backchannel_probability_spin.value(),
                 tts_enabled=self.backchannel_tts_enabled_check.isChecked(),

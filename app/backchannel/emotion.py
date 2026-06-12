@@ -15,6 +15,7 @@ DEFAULT_EMOTION_THRESHOLD = 1.0
 _LEXICON_PATH = Path(__file__).resolve().parent / "data" / "emotion_lexicon.json"
 
 
+# maxsize=2:默认随包词典 + 测试/将来替换词典注入的自定义路径可并存不互逐
 @lru_cache(maxsize=2)
 def load_emotion_lexicon(path: Path = _LEXICON_PATH) -> dict[str, dict[str, float]]:
     """加载情感词典;非法/缺失时返回空表(打分器空转,分类器走缺省映射)。"""
@@ -61,7 +62,11 @@ class EmotionScorer:
         self._threshold = threshold
 
     def scores(self, text: str) -> dict[str, float]:
-        """各情绪累计得分。同一词只计一次;被更长命中词包含的子串词不计分。"""
+        """各情绪累计得分。同一词只计一次;被更长命中词包含的子串词不计分。
+
+        性能边界:暴力子串匹配,词典 ~150 条对短输入 <1ms;
+        词典扩到数千条(如 DUTIR 裁剪版)时应换 Aho-Corasick。
+        """
         content = (text or "").strip()
         if not content or not self._lexicon:
             return {}

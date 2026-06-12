@@ -61,7 +61,8 @@ _GREETING_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("greeting_return", ("回来了", "回来啦", "我回啦", "我回来", "到家", "下班", "放学")),
     ("greeting_morning", ("早上好", "早安", "早哇", "我醒了", "起床了")),
     ("greeting_evening", ("晚上好",)),
-    ("greeting", ("你好", "您好", "哈喽", "嗨", "hello", "Hello", "hi", "Hi", "在吗", "在不在", "在么")),
+    # 英文词只留小写:_is_complete_greeting 对输入和关键词都 casefold
+    ("greeting", ("你好", "您好", "哈喽", "嗨", "hello", "hi", "在吗", "在不在", "在么")),
 )
 _GREETING_MAX_LENGTH = 12
 _GREETING_CONFIDENCE = 0.85
