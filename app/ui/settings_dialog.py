@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 from app.agent.memory import EmbeddingModelImportResult, MemoryStore
 from app.agent.mcp import MCPRuntimeSettings, WINDOWS_MCP_EXPERIMENTAL_TEXT
 from app.core.debug_log import debug_log
+from app.storage.paths import StoragePaths
 from app.config.character_archive import (
     CharacterArchiveError,
     export_character_archive,
@@ -3389,7 +3390,7 @@ def _bundle_tts_config_display(provider: str, work_dir: Path | None) -> str:
 
 def _default_genie_onnx_dir(base_dir: Path, profile: CharacterProfile | None) -> Path:
     character_id = profile.id if profile is not None else "default"
-    return base_dir / "data" / "tts_bundles" / "onnx" / character_id
+    return StoragePaths(base_dir).tts_bundle_onnx_for(character_id)
 
 
 def _optional_path(value: str, base_dir: Path) -> Path | None:

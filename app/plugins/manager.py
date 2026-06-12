@@ -18,6 +18,7 @@ from app.plugins.adapters import contribution_to_app_tool
 from app.plugins.capabilities import PluginCapabilities
 from app.plugins.discovery import PluginDiscovery
 from app.plugins.models import PluginManifest, PluginSpec, ToolContribution
+from app.storage.paths import StoragePaths
 from sdk.plugin import PluginBase
 from sdk.plugin_host_context import PluginContext, PluginHostContext
 from sdk.register import PluginCapabilityRegistry
@@ -311,7 +312,7 @@ def _string_attr(plugin: PluginBase, name: str) -> str:
 
 def _build_plugin_context(base_dir: Path, manifest: PluginManifest) -> PluginContext:
     plugin_root = manifest.plugin_root or base_dir / "plugins" / manifest.plugin_id
-    data_dir = base_dir / "data" / "plugins" / manifest.plugin_id
+    data_dir = StoragePaths(base_dir).plugin_data_for(manifest.plugin_id)
     data_dir.mkdir(parents=True, exist_ok=True)
     manifest_view = PluginManifestView(
         plugin_id=manifest.plugin_id,

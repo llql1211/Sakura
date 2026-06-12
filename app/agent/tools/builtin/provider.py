@@ -17,6 +17,7 @@ from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
 from app.agent.tools.registry import Tool
+from app.storage.paths import StoragePaths
 
 
 class BuiltinToolProvider:
@@ -34,10 +35,13 @@ class BuiltinToolProvider:
         reminders: ReminderStore | None = None,
     ) -> None:
         self.base_dir = base_dir
-        self.memory = memory or MemoryStore(base_dir / "data" / "memory.json")
-        self.reminders = reminders or ReminderStore(base_dir / "data" / "reminders.json")
-        self._todo_store = TodoStore(base_dir / "data" / "tasks.json")
-        self._notes_store = NotesStore(base_dir / "data" / "notes")
+        paths = StoragePaths(base_dir)
+        # MemoryStore 是 dataclass，第一个字段是 base_dir；旧写法误把 json 路径
+        # 当 base_dir 传入（主链路总会注入 memory，未实际触发），一并修正
+        self.memory = memory or MemoryStore(base_dir=base_dir)
+        self.reminders = reminders or ReminderStore(paths.reminders_store())
+        self._todo_store = TodoStore(paths.tasks_store())
+        self._notes_store = NotesStore(paths.notes_dir)
 
     def contribute_tools(self) -> list[Tool]:
         """返回所有内置工具。"""

@@ -252,6 +252,7 @@ def test_genie_service_probe_adopts_existing_local_process_when_port_is_ready(mo
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
 
     class FakeConnection:
         def __enter__(self) -> "FakeConnection":
@@ -322,6 +323,7 @@ def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch)
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     connection_calls = 0
     popen_calls: list[list[str]] = []
@@ -404,6 +406,7 @@ def test_tts_service_waits_past_thirty_seconds_for_slow_gptsovits_start(monkeypa
     provider.settings = replace(_minimal_tts_settings(work_dir=work_dir), timeout_seconds=55)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     debug_messages: list[tuple[str, object]] = []
     elapsed = 0.0
@@ -460,6 +463,7 @@ def test_tts_service_probe_reports_missing_local_runtime(monkeypatch) -> None:  
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
 
     def fake_create_connection(*_args: object, **_kwargs: object) -> object:
@@ -483,6 +487,7 @@ def test_tts_service_probe_reports_incompatible_windows_runtime_on_macos(monkeyp
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
 
     def fake_create_connection(*_args: object, **_kwargs: object) -> object:
@@ -559,6 +564,7 @@ def test_genie_service_probe_starts_local_server_when_port_is_down(monkeypatch) 
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     connection_calls = 0
     popen_calls: list[list[str]] = []
@@ -652,6 +658,7 @@ def test_genie_service_probe_moves_to_fallback_port_when_9880_is_gptsovits(monke
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9880/")
     provider._service_checked = False
     provider._server_process = None
+    provider._base_dir = work_dir.parent
     messages: list[str] = []
     service_started = False
     popen_calls: list[list[str]] = []

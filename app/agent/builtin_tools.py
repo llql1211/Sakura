@@ -11,6 +11,7 @@ from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
 from app.agent.tool_registry import Tool, ToolRegistry
+from app.storage.paths import StoragePaths
 
 
 def create_builtin_tool_registry(
@@ -18,10 +19,13 @@ def create_builtin_tool_registry(
     memory: MemoryStore | None = None,
     reminders: ReminderStore | None = None,
 ) -> ToolRegistry:
-    store = TodoStore(base_dir / "data" / "tasks.json")
-    notes = NotesStore(base_dir / "data" / "notes")
-    memory = memory or MemoryStore(base_dir / "data" / "memory.json")
-    reminders = reminders or ReminderStore(base_dir / "data" / "reminders.json")
+    paths = StoragePaths(base_dir)
+    store = TodoStore(paths.tasks_store())
+    notes = NotesStore(paths.notes_dir)
+    # MemoryStore 是 dataclass，第一个字段是 base_dir；旧写法把 json 路径误传成
+    # base_dir（主链路总会注入 memory，未实际触发），这里一并修正
+    memory = memory or MemoryStore(base_dir=base_dir)
+    reminders = reminders or ReminderStore(paths.reminders_store())
     registry = ToolRegistry(
         [
             create_screen_observation_tool(),

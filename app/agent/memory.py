@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from app.storage.chat_history import ChatHistoryEntry
+from app.storage.paths import StoragePaths
 
 if TYPE_CHECKING:
     from app.llm.api_client import ApiSettings
@@ -312,7 +313,7 @@ class MemoryStore:
     def build_mem0_config(self, api_settings: "ApiSettings | None" = None) -> dict[str, Any]:
         """生成 mem0 配置：本地 Qdrant + Sakura 当前 OpenAI-compatible LLM。"""
 
-        memory_dir = self.base_dir / "data" / "memory"
+        memory_dir = StoragePaths(self.base_dir).memory_dir
         qdrant_path = memory_dir / "qdrant"
         qdrant_path.mkdir(parents=True, exist_ok=True)
         settings = self.api_settings if api_settings is None else api_settings

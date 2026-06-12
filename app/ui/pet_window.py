@@ -58,7 +58,6 @@ from app.agent.memory_curation_worker import MemoryCurationWorker
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
 from app.core.app_context import AppContext
 from app.config.character_loader import (
-    DEFAULT_CHARACTER_ID,
     THEME_SOURCE_PACKAGE,
     CharacterConfigError,
     CharacterProfile,
@@ -4101,29 +4100,20 @@ class PetWindow(QWidget):
             self.subtitle_controller.cancel_reply_flow(profile.initial_message)
 
     def _create_history_store(self, profile: CharacterProfile) -> ChatHistoryStore:
-        history_path = self.base_dir / "data" / "chat_history" / f"{profile.id}.jsonl"
-        self._migrate_legacy_history(profile, history_path)
-        return ChatHistoryStore(history_path, profile.display_name)
+        # 路径与旧历史迁移统一走 bootstrap 的公开 helper，避免两处实现漂移
+        from app.core.bootstrap import create_history_store
+
+        return create_history_store(self.base_dir, profile)
 
     def _create_runtime_event_log(self, profile: CharacterProfile) -> RuntimeEventLog:
-        event_path = self.base_dir / "data" / "runtime_events" / f"{profile.id}.jsonl"
-        return RuntimeEventLog(event_path)
+        from app.core.bootstrap import create_runtime_event_log
+
+        return create_runtime_event_log(self.base_dir, profile)
 
     def _create_visual_observation_store(self, profile: CharacterProfile) -> VisualObservationStore:
-        visual_path = self.base_dir / "data" / "visual_observations" / f"{profile.id}.jsonl"
-        return VisualObservationStore(visual_path)
+        from app.core.bootstrap import create_visual_observation_store
 
-    def _migrate_legacy_history(self, profile: CharacterProfile, history_path: Path) -> None:
-        if profile.id != DEFAULT_CHARACTER_ID or history_path.exists():
-            return
-        legacy_path = self.base_dir / "data" / "chat_history.jsonl"
-        if not legacy_path.exists():
-            return
-        try:
-            history_path.parent.mkdir(parents=True, exist_ok=True)
-            history_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
-        except OSError as exc:
-            print(f"[History] 旧历史迁移失败：{exc}")
+        return create_visual_observation_store(self.base_dir, profile)
 
 
 def _build_screen_observation_disabled_result() -> AgentResult:

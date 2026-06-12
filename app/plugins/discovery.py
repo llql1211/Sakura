@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 from app.plugins.models import PluginSpec
+from app.storage.paths import StoragePaths
 
 
 class PluginDiscovery:
@@ -26,7 +27,7 @@ class PluginDiscovery:
 
     def __init__(self, base_dir: Path, config_path: Path | None = None) -> None:
         self.base_dir = base_dir
-        self._config_path = config_path or base_dir / "data" / "config" / "plugins.yaml"
+        self._config_path = config_path or StoragePaths(base_dir).plugins_config()
 
     def discover(self) -> list[PluginSpec]:
         """发现所有已配置的插件（按优先级降序排列）。"""
@@ -154,7 +155,7 @@ def save_plugin_enabled_overrides(
     config_path: Path | None = None,
 ) -> bool:
     """保存插件启用状态覆盖配置，返回配置是否发生变化。"""
-    path = config_path or base_dir / "data" / "config" / "plugins.yaml"
+    path = config_path or StoragePaths(base_dir).plugins_config()
     raw = _load_yaml(path)
     entries = list(raw) if isinstance(raw, list) else []
     specs = PluginDiscovery(base_dir, config_path=path).discover()

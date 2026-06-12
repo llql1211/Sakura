@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from app.storage.paths import StoragePaths
 from app.voice.runtime_compat import current_platform_label, current_system_name, find_usable_runtime_python
 
 
@@ -284,7 +285,7 @@ def default_bundle_work_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
     """返回整合包对应的工作目录；已安装时解析真实解压根目录，未安装时返回预期目录。"""
 
     if entry.install_method == "script":
-        installed_dir = base_dir / "data" / "tts_bundles" / "installed" / entry.key
+        installed_dir = StoragePaths(base_dir).tts_bundle_installed_for(entry.key)
         if entry.work_dir_name:
             return installed_dir / entry.work_dir_name
         return installed_dir
@@ -331,7 +332,7 @@ def is_provider_bundle_work_dir(path: Path, base_dir: Path) -> bool:
     resolved = path.resolve()
     for root in (
         (base_dir / "tts").resolve(),
-        (base_dir / "data" / "tts_bundles" / "installed").resolve(),
+        StoragePaths(base_dir).tts_bundles_installed_dir.resolve(),
     ):
         try:
             resolved.relative_to(root)
@@ -559,7 +560,7 @@ def cleanup_stale_download_archives(base_dir: Path) -> list[Path]:
             continue
         if not _is_bundle_installed(entry, base_dir):
             continue
-        for downloads_dir in (base_dir / "tts" / "_dl", base_dir / "data" / "tts_bundles" / "downloads"):
+        for downloads_dir in (base_dir / "tts" / "_dl", StoragePaths(base_dir).tts_bundles_downloads_dir):
             archive = downloads_dir / entry.filename
             if not archive.is_file():
                 continue
@@ -585,7 +586,7 @@ def _run_script_bundle_installer(
         raise RuntimeError(f"{entry.label} 缺少安装脚本。")
 
     script = _resolve_installer_script(entry.installer_script, base_dir)
-    bundle_base = base_dir / "data" / "tts_bundles"
+    bundle_base = StoragePaths(base_dir).tts_bundles_dir
     installed_dir = bundle_base / "installed" / entry.key
     install_tmp_dir = bundle_base / "tmp" / entry.key
     downloads_dir = bundle_base / "downloads"
@@ -758,7 +759,7 @@ def _short_bundle_install_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
 
 
 def _legacy_bundle_install_dir(entry: TTSBundleEntry, base_dir: Path) -> Path:
-    return base_dir / "data" / "tts_bundles" / "installed" / entry.key
+    return StoragePaths(base_dir).tts_bundle_installed_for(entry.key)
 
 
 def _is_bundle_installed(entry: TTSBundleEntry, base_dir: Path) -> bool:

@@ -29,6 +29,7 @@ from app.voice.tts import (
     TTSProvider,
     purge_tts_cache,
 )
+from app.storage.paths import StoragePaths
 from app.storage.visual_observation import VisualObservationStore
 from app.core.plugin_manager import SakuraPluginManager
 
@@ -128,7 +129,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         scope_id=character_profile.id,
     )
     memory_store.preload(wait=False)
-    reminder_store = ReminderStore(base_dir / "data" / "reminders.json")
+    reminder_store = ReminderStore(StoragePaths(base_dir).reminders_store())
     tool_registry = create_builtin_tool_registry(
         base_dir,
         memory_store,
@@ -146,14 +147,14 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         tools=tool_registry,
         memory=memory_store,
     )
-    history_store = _create_history_store(base_dir, character_profile)
-    runtime_event_log = _create_runtime_event_log(base_dir, character_profile)
-    visual_observation_store = _create_visual_observation_store(base_dir, character_profile)
+    history_store = create_history_store(base_dir, character_profile)
+    runtime_event_log = create_runtime_event_log(base_dir, character_profile)
+    visual_observation_store = create_visual_observation_store(base_dir, character_profile)
     debug_log_settings = settings_service.load_debug_log_settings()
     startup_settings = settings_service.load_startup_settings()
     memory_curation_settings = settings_service.load_memory_curation_settings()
     memory_curation_state = MemoryCurationState(
-        base_dir / "data" / "memory_curation_state.json"
+        StoragePaths(base_dir).memory_curation_state()
     )
     memory_curator = MemoryCurator(api_client, memory_store)
     proactive_care_settings = settings_service.load_proactive_care_settings()
@@ -334,34 +335,35 @@ def _normalize_portrait_scale_percent(value: object) -> int:
     return max(PORTRAIT_SCALE_MIN_PERCENT, min(PORTRAIT_SCALE_MAX_PERCENT, percent))
 
 
-def _create_history_store(base_dir: Path, profile: CharacterProfile) -> ChatHistoryStore:
-    history_path = base_dir / "data" / "chat_history" / f"{profile.id}.jsonl"
+def create_history_store(base_dir: Path, profile: CharacterProfile) -> ChatHistoryStore:
+    """按角色创建聊天历史存储；路径统一来自 StoragePaths（pet_window 复用）。"""
+    history_path = StoragePaths(base_dir).chat_history_for(profile.id)
     _migrate_legacy_history(base_dir, profile, history_path)
     return ChatHistoryStore(history_path, profile.display_name)
 
 
-def _create_runtime_event_log(base_dir: Path, profile: CharacterProfile) -> RuntimeEventLog:
+def create_runtime_event_log(base_dir: Path, profile: CharacterProfile) -> RuntimeEventLog:
     """按角色创建运行时事件日志（与聊天历史路径风格一致，但完全独立）。"""
-    event_path = base_dir / "data" / "runtime_events" / f"{profile.id}.jsonl"
+    event_path = StoragePaths(base_dir).runtime_events_for(profile.id)
     return RuntimeEventLog(event_path)
 
 
-def _create_visual_observation_store(
+def create_visual_observation_store(
     base_dir: Path,
     profile: CharacterProfile,
 ) -> VisualObservationStore:
-    visual_path = base_dir / "data" / "visual_observations" / f"{profile.id}.jsonl"
+    visual_path = StoragePaths(base_dir).visual_observations_for(profile.id)
     return VisualObservationStore(visual_path)
 
 
 def _migrate_legacy_history(base_dir: Path, profile: CharacterProfile, history_path: Path) -> None:
     if profile.id != DEFAULT_CHARACTER_ID or history_path.exists():
         return
-    legacy_path = base_dir / "data" / "chat_history.jsonl"
+    legacy_path = StoragePaths(base_dir).legacy_chat_history()
     if not legacy_path.exists():
         return
     try:
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
     except OSError as exc:
-        print(f"[History] 旧历史迁移失败：{exc}")
+        debug_log("History", "旧历史迁移失败", {"error": str(exc), "legacy": str(legacy_path)})

@@ -35,6 +35,7 @@ from app.config.character_loader import CharacterProfile
 from app.core.gui_log import record_tts_service_output
 from app.llm.chat_reply import DEFAULT_TONE
 from app.core.debug_log import debug_log
+from app.storage.paths import StoragePaths
 from app.voice.runtime_compat import find_usable_runtime_python, format_runtime_python_issue
 
 
@@ -59,15 +60,18 @@ _SUPPORTED_TTS_PROVIDERS = {
 }
 
 
+def _resolve_project_root(base_dir: Path | None = None) -> Path:
+    """解析项目根目录；base_dir 为空时基于 __file__ 推算（app/voice/tts.py → 项目根），
+    与 main.py 的路径惯例一致。"""
+    return Path(base_dir) if base_dir is not None else Path(__file__).resolve().parents[2]
+
+
 def _resolve_tts_cache_dir(base_dir: Path | None = None) -> Path:
     """返回 TTS 临时音频缓存目录（data/cache/tts），并确保存在。
 
     不再写入系统 Temp，改用 Sakura 自有数据目录，便于集中管理与启动清理。
-    base_dir 为空时基于 __file__ 推算项目根（app/voice/tts.py → 项目根），
-    与 main.py 的路径惯例一致。
     """
-    root = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parents[2]
-    cache_dir = root / "data" / "cache" / "tts"
+    cache_dir = StoragePaths(_resolve_project_root(base_dir)).tts_cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -403,6 +407,7 @@ class GPTSoVITSTTSProvider(QObject):
         # TTS 临时音频缓存目录（data/cache/tts）。由调用方注入 base_dir，
         # 与启动清理 purge_tts_cache(base_dir) 同源，避免写入目录与清理目录错位。
         # base_dir 为空时退回 _resolve_tts_cache_dir 的 __file__ 推算，保持向后兼容。
+        self._base_dir = Path(base_dir) if base_dir is not None else None
         self._tts_cache_dir = _resolve_tts_cache_dir(base_dir)
         # 队列元素：(音频路径, 开始回调, 完成回调, 预生成句柄, 合成文本)
         self._pending_audio: list[
@@ -794,7 +799,7 @@ class GPTSoVITSTTSProvider(QObject):
         while time.monotonic() < deadline:
             exit_code = self._server_process.poll() if self._server_process is not None else None
             if exit_code is not None:
-                log_path = _local_tts_service_log_path(self.settings.provider)
+                log_path = _local_tts_service_log_path(self.settings.provider, getattr(self, "_base_dir", None))
                 fail_callback(
                     f"GPT-SoVITS 本地服务进程已退出，退出码：{exit_code}。"
                     f"请查看启动日志：{log_path}"
@@ -816,7 +821,7 @@ class GPTSoVITSTTSProvider(QObject):
 
         fail_callback(
             f"GPT-SoVITS 已尝试启动，但端口仍不可用：{self.settings.api_url}。"
-            f"请查看启动日志：{_local_tts_service_log_path(self.settings.provider)}"
+            f"请查看启动日志：{_local_tts_service_log_path(self.settings.provider, getattr(self, "_base_dir", None))}"
         )
         return False
 
@@ -909,7 +914,7 @@ class GPTSoVITSTTSProvider(QObject):
             return True
 
         try:
-            log_path = _local_tts_service_log_path(self.settings.provider)
+            log_path = _local_tts_service_log_path(self.settings.provider, getattr(self, "_base_dir", None))
             log_path.parent.mkdir(parents=True, exist_ok=True)
             kwargs: dict[str, object] = {
                 "cwd": str(work_dir),
@@ -946,7 +951,7 @@ class GPTSoVITSTTSProvider(QObject):
             {
                 "work_dir": str(work_dir),
                 "pid": self._server_process.pid,
-                "log_path": str(_local_tts_service_log_path(self.settings.provider)),
+                "log_path": str(_local_tts_service_log_path(self.settings.provider, getattr(self, "_base_dir", None))),
             },
         )
         return True
@@ -1807,7 +1812,7 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
             }
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW")
-            log_path = _local_tts_service_log_path(self.settings.provider)
+            log_path = _local_tts_service_log_path(self.settings.provider, getattr(self, "_base_dir", None))
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as log_file:
                 log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 Genie TTS：{work_dir}\n")
@@ -2328,11 +2333,14 @@ def _probe_failure_message(service_name: str, purpose: str, *, timeout: bool) ->
     return "服务探测超时" if timeout else "服务不可用"
 
 
-def _local_tts_service_log_path(provider: str) -> Path:
-    """返回本地 TTS 子进程启动日志路径。"""
+def _local_tts_service_log_path(provider: str, base_dir: Path | None = None) -> Path:
+    """返回本地 TTS 子进程启动日志路径。
 
-    safe_provider = re.sub(r"[^A-Za-z0-9_.-]+", "-", provider.strip().lower()) or "tts"
-    return Path.cwd() / "data" / "logs" / f"{safe_provider}-service.log"
+    旧实现基于 Path.cwd()，工作目录与安装目录不一致时日志会写错位置；
+    现统一走 StoragePaths（base_dir 缺省时与缓存目录同样按 __file__ 推算根）。
+    """
+
+    return StoragePaths(_resolve_project_root(base_dir)).tts_service_log(provider)
 
 
 def _start_local_tts_output_reader(
