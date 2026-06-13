@@ -54,6 +54,14 @@ _EXCLAMATION_RUN = re.compile(r"[!！]{2,}")
 _QUESTION_MARKS = re.compile(r"[?？]")
 _CODE_FENCE = "```"
 
+# 否定/虚指语境里的 什么/怎么 不表疑问(没有什么/什么都没/怎么会…)。
+# 计 question 信号前先抹掉,避免把陈述句("没有什么特别的")和情绪反问
+# ("怎么会有这样的人")误判成提问——这是规则层在情感域 OOS 误接的主因。
+_QUESTION_FALSE_CONTEXTS = re.compile(
+    r"没有什么|没什么|什么都|什么也|不算什么|算不了什么|"
+    r"怎么会|怎么能|怎么这么|怎么总是|怎么老是|怎么又"
+)
+
 # 社交礼仪句(greeting 家族):高度程式化的封闭集,会话分析中的相邻对首件。
 # 仅对短输入短路(长句里"我回来了,帮我查…"应让任务意图按正常计分胜出)。
 _GREETING_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -153,10 +161,18 @@ class RuleClassifier:
         suffix = normalized[len(base):]
         return all(char in _GREETING_ALLOWED_SUFFIX for char in suffix)
 
+    def _count_question_signals(self, content: str) -> int:
+        # 先抹掉否定/虚指里的 什么/怎么,再计疑问词,避免"没有什么/怎么会"假触发。
+        masked = _QUESTION_FALSE_CONTEXTS.sub("", content)
+        return sum(1 for keyword in _INTENT_KEYWORDS["question"] if keyword in masked)
+
     def _classify_intent(self, content: str) -> tuple[str | None, int]:
         scores: dict[str, int] = {}
         for intent, keywords in _INTENT_KEYWORDS.items():
-            count = sum(1 for keyword in keywords if keyword in content)
+            if intent == "question":
+                count = self._count_question_signals(content)
+            else:
+                count = sum(1 for keyword in keywords if keyword in content)
             if count:
                 scores[intent] = count
         # 代码块/报错栈是 error 的强信号(报错往往整段粘贴而不含中文关键词)。

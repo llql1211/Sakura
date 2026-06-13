@@ -9,7 +9,9 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from app.backchannel.embedding_classifier import DEFAULT_BACKCHANNEL_EMBEDDING_MODEL
+# 接话意图分类用的句向量底座(probe 头骑在它上面)。常量定义在此(bge 缓存的归属地),
+# 不再从 embedding_classifier 导入——后者将随零样本原型方案一并移除。
+DEFAULT_BACKCHANNEL_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 
 BACKCHANNEL_MODEL_CACHE_NAME = "models--" + DEFAULT_BACKCHANNEL_EMBEDDING_MODEL.replace("/", "--")
 DEFAULT_HUGGINGFACE_ENDPOINT = "https://huggingface.co"

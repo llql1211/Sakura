@@ -1672,9 +1672,7 @@ def test_settings_dialog_returns_backchannel_settings() -> None:
     assert not dialog.backchannel_tts_enabled_check.isEnabled()
     assert dialog.backchannel_download_model_button.isEnabled()
     assert dialog.backchannel_import_model_button.isEnabled()
-    assert dialog.backchannel_init_prototypes_button.isEnabled()
     assert dialog.backchannel_refresh_status_button.isEnabled()
-    assert dialog.backchannel_show_prototypes_button.isEnabled()
     dialog.backchannel_enabled_check.setChecked(True)
     dialog.backchannel_tts_enabled_check.setChecked(True)
     dialog.backchannel_mode_combo.setCurrentIndex(dialog.backchannel_mode_combo.findData("hybrid"))
@@ -4523,125 +4521,6 @@ def test_settings_dialog_refreshes_backchannel_setup_status(monkeypatch) -> None
 
     assert "模型增强可用" in dialog.backchannel_model_status_label.text()
     assert "缺模型" not in dialog.backchannel_setup_hint_label.text()
-    dialog.deleteLater()
-    app.processEvents()
-
-
-def test_settings_dialog_initializes_backchannel_prototypes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not hasattr(qtwidgets, "QApplication"):
-        pytest.skip("当前测试环境只提供了 PySide6 stub。")
-
-    from app.ui import settings_dialog as settings_dialog_module
-    from app.ui.settings_dialog import SettingsDialog
-
-    class BuildResult:
-        output_path = Path("runtime/backchannel/prototypes/intent_prototypes.local.json")
-        total_rows = 2
-        accepted_rows = 2
-        skipped_rows = 0
-        counts = {"request": 1, "question": 1}
-        samples = {"request": ("帮我总结一下",), "question": ("这是什么意思",)}
-
-        @property
-        def total_prototypes(self) -> int:
-            return 2
-
-    initialized_paths: list[tuple[Path, ...]] = []
-
-    def fake_build(paths, *, base_dir):  # type: ignore[no-untyped-def]
-        initialized_paths.append(tuple(paths))
-        return BuildResult()
-
-    QApplication = qtwidgets.QApplication
-    app = QApplication.instance() or QApplication([])
-    root = _ui_runtime_root("backchannel_prototype_init_dialog")
-    data_path = root / "massive.jsonl"
-    data_path.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(settings_dialog_module, "build_intent_prototypes_from_files", fake_build)
-    monkeypatch.setattr(
-        settings_dialog_module.QFileDialog,
-        "getOpenFileNames",
-        lambda *_args, **_kwargs: ([str(data_path)], "数据文件 (*.json *.jsonl *.csv *.tsv *.txt)"),
-    )
-    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(settings_dialog_module.QMessageBox, "warning", lambda *_args, **_kwargs: None)
-    dialog = SettingsDialog(
-        api_settings=ApiSettings(
-            base_url="https://api.example.com/v1",
-            api_key="test-key",
-            model="test-model",
-        ),
-        tts_settings=_minimal_tts_settings(),
-        base_dir=root,
-        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
-        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
-    )
-
-    assert hasattr(dialog, "backchannel_init_prototypes_button")
-    dialog.backchannel_init_prototypes_button.click()
-
-    assert _process_events_until(app, lambda: dialog._backchannel_prototype_init_thread is None)
-    assert initialized_paths == [(data_path,)]
-    dialog.deleteLater()
-    app.processEvents()
-
-
-def test_settings_dialog_shows_backchannel_prototype_summary(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not hasattr(qtwidgets, "QApplication"):
-        pytest.skip("当前测试环境只提供了 PySide6 stub。")
-
-    from app.backchannel.prototypes import load_intent_prototypes, local_intent_prototypes_path
-    from app.ui import settings_dialog as settings_dialog_module
-    from app.ui.settings_dialog import SettingsDialog
-
-    QApplication = qtwidgets.QApplication
-    app = QApplication.instance() or QApplication([])
-    root = _ui_runtime_root("backchannel_prototype_summary_dialog")
-    local_path = local_intent_prototypes_path(root)
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    local_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "entries": {
-                    "request": [{"text": "帮我总结一下", "source": "sample.jsonl"}],
-                    "question": [{"text": "这是什么意思", "source": "sample.jsonl"}],
-                },
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    load_intent_prototypes.cache_clear()
-    messages: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        settings_dialog_module.QMessageBox,
-        "information",
-        lambda _parent, title, message: messages.append((title, message)),
-    )
-    dialog = SettingsDialog(
-        api_settings=ApiSettings(
-            base_url="https://api.example.com/v1",
-            api_key="test-key",
-            model="test-model",
-        ),
-        tts_settings=_minimal_tts_settings(),
-        base_dir=root,
-        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
-        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
-    )
-
-    dialog.backchannel_show_prototypes_button.click()
-
-    assert messages
-    assert messages[-1][0] == "意图数据摘要"
-    assert "本地样本：2 条" in messages[-1][1]
-    assert "request: 1 条" in messages[-1][1]
-    assert "帮我总结一下" in messages[-1][1]
     dialog.deleteLater()
     app.processEvents()
 

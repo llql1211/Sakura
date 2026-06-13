@@ -121,6 +121,14 @@ def test_question_mark_alone_is_question(classifier: RuleClassifier) -> None:
     assert label.intent == "question"
 
 
+@pytest.mark.parametrize("text", ["没有什么特别的", "怎么会有这样的人"])
+def test_false_question_contexts_do_not_trigger_question(
+    classifier: RuleClassifier,
+    text: str,
+) -> None:
+    assert classifier.classify(text) is None
+
+
 def test_polite_request_does_not_trigger_complaint_by_fan_substring(
     classifier: RuleClassifier,
 ) -> None:

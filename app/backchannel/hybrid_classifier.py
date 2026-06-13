@@ -1,45 +1,42 @@
 from __future__ import annotations
 
 from app.backchannel.classifier import RuleClassifier
-from app.backchannel.embedding_classifier import EmbeddingIntentClassifier
 from app.backchannel.model_cache import backchannel_model_cache_kwargs
 from app.backchannel.models import BackchannelLabel
-from app.backchannel.prototypes import load_runtime_intent_prototypes
+from app.backchannel.probe_classifier import ProbeIntentClassifier
 
 
 class HybridBackchannelClassifier:
     """rules-first hybrid classifier。
 
-    规则层负责高精度信号;embedding 层只补足规则无命中的中文意图泛化。
+    规则层负责高精度信号(问候/报错等关键词);probe 层(bge 句向量 +
+    标注数据训练出的分类头)补足规则无命中的中文情感/意图泛化。
     """
 
-    # 首次 classify 会冷加载句向量模型(数秒)+ 编码原型,必须派发到后台线程。
+    # 首次 classify 会冷加载句向量模型(数秒),必须派发到后台线程。
     prefers_background = True
 
     def __init__(
         self,
         rule_classifier: RuleClassifier | None = None,
-        embedding_classifier: EmbeddingIntentClassifier | None = None,
+        probe_classifier: ProbeIntentClassifier | None = None,
     ) -> None:
         self._rule_classifier = rule_classifier if rule_classifier is not None else RuleClassifier()
-        self._embedding_classifier = (
-            embedding_classifier
-            if embedding_classifier is not None
-            else EmbeddingIntentClassifier()
+        self._probe_classifier = (
+            probe_classifier if probe_classifier is not None else ProbeIntentClassifier()
         )
 
     @classmethod
     def from_model_cache(cls, base_dir) -> "HybridBackchannelClassifier":  # type: ignore[no-untyped-def]
         return cls(
-            embedding_classifier=EmbeddingIntentClassifier(
-                prototypes=load_runtime_intent_prototypes(base_dir),
-                model_kwargs=backchannel_model_cache_kwargs(base_dir),
+            probe_classifier=ProbeIntentClassifier(
+                model_kwargs=backchannel_model_cache_kwargs(base_dir)
             )
         )
 
     def preload(self) -> None:
-        """预加载底层 embedding 分类器的模型与原型向量。"""
-        preload_fn = getattr(self._embedding_classifier, "preload", None)
+        """预加载底层 probe 头与句向量模型。"""
+        preload_fn = getattr(self._probe_classifier, "preload", None)
         if callable(preload_fn):
             preload_fn()
 
@@ -48,7 +45,7 @@ class HybridBackchannelClassifier:
         if rule_label is not None:
             return rule_label
 
-        result = self._embedding_classifier.classify_intent(text)
+        result = self._probe_classifier.classify_intent(text)
         if result is None:
             return None
         intent, confidence = result

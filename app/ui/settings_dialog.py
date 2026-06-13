@@ -44,20 +44,15 @@ from PySide6.QtWidgets import (
 
 from app.agent.memory import EmbeddingModelImportResult, MemoryStore
 from app.agent.mcp import MCPRuntimeSettings, WINDOWS_MCP_EXPERIMENTAL_TEXT
-from app.backchannel.embedding_classifier import DEFAULT_BACKCHANNEL_EMBEDDING_MODEL
 from app.backchannel.model_cache import (
     BACKCHANNEL_MODEL_CACHE_NAME,
+    DEFAULT_BACKCHANNEL_EMBEDDING_MODEL,
     BackchannelModelImportResult,
     backchannel_model_endpoint,
     backchannel_model_cached,
     download_backchannel_model,
     import_backchannel_model_archive,
 )
-from app.backchannel.prototype_builder import (
-    PrototypeBuildResult,
-    build_intent_prototypes_from_files,
-)
-from app.backchannel.prototypes import load_intent_prototypes, local_intent_prototypes_path
 from app.core.debug_log import debug_log
 from app.config.character_archive import (
     CharacterArchiveError,
@@ -459,31 +454,6 @@ class BackchannelModelDownloadWorker(QObject):
             self.finished.emit()
 
 
-class BackchannelPrototypeInitWorker(QObject):
-    succeeded = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, base_dir: Path, input_paths: tuple[Path, ...]) -> None:
-        super().__init__()
-        self.base_dir = base_dir
-        self.input_paths = input_paths
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            result = build_intent_prototypes_from_files(
-                self.input_paths,
-                base_dir=self.base_dir,
-            )
-        except Exception as exc:  # UI 边界统一转成可读错误。
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(result)
-        finally:
-            self.finished.emit()
-
-
 class ThemeAiWorker(QObject):
     succeeded = Signal(object)
     failed = Signal(str)
@@ -685,8 +655,6 @@ class SettingsDialog(QDialog):
         self._backchannel_model_import_worker: BackchannelModelImportWorker | None = None
         self._backchannel_model_download_thread: QThread | None = None
         self._backchannel_model_download_worker: BackchannelModelDownloadWorker | None = None
-        self._backchannel_prototype_init_thread: QThread | None = None
-        self._backchannel_prototype_init_worker: BackchannelPrototypeInitWorker | None = None
         self._theme_ai_thread: QThread | None = None
         self._theme_ai_worker: ThemeAiWorker | None = None
         self._theme_ai_enabled = self.theme_settings.ai_enabled
@@ -1618,18 +1586,8 @@ class SettingsDialog(QDialog):
         )
         self.backchannel_import_model_button.clicked.connect(self._import_backchannel_model_archive)
         self.backchannel_refresh_status_button = QPushButton("重新检测", tab)
-        self.backchannel_refresh_status_button.setToolTip("重新检测接话模型和本地意图数据状态。")
+        self.backchannel_refresh_status_button.setToolTip("重新检测接话模型状态。")
         self.backchannel_refresh_status_button.clicked.connect(self._refresh_backchannel_setup_status)
-        self.backchannel_prototype_status_label = QLabel(self._backchannel_prototype_status_text(), tab)
-        self.backchannel_prototype_status_label.setWordWrap(True)
-        self.backchannel_init_prototypes_button = QPushButton("初始化意图数据", tab)
-        self.backchannel_init_prototypes_button.setToolTip(
-            "从本地 MASSIVE/SMP/CPED/CrossWOZ 等数据文件生成接话意图样本；不会上传。"
-        )
-        self.backchannel_init_prototypes_button.clicked.connect(self._init_backchannel_prototypes)
-        self.backchannel_show_prototypes_button = QPushButton("查看摘要", tab)
-        self.backchannel_show_prototypes_button.setToolTip("查看本地初始化结果的意图分布和样例。")
-        self.backchannel_show_prototypes_button.clicked.connect(self._show_backchannel_prototype_summary)
         self.backchannel_enabled_check.toggled.connect(self._sync_backchannel_controls)
         self.backchannel_mode_combo.currentIndexChanged.connect(
             lambda _index: self._refresh_backchannel_setup_status()
@@ -1684,11 +1642,6 @@ class SettingsDialog(QDialog):
         backchannel_model_layout.addWidget(self.backchannel_import_model_button)
         backchannel_model_layout.addWidget(self.backchannel_refresh_status_button)
         backchannel_form.addRow("接话模型", backchannel_model_layout)
-        backchannel_data_layout = QHBoxLayout()
-        backchannel_data_layout.addWidget(self.backchannel_prototype_status_label, 1)
-        backchannel_data_layout.addWidget(self.backchannel_init_prototypes_button)
-        backchannel_data_layout.addWidget(self.backchannel_show_prototypes_button)
-        backchannel_form.addRow("意图数据", backchannel_data_layout)
         self._backchannel_form_layout = backchannel_form
 
         layout = QVBoxLayout()
@@ -1997,97 +1950,11 @@ class SettingsDialog(QDialog):
             return
         self._start_backchannel_model_download()
 
-    def _init_backchannel_prototypes(self) -> None:
-        if self._backchannel_prototype_init_thread is not None:
-            QMessageBox.information(self, "初始化中", "接话意图数据正在初始化，请等待完成。")
-            return
-        path_texts, _ = QFileDialog.getOpenFileNames(
-            self,
-            "选择接话意图数据文件",
-            str(self.base_dir),
-            "数据文件 (*.json *.jsonl *.csv *.tsv *.txt)",
-        )
-        paths = tuple(Path(path) for path in path_texts)
-        if not paths:
-            return
-        self._start_backchannel_prototype_init(paths)
-
     def _refresh_backchannel_setup_status(self) -> None:
         if hasattr(self, "backchannel_setup_hint_label"):
             self.backchannel_setup_hint_label.setText(self._backchannel_setup_hint_text())
         if hasattr(self, "backchannel_model_status_label"):
             self.backchannel_model_status_label.setText(self._backchannel_model_status_text())
-        if hasattr(self, "backchannel_prototype_status_label"):
-            self.backchannel_prototype_status_label.setText(self._backchannel_prototype_status_text())
-
-    def _show_backchannel_prototype_summary(self) -> None:
-        path = local_intent_prototypes_path(self.base_dir)
-        if not path.exists():
-            QMessageBox.information(
-                self,
-                "意图数据摘要",
-                "尚未初始化本地接话意图数据；当前只会使用内置 seed。",
-            )
-            return
-        prototypes = load_intent_prototypes(path)
-        if not prototypes:
-            QMessageBox.information(
-                self,
-                "意图数据摘要",
-                f"本地数据文件存在但没有可用样本：{path}",
-            )
-            return
-
-        counts: dict[str, int] = {}
-        sources: dict[str, int] = {}
-        samples: dict[str, list[str]] = {}
-        for prototype in prototypes:
-            counts[prototype.intent] = counts.get(prototype.intent, 0) + 1
-            sources[prototype.source] = sources.get(prototype.source, 0) + 1
-            bucket = samples.setdefault(prototype.intent, [])
-            if len(bucket) < 2:
-                bucket.append(prototype.text)
-
-        intent_lines = []
-        for intent in sorted(counts):
-            sample_text = " / ".join(samples.get(intent, ()))
-            intent_lines.append(f"{intent}: {counts[intent]} 条（{sample_text}）")
-        source_text = "，".join(
-            f"{source}={count}" for source, count in sorted(sources.items())[:6]
-        )
-        if len(sources) > 6:
-            source_text += f"，另 {len(sources) - 6} 个来源"
-
-        QMessageBox.information(
-            self,
-            "意图数据摘要",
-            (
-                f"本地样本：{len(prototypes)} 条\n"
-                f"文件位置：{path}\n"
-                f"来源：{source_text or '未知'}\n\n"
-                + "\n".join(intent_lines)
-            ),
-        )
-
-    def _start_backchannel_prototype_init(self, input_paths: tuple[Path, ...]) -> None:
-        self._set_backchannel_prototype_init_busy(True)
-        if hasattr(self, "backchannel_prototype_status_label"):
-            self.backchannel_prototype_status_label.setText("正在初始化本地意图数据...")
-
-        thread = QThread()
-        worker = BackchannelPrototypeInitWorker(self.base_dir, input_paths)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.succeeded.connect(self._handle_backchannel_prototype_init_success)
-        worker.failed.connect(self._handle_backchannel_prototype_init_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._reset_backchannel_prototype_init_worker)
-
-        self._backchannel_prototype_init_thread = thread
-        self._backchannel_prototype_init_worker = worker
-        thread.start()
 
     def _start_backchannel_model_import(self, archive_path: Path) -> None:
         self._set_backchannel_model_import_busy(True)
@@ -2212,67 +2079,18 @@ class SettingsDialog(QDialog):
             return f"已导入 {DEFAULT_BACKCHANNEL_EMBEDDING_MODEL}；切换到模型增强后启用。"
         return "未导入模型；模型增强会自动使用规则模式降级。"
 
-    @Slot(object)
-    def _handle_backchannel_prototype_init_success(self, result: PrototypeBuildResult) -> None:
-        if hasattr(self, "backchannel_prototype_status_label"):
-            self.backchannel_prototype_status_label.setText(self._backchannel_prototype_status_text())
-        QMessageBox.information(
-            self,
-            "初始化完成",
-            (
-                f"已生成 {result.total_prototypes} 条本地接话意图样本。\n"
-                f"输出位置：{result.output_path}\n"
-                f"命中分布：{_format_intent_counts(result.counts)}"
-            ),
-        )
-
-    @Slot(str)
-    def _handle_backchannel_prototype_init_failed(self, message: str) -> None:
-        if hasattr(self, "backchannel_prototype_status_label"):
-            self.backchannel_prototype_status_label.setText(f"初始化失败：{message}")
-        QMessageBox.warning(self, "初始化失败", message)
-
-    @Slot()
-    def _reset_backchannel_prototype_init_worker(self) -> None:
-        self._backchannel_prototype_init_thread = None
-        self._backchannel_prototype_init_worker = None
-        self._set_backchannel_prototype_init_busy(False)
-        if hasattr(self, "backchannel_prototype_status_label"):
-            self.backchannel_prototype_status_label.setText(self._backchannel_prototype_status_text())
-
-    def _set_backchannel_prototype_init_busy(self, busy: bool) -> None:
-        if hasattr(self, "backchannel_init_prototypes_button"):
-            self.backchannel_init_prototypes_button.setEnabled(not busy)
-        if hasattr(self, "backchannel_show_prototypes_button"):
-            self.backchannel_show_prototypes_button.setEnabled(not busy)
-
-    def _backchannel_prototype_status_text(self) -> str:
-        path = local_intent_prototypes_path(self.base_dir)
-        if not path.exists():
-            return "未初始化;当前仅使用内置 seed。"
-        prototypes = load_intent_prototypes(path)
-        if not prototypes:
-            return "本地意图数据为空;当前仅使用内置 seed。"
-        return f"已初始化 {len(prototypes)} 条本地意图样本。"
-
     def _backchannel_setup_hint_text(self) -> str:
         enabled = self._selected_backchannel_enabled()
         mode = self._selected_backchannel_mode()
         model_ready = backchannel_model_cached(self.base_dir)
-        local_path = local_intent_prototypes_path(self.base_dir)
-        local_data_ready = local_path.exists() and bool(load_intent_prototypes(local_path))
 
         if not enabled:
-            return "接话当前关闭；仍可先导入模型和初始化本地意图数据。"
+            return "接话当前关闭；仍可先导入句向量模型备用。"
         if mode == "rules":
-            return "当前使用规则模式；模型和本地意图数据可作为后续模型增强的前置准备。"
-        if model_ready and local_data_ready:
-            return "模型增强已就绪；保存后会规则优先，并用本地中文意图样本补足泛化。"
+            return "当前使用规则模式；句向量模型可作为后续模型增强(probe)的前置准备。"
         if model_ready:
-            return "模型已就绪；建议再初始化本地意图数据，让中文意图样本更贴近用户场景。"
-        if local_data_ready:
-            return "本地意图数据已就绪；导入模型后才能启用 embedding 泛化。"
-        return "已选择模型增强；缺模型或低置信时会自动降级，不会强行接话。"
+            return "模型增强已就绪；保存后规则优先，规则无命中时由 probe 分类头补足泛化。"
+        return "已选择模型增强；缺句向量模型或低置信时会自动降级到规则，不会强行接话。"
 
     def _selected_backchannel_mode(self) -> str:
         combo = getattr(self, "backchannel_mode_combo", None)
@@ -3293,8 +3111,6 @@ class SettingsDialog(QDialog):
             return "接话模型正在导入，请等待完成后再关闭设置。"
         if getattr(self, "_backchannel_model_download_thread", None) is not None:
             return "接话模型正在在线安装，请等待完成后再关闭设置。"
-        if getattr(self, "_backchannel_prototype_init_thread", None) is not None:
-            return "接话意图数据正在初始化，请等待完成后再关闭设置。"
         return ""
 
     def reject(self) -> None:
@@ -4063,12 +3879,6 @@ def _compact_memory_id(memory_id: str) -> str:
     if len(memory_id) <= 16:
         return memory_id
     return f"{memory_id[:8]}...{memory_id[-4:]}"
-
-
-def _format_intent_counts(counts: dict[str, int]) -> str:
-    if not counts:
-        return "无"
-    return "，".join(f"{intent}={count}" for intent, count in sorted(counts.items()))
 
 
 def _memory_row_background(row: int, checked: bool, theme: ThemeSettings) -> QBrush:
