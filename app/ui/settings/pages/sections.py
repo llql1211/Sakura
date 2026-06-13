@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -940,11 +940,9 @@ class MemorySettingsPage:
         layout.addWidget(owner.memory_editor_container)
         tab.setLayout(layout)
 
-        loading_text = owner._memory_loading_text()
-        owner.memory_status_label.setText(loading_text)
-        owner._show_memory_placeholder(loading_text)
+        owner.memory_status_label.setText("打开记忆页时读取长期记忆。")
+        owner._show_memory_placeholder("切换到记忆页后读取长期记忆。")
         owner._clear_memory_editor()
-        QTimer.singleShot(0, owner._load_memory_entries)
         return tab
 
 

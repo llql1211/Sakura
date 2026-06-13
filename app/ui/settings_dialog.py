@@ -233,6 +233,7 @@ class SettingsDialog(QDialog):
         self._character_export_worker: settings_workers.CharacterArchiveExportWorker | None = None
         self._memory_reload_pending = False
         self._syncing_memory_selection = False
+        self._memory_entries_loaded_once = False
 
         self.setWindowTitle("设置")
         self.setMinimumSize(680, 500)
@@ -321,10 +322,12 @@ class SettingsDialog(QDialog):
         nav_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         stack = QStackedWidget(container)
         stack.setObjectName("settingsNavStack")
+        self._settings_nav_titles = [title for title, _panel in items]
         for title, panel in items:
             nav_list.addItem(QListWidgetItem(title))
             stack.addWidget(panel)
         nav_list.currentRowChanged.connect(stack.setCurrentIndex)
+        nav_list.currentRowChanged.connect(self._handle_settings_nav_changed)
         nav_list.setCurrentRow(0)
 
         layout = QHBoxLayout()
@@ -334,6 +337,22 @@ class SettingsDialog(QDialog):
         layout.addWidget(stack, 1)
         container.setLayout(layout)
         return container
+
+    @Slot(int)
+    def _handle_settings_nav_changed(self, row: int) -> None:
+        titles = getattr(self, "_settings_nav_titles", [])
+        if row < 0 or row >= len(titles):
+            return
+        if titles[row] == "记忆":
+            self._ensure_memory_entries_loaded()
+
+    def _ensure_memory_entries_loaded(self) -> None:
+        if self._memory_entries_loaded_once:
+            return
+        if self.memory_store is None or not hasattr(self, "memory_table"):
+            return
+        self._memory_entries_loaded_once = True
+        self._load_memory_entries()
 
     def _build_scrollable_tab(self, content: QWidget) -> QWidget:
         tab = QWidget(self)
@@ -509,6 +528,7 @@ class SettingsDialog(QDialog):
     def _load_memory_entries(self) -> None:
         if self.memory_store is None or not hasattr(self, "memory_table"):
             return
+        self._memory_entries_loaded_once = True
         if self._memory_list_thread is not None:
             self._memory_reload_pending = True
             return
@@ -629,6 +649,7 @@ class SettingsDialog(QDialog):
     @Slot(str)
     def _handle_memory_load_failed(self, message: str) -> None:
         self._all_memories = []
+        self._memory_entries_loaded_once = False
         self.memory_status_label.setText(f"读取失败：{message}")
         self._show_memory_placeholder("记忆读取失败，请稍后重试。")
         QMessageBox.warning(self, "读取失败", message)

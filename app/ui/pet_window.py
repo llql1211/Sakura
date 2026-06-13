@@ -3907,8 +3907,8 @@ class PetWindow(QWidget):
         self.history_window.set_theme_settings(self.theme_settings)
         # 始终置顶，避免被桌宠卡片（同为置顶窗口）盖住。
         _mark_dialog_always_on_top(self.history_window)
-        self.history_window.refresh()
         self.history_window.show()
+        self.history_window.request_refresh()
         self.history_window.raise_()
         self.history_window.activateWindow()
 
@@ -3920,7 +3920,6 @@ class PetWindow(QWidget):
                 parent=self,
             )
         self.runtime_log_window.set_theme_settings(self.theme_settings)
-        self.runtime_log_window.refresh(reset=True)
         self.runtime_log_window.show()
         self.runtime_log_window.raise_()
         self.runtime_log_window.activateWindow()
