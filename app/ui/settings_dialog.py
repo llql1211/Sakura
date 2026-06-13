@@ -72,8 +72,8 @@ from app.ui.subtitle_controller import (
     SPEECH_TYPING_INTERVAL_MS,
     normalize_subtitle_display_speed,
 )
-from app.agent.proactive_care import (
-    ProactiveCareSettings,
+from app.agent.screen_awareness import (
+    ScreenAwarenessSettings,
 )
 from app.voice.tts_settings import (
     DEFAULT_GENIE_TTS_API_URL,
@@ -127,7 +127,7 @@ class SettingsDialog(QDialog):
         base_dir: Path,
         character_registry: CharacterRegistry | None = None,
         current_character: CharacterProfile | None = None,
-        proactive_care_settings: ProactiveCareSettings | None = None,
+        screen_awareness_settings: ScreenAwarenessSettings | None = None,
         mcp_settings: MCPRuntimeSettings | None = None,
         debug_log_settings: DebugLogSettings | None = None,
         memory_store: MemoryStore | None = None,
@@ -145,8 +145,11 @@ class SettingsDialog(QDialog):
         startup_settings: StartupSettings | None = None,
         bubble_settings: BubbleSettings | None = None,
         on_layout_preview: Callable[[int, int, int, int, int], None] | None = None,
+        proactive_care_settings: ScreenAwarenessSettings | None = None,
     ) -> None:
         super().__init__(parent)
+        if screen_awareness_settings is None:
+            screen_awareness_settings = proactive_care_settings
         self.base_dir = base_dir
         self.tts_settings = tts_settings
         self.startup_settings = startup_settings or StartupSettings()
@@ -199,7 +202,8 @@ class SettingsDialog(QDialog):
         self.result_input_bar_offset: int | None = None
         self.result_subtitle_typing_interval_ms: int | None = None
         self.result_reply_segment_pause_ms: int | None = None
-        self.result_proactive_care_settings: ProactiveCareSettings | None = None
+        self.result_screen_awareness_settings: ScreenAwarenessSettings | None = None
+        self.result_proactive_care_settings: ScreenAwarenessSettings | None = None
         self.result_mcp_settings: MCPRuntimeSettings | None = None
         self.result_debug_log_settings: DebugLogSettings | None = None
         self.result_startup_settings: StartupSettings | None = None
@@ -248,7 +252,7 @@ class SettingsDialog(QDialog):
             (
                 "隐私",
                 self._build_scrollable_tab(
-                    PrivacySettingsPage(self).build(proactive_care_settings or ProactiveCareSettings())
+                    PrivacySettingsPage(self).build(screen_awareness_settings or ScreenAwarenessSettings())
                 ),
             ),
             (
@@ -427,7 +431,7 @@ class SettingsDialog(QDialog):
 
     @Slot(bool)
     def _sync_proactive_screen_context_controls(self, enabled: bool) -> None:
-        """主动屏幕获取关闭时，不允许调整从属参数。"""
+        """主动屏幕感知关闭时，不允许调整从属参数。"""
         self._set_form_widgets_enabled(
             getattr(self, "_proactive_form_layout", None),
             (
@@ -1324,7 +1328,7 @@ class SettingsDialog(QDialog):
             "subtitle_typing_interval_ms": subtitle_typing_interval_ms,
             "reply_segment_pause_ms": reply_segment_pause_ms,
             "theme_settings": theme_settings,
-            "proactive_care_settings": ProactiveCareSettings(
+            "screen_awareness_settings": ScreenAwarenessSettings(
                 enabled=self.proactive_screen_context_enabled_check.isChecked(),
                 screen_context_enabled=self.proactive_screen_context_enabled_check.isChecked(),
                 check_interval_minutes=self.proactive_check_interval_spin.value(),
@@ -1367,7 +1371,7 @@ class SettingsDialog(QDialog):
         subtitle_typing_interval_ms = values["subtitle_typing_interval_ms"]
         reply_segment_pause_ms = values["reply_segment_pause_ms"]
         theme_settings = values["theme_settings"]
-        proactive_care_settings = values["proactive_care_settings"]
+        screen_awareness_settings = values["screen_awareness_settings"]
         mcp_settings = values["mcp_settings"]
         debug_log_settings = values["debug_log_settings"]
         startup_settings = values["startup_settings"]
@@ -1387,7 +1391,7 @@ class SettingsDialog(QDialog):
             return
         if not isinstance(theme_settings, ThemeSettings):
             return
-        if not isinstance(proactive_care_settings, ProactiveCareSettings):
+        if not isinstance(screen_awareness_settings, ScreenAwarenessSettings):
             return
         if not isinstance(mcp_settings, MCPRuntimeSettings):
             return
@@ -1428,7 +1432,8 @@ class SettingsDialog(QDialog):
         self.result_reply_segment_pause_ms = reply_segment_pause_ms
         self.result_theme_settings = theme_settings
         self.result_theme_write_mode = self._theme_write_mode
-        self.result_proactive_care_settings = proactive_care_settings
+        self.result_screen_awareness_settings = screen_awareness_settings
+        self.result_proactive_care_settings = screen_awareness_settings
         self.result_mcp_settings = mcp_settings
         self.result_debug_log_settings = debug_log_settings
         self.result_startup_settings = startup_settings
