@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
+from app.storage.atomic import rename_with_retry
 from app.storage.chat_history import ChatHistoryEntry
 from app.storage.paths import StoragePaths
 
@@ -834,7 +835,7 @@ def import_embedding_model_archive(path: Path, base_dir: Path | None = None) -> 
         if backup_model_dir.exists():
             shutil.rmtree(backup_model_dir, ignore_errors=True)
         if destination_model_dir.exists():
-            destination_model_dir.rename(backup_model_dir)
+            rename_with_retry(destination_model_dir, backup_model_dir)
         moved = False
         try:
             shutil.move(str(staging_model_dir), str(destination_model_dir))
@@ -845,7 +846,7 @@ def import_embedding_model_archive(path: Path, base_dir: Path | None = None) -> 
             if moved and destination_model_dir.exists():
                 shutil.rmtree(destination_model_dir, ignore_errors=True)
             if backup_model_dir.exists() and not destination_model_dir.exists():
-                backup_model_dir.rename(destination_model_dir)
+                rename_with_retry(backup_model_dir, destination_model_dir)
             raise
     except zipfile.BadZipFile as exc:
         raise MemoryModelImportError("不是有效的记忆模型 ZIP 包。") from exc

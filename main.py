@@ -14,6 +14,7 @@ from app.config.default_configs import ensure_default_configs
 from app.config.migration_runner import MigrationRunner
 from app.core.app_context import AppContext
 from app.core.bootstrap import build_deferred_services, build_initial_app_context
+from app.core.cancellation import CancellationToken, OperationCancelled
 from app.core.debug_log import debug_log
 from app.core.instance import SingleInstanceGuard
 from app.core.selfcheck import run_startup_self_check
@@ -129,19 +130,46 @@ def _set_windows_process_dpi_awareness() -> str:
 class DeferredStartupWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, base_dir: Path, context: AppContext) -> None:
         super().__init__()
         self.base_dir = base_dir
         self.context = context
+        self._cancel_token = CancellationToken()
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancel_token.cancel()
 
     @Slot()
     def run(self) -> None:
+        services: object | None = None
         try:
-            services = build_deferred_services(self.base_dir, self.context)
+            self._cancel_token.throw_if_cancelled()
+            services = build_deferred_services(
+                self.base_dir,
+                self.context,
+                cancel_checker=self._cancel_token.throw_if_cancelled,
+            )
+            if self._cancel_token.is_cancelled():
+                self._close_services(services)
+                self.cancelled.emit()
+                return
             self._move_service_objects_to_ui_thread(services)
+            self._cancel_token.throw_if_cancelled()
             self.finished.emit(services)
+            services = None
+        except OperationCancelled:
+            if services is not None:
+                self._close_services(services)
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001
+            if self._cancel_token.is_cancelled():
+                if services is not None:
+                    self._close_services(services)
+                self.cancelled.emit()
+                return
             self.failed.emit(str(exc))
 
     def _move_service_objects_to_ui_thread(self, services: object) -> None:
@@ -151,6 +179,29 @@ class DeferredStartupWorker(QObject):
         tts_provider = getattr(services, "tts_provider", None)
         if isinstance(tts_provider, QObject):
             tts_provider.moveToThread(application.thread())
+
+    def _close_services(self, services: object) -> None:
+        for provider in (getattr(services, "tts_provider", None),):
+            close = getattr(provider, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    debug_log("TTS", "取消后台启动时关闭 TTS Provider 失败", {"error": str(exc)})
+        mcp_tool_provider = getattr(services, "mcp_tool_provider", None)
+        close_mcp = getattr(mcp_tool_provider, "close", None)
+        if callable(close_mcp):
+            try:
+                close_mcp()
+            except Exception as exc:  # noqa: BLE001
+                debug_log("MCP", "取消后台启动时关闭 MCP Provider 失败", {"error": str(exc)})
+        plugin_manager = getattr(services, "plugin_manager", None)
+        shutdown_all = getattr(plugin_manager, "shutdown_all", None)
+        if callable(shutdown_all):
+            try:
+                shutdown_all()
+            except Exception as exc:  # noqa: BLE001
+                debug_log("PluginManager", "取消后台启动时关闭插件失败", {"error": str(exc)})
 
 
 class TTSBundleMigrationWorker(QObject):
@@ -526,6 +577,7 @@ def _start_deferred_startup(base_dir: Path, pet_window: PetWindow) -> None:
     worker.failed.connect(pet_window.handle_deferred_startup_failed)
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
+    worker.cancelled.connect(thread.quit)
     thread.finished.connect(worker.deleteLater)
     thread.finished.connect(thread.deleteLater)
     thread.finished.connect(lambda: setattr(pet_window, "deferred_startup_thread", None))

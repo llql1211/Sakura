@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.core.debug_log import debug_log
+from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
 
 # 与历史发布版本默认 mcp.yaml 等价的内容（web 搜索开启、Windows-MCP 关闭）
@@ -95,8 +96,7 @@ def ensure_default_configs(base_dir: Path) -> list[str]:
         try:
             if target.exists():
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            atomic_write_text(target, content, encoding="utf-8", backup=False)
             created.append(target.name)
         except OSError as exc:
             debug_log(

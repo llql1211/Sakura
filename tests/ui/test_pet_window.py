@@ -737,6 +737,180 @@ def test_emit_app_closed_event_logs_once_with_interrupted_flag() -> None:
     assert len(window.runtime_event_queue) == 0
 
 
+def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class SignalStub:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def connect(self, callback):  # type: ignore[no-untyped-def]
+            self.callbacks.append(callback)
+
+    class ThreadStub:
+        def __init__(self) -> None:
+            self.finished = SignalStub()
+            self.interrupted = False
+            self.quit_called = False
+            self.waits: list[int] = []
+
+        def requestInterruption(self) -> None:
+            self.interrupted = True
+
+        def isRunning(self) -> bool:
+            return True
+
+        def quit(self) -> None:
+            self.quit_called = True
+
+        def wait(self, timeout: int) -> bool:
+            self.waits.append(timeout)
+            return False
+
+    class WorkerStub:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class SubtitleStub:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel_reply_flow(self) -> None:
+            self.cancelled = True
+
+    class MinimalWindow:
+        close_external_tools = PetWindow.close_external_tools
+        _shutdown_qthread = PetWindow._shutdown_qthread
+        _keep_shutdown_lingering_thread = PetWindow._keep_shutdown_lingering_thread
+        _release_shutdown_lingering_thread = PetWindow._release_shutdown_lingering_thread
+
+    window = MinimalWindow()
+    thread = ThreadStub()
+    worker = WorkerStub()
+    subtitle = SubtitleStub()
+    window._shutdown_in_progress = False
+    window._shutdown_lingering_threads = []
+    window.messages = [
+        {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+    ]
+    window.subtitle_controller = subtitle
+    window.worker_thread = thread
+    window.worker = worker
+    window.memory_curation_thread = None
+    window.memory_curation_worker = None
+    window.deferred_startup_thread = None
+    window.deferred_startup_worker = None
+    window.tts_ready_warmup_thread = None
+    window.tts_ready_warmup_worker = None
+    window.screen_observation_encode_thread = None
+    window.screen_observation_encode_worker = None
+    window._emit_app_closed_event = lambda: None
+    window._stop_speaking_state_watchdog = lambda: None
+    window.close_tts_tools = lambda: None
+    window.close_mcp_tools = lambda: None
+    window.close_plugins = lambda: None
+
+    window.close_external_tools()
+
+    assert window._shutdown_in_progress is True
+    assert worker.cancelled is True
+    assert thread.interrupted is True
+    assert thread.quit_called is True
+    assert thread.waits == [1000]
+    assert window._shutdown_lingering_threads == [(thread, worker)]
+    assert window.messages == []
+    assert subtitle.cancelled is True
+
+
+def test_shutdown_ignores_late_progress_and_reply() -> None:
+    from app.agent import AgentProgress, AgentResult
+    from app.llm.chat_reply import parse_chat_reply
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class MinimalWindow:
+        _handle_progress_reply = PetWindow._handle_progress_reply
+        _handle_reply = PetWindow._handle_reply
+
+    window = MinimalWindow()
+    window._shutdown_in_progress = True
+    window.messages = [
+        {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+    ]
+    progress = AgentProgress(
+        reply=parse_chat_reply('{"segments":[{"ja":"見るね。","zh":"我看看。","tone":"中性"}]}')
+    )
+    result = AgentResult(
+        reply=parse_chat_reply('{"segments":[{"ja":"終わり。","zh":"结束。","tone":"中性"}]}')
+    )
+
+    window._handle_progress_reply(progress)
+    window._handle_reply(result)
+
+    assert window.messages == []
+
+
+def test_event_error_cleans_transient_progress_during_shutdown() -> None:
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class MinimalWindow:
+        _handle_event_error = PetWindow._handle_event_error
+
+        def _clear_active_event(self) -> None:
+            self.active_event_type = ""
+
+    window = MinimalWindow()
+    window._shutdown_in_progress = True
+    window.active_event_type = "custom"
+    window.messages = [
+        {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+    ]
+
+    window._handle_event_error("late error")
+
+    assert window.messages == []
+    assert window.active_event_type == ""
+
+
+def test_speaking_state_timeout_cancels_reply_and_ends_interaction() -> None:
+    from app.ui.pet_window import PetWindow
+    from app.ui.state import PetUiState
+
+    class UiStateStub:
+        state = PetUiState.SPEAKING
+
+        def finish(self, reason: str) -> None:
+            raise AssertionError(f"active interaction should use _end_interaction, got {reason}")
+
+    class SubtitleStub:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def is_reply_sequence_active(self) -> bool:
+            return True
+
+        def cancel_reply_flow(self) -> None:
+            self.cancelled = True
+
+    class MinimalWindow:
+        _handle_speaking_state_timeout = PetWindow._handle_speaking_state_timeout
+
+    window = MinimalWindow()
+    subtitle = SubtitleStub()
+    outcomes = []
+    window.ui_state = UiStateStub()
+    window.subtitle_controller = subtitle
+    window.active_interaction_id = "interaction-1"
+    window._end_interaction = lambda outcome: outcomes.append(outcome)
+
+    window._handle_speaking_state_timeout()
+
+    assert subtitle.cancelled is True
+    assert outcomes == ["speaking_timeout"]
+
+
 def test_pet_window_application_activation_restores_when_hidden_to_tray(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
@@ -1528,6 +1702,98 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
     window.close()
     window.deleteLater()
     app.processEvents()
+
+
+def test_shutdown_closes_late_deferred_services() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class CloseableStub:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    class PluginManagerStub:
+        def __init__(self) -> None:
+            self.shutdowns = 0
+
+        def shutdown_all(self) -> None:
+            self.shutdowns += 1
+
+    class ServicesStub:
+        def __init__(self) -> None:
+            self.tts_provider = CloseableStub()
+            self.mcp_tool_provider = CloseableStub()
+            self.plugin_manager = PluginManagerStub()
+
+    class WindowStub:
+        _shutdown_in_progress = True
+        apply_deferred_services = PetWindow.apply_deferred_services
+        _close_deferred_services = PetWindow._close_deferred_services
+
+    services = ServicesStub()
+    window = WindowStub()
+
+    window.apply_deferred_services(services)
+
+    assert services.tts_provider.closed == 1
+    assert services.mcp_tool_provider.closed == 1
+    assert services.plugin_manager.shutdowns == 1
+
+
+def test_deferred_startup_worker_closes_services_when_cancelled_after_move(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import main as main_module
+    from main import DeferredStartupWorker
+
+    class CloseableStub:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    class PluginManagerStub:
+        def __init__(self) -> None:
+            self.shutdowns = 0
+
+        def shutdown_all(self) -> None:
+            self.shutdowns += 1
+
+    class ServicesStub:
+        def __init__(self) -> None:
+            self.tts_provider = CloseableStub()
+            self.mcp_tool_provider = CloseableStub()
+            self.plugin_manager = PluginManagerStub()
+
+    services = ServicesStub()
+    monkeypatch.setattr(
+        main_module,
+        "build_deferred_services",
+        lambda *_args, **_kwargs: services,
+    )
+
+    worker = DeferredStartupWorker(Path("."), object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        worker,
+        "_move_service_objects_to_ui_thread",
+        lambda _services: worker.cancel(),
+    )
+    cancelled: list[bool] = []
+    finished: list[object] = []
+    failed: list[str] = []
+    worker.cancelled.connect(lambda: cancelled.append(True))
+    worker.finished.connect(lambda value: finished.append(value))
+    worker.failed.connect(lambda message: failed.append(message))
+
+    worker.run()
+
+    assert cancelled == [True]
+    assert finished == []
+    assert failed == []
+    assert services.tts_provider.closed == 1
+    assert services.mcp_tool_provider.closed == 1
+    assert services.plugin_manager.shutdowns == 1
 
 
 def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabled() -> None:
@@ -5918,20 +6184,27 @@ def test_proactive_care_batches_screenshots_until_cooldown(monkeypatch) -> None:
         history=history,
     )
 
+    observations: list[ScreenObservation] = []
+
     def fake_capture(_window):  # type: ignore[no-untyped-def]
         index = len(captures) + 1
         data_url = f"data:image/jpeg;base64,{index}"
         captures.append(data_url)
-        return ScreenObservation(
+        observation = ScreenObservation(
             data_url=data_url,
             width=800,
             height=600,
             captured_at=f"2026-05-30T12:0{index}:00+08:00",
             screen_name="DISPLAY1",
         )
+        observations.append(observation)
+        return object()
 
     monkeypatch.setattr(pet_window_module.time, "perf_counter", lambda: current_time["value"])
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fake_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fake_capture)
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_proactive_screen_context(context, observations[-1]) or True
+    )
 
     current_time["value"] = 60
     window._check_proactive_care()
@@ -6081,18 +6354,25 @@ def test_proactive_care_keeps_recent_screenshot_batch(monkeypatch) -> None:  # t
         cooldown_minutes=10,
     )
 
+    observations: list[ScreenObservation] = []
+
     def fake_capture(_window):  # type: ignore[no-untyped-def]
         index = len(captures) + 1
         captures.append(index)
-        return ScreenObservation(
+        observation = ScreenObservation(
             data_url=f"data:image/jpeg;base64,{index}",
             width=800,
             height=600,
             captured_at=f"2026-05-30T12:{index:02d}:00+08:00",
             screen_name="DISPLAY1",
         )
+        observations.append(observation)
+        return object()
 
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fake_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fake_capture)
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_proactive_screen_context(context, observations[-1]) or True
+    )
 
     for index in range(8):
         window._capture_proactive_screen_context(float(index * 60))
@@ -6120,18 +6400,25 @@ def test_proactive_care_uses_configured_screenshot_batch_limit(monkeypatch) -> N
         screen_context_batch_limit=3,
     )
 
+    observations: list[ScreenObservation] = []
+
     def fake_capture(_window):  # type: ignore[no-untyped-def]
         index = len(captures) + 1
         captures.append(index)
-        return ScreenObservation(
+        observation = ScreenObservation(
             data_url=f"data:image/jpeg;base64,{index}",
             width=800,
             height=600,
             captured_at=f"2026-05-30T12:{index:02d}:00+08:00",
             screen_name="DISPLAY1",
         )
+        observations.append(observation)
+        return object()
 
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fake_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fake_capture)
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_proactive_screen_context(context, observations[-1]) or True
+    )
 
     for index in range(5):
         window._capture_proactive_screen_context(float(index * 60))
@@ -6161,7 +6448,7 @@ def test_proactive_care_disabled_does_not_capture_or_send(monkeypatch) -> None: 
         raise AssertionError("关闭主动屏幕获取时不应该截图")
 
     monkeypatch.setattr(pet_window_module.time, "perf_counter", lambda: current_time["value"])
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fail_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fail_capture)
 
     window._check_proactive_care()
 
@@ -6481,7 +6768,7 @@ def test_input_bar_pinned_while_waiting_reply() -> None:
 def test_progress_reply_displays_and_records_assistant_message() -> None:
     from app.agent import AgentProgress
     from app.llm.chat_reply import parse_chat_reply
-    from app.ui.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
@@ -6505,14 +6792,16 @@ def test_progress_reply_displays_and_records_assistant_message() -> None:
         )
     )
 
-    assert window.messages[-1] == {"role": "assistant", "content": "調べるね。"}
+    assert window.messages[-1]["role"] == "assistant"
+    assert window.messages[-1]["content"] == "調べるね。"
+    assert window.messages[-1][TRANSIENT_PROGRESS_MESSAGE_KEY] is True
     assert history[-1] == ("assistant", "調べるね。", "我查一下。", "中性", "")
 
 
 def test_progress_reply_records_segments_as_separate_history_entries() -> None:
     from app.agent import AgentProgress
     from app.llm.chat_reply import parse_chat_reply
-    from app.ui.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
@@ -6537,7 +6826,9 @@ def test_progress_reply_records_segments_as_separate_history_entries() -> None:
         )
     )
 
-    assert window.messages[-1] == {"role": "assistant", "content": "一つ目。\n二つ目。"}
+    assert window.messages[-1]["role"] == "assistant"
+    assert window.messages[-1]["content"] == "一つ目。\n二つ目。"
+    assert window.messages[-1][TRANSIENT_PROGRESS_MESSAGE_KEY] is True
     assert history == [
         ("assistant", "一つ目。", "第一段。", "中性", ""),
         ("assistant", "二つ目。", "第二段。", "中性", ""),
@@ -6776,7 +7067,7 @@ def test_reply_history_buttons_review_segments_without_tts_or_history() -> None:
 def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
     from app.agent import AgentResult
     from app.llm.chat_reply import ChatReply
-    from app.ui.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class MinimalConsumeWindow:
         _consume_agent_result = PetWindow._consume_agent_result
@@ -6786,7 +7077,13 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
     shown_segments = []
     applied_results = []
     history = []
-    window.messages = []
+    window.messages = [
+        {
+            "role": "assistant",
+            "content": "途中経過。",
+            TRANSIENT_PROGRESS_MESSAGE_KEY: True,
+        }
+    ]
     window._log_interaction_stage = lambda *_args, **_kwargs: None
     window._record_assistant_reply_history = lambda reply, _debug=None: history.append((reply, _debug))
     window._show_reply_segments = lambda segments: shown_segments.append(segments)
@@ -7104,6 +7401,8 @@ def test_screen_observation_followup_uses_last_user_message_after_progress(monke
 
     class MinimalScreenFollowupWindow:
         _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
+        _finish_chat_screen_observation_followup = PetWindow._finish_chat_screen_observation_followup
+        _resume_screen_observation_followup_cleanup = lambda self: None
 
     window = MinimalScreenFollowupWindow()
     history = []
@@ -7117,6 +7416,9 @@ def test_screen_observation_followup_uses_last_user_message_after_progress(monke
     window._log_interaction_stage = lambda *_args, **_kwargs: None
     window._record_history = lambda *args: history.append(args)
     window._consume_agent_result = lambda _result: None
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_chat_screen_observation_followup(context, observation) or True
+    )
     observation = ScreenObservation(
         data_url="data:image/jpeg;base64,screen",
         width=640,
@@ -7124,7 +7426,7 @@ def test_screen_observation_followup_uses_last_user_message_after_progress(monke
         captured_at="2026-05-31T12:00:00+08:00",
         screen_name="DISPLAY1",
     )
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", lambda _window: observation)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
 
     queued = window._queue_screen_observation_followup(
         AgentResult(
@@ -7152,6 +7454,8 @@ def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatc
 
     class MinimalScreenFollowupWindow:
         _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
+        _finish_chat_screen_observation_followup = PetWindow._finish_chat_screen_observation_followup
+        _resume_screen_observation_followup_cleanup = lambda self: None
 
     window = MinimalScreenFollowupWindow()
     window.messages = [
@@ -7164,6 +7468,9 @@ def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatc
     window._log_interaction_stage = lambda *_args, **_kwargs: None
     window._record_history = lambda *_args: None
     window._consume_agent_result = lambda _result: None
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_chat_screen_observation_followup(context, observation) or True
+    )
     observation = ScreenObservation(
         data_url=f"data:image/jpeg;base64,{'a' * 50000}",
         width=640,
@@ -7171,7 +7478,7 @@ def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatc
         captured_at="2026-05-31T12:00:00+08:00",
         screen_name="DISPLAY1",
     )
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", lambda _window: observation)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
 
     queued = window._queue_screen_observation_followup(
         AgentResult(
@@ -7260,6 +7567,7 @@ def _build_minimal_proactive_window(
             PetWindow._should_capture_proactive_screen_context
         )
         _capture_proactive_screen_context = PetWindow._capture_proactive_screen_context
+        _finish_proactive_screen_context = PetWindow._finish_proactive_screen_context
         _should_send_proactive_care_batch = PetWindow._should_send_proactive_care_batch
         _build_proactive_care_event = PetWindow._build_proactive_care_event
         _proactive_screen_context_allowed = PetWindow._proactive_screen_context_allowed
@@ -7280,6 +7588,7 @@ def _build_minimal_proactive_window(
     window.pending_tool_action = None
     window.pending_screen_observation_messages = None
     window.screen_observation_followup_in_progress = False
+    window.screen_observation_encode_thread = None
     window.active_interaction_id = ""
     window.input_edit = _DummyTextInput()
     window.speech_timer = _DummyTimer()

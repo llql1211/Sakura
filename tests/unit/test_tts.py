@@ -83,6 +83,7 @@ from app.voice.tts import (
     _read_local_tts_output,
     _resolve_request_text_lang,
     _resolve_tts_cache_dir,
+    _TTSRequest,
     _write_genie_audio,
     purge_tts_cache,
 )
@@ -171,6 +172,26 @@ def test_tts_provider_can_skip_constructor_service_adoption(monkeypatch) -> None
     GPTSoVITSTTSProvider(_minimal_tts_settings())
 
     assert calls == ["GPTSoVITSTTSProvider"]
+
+
+def test_tts_provider_close_clears_queue_and_blocks_late_requests() -> None:
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    provider._pending_requests.append(_TTSRequest(text="queued", tone=None))
+
+    provider.close()
+
+    assert provider._is_closed()
+    assert provider._pending_requests == []
+
+    provider.speak("late request")
+
+    assert provider._pending_requests == []
+
+    provider._pending_requests.append(_TTSRequest(text="stale", tone=None))
+    provider._start_next_request()
+
+    assert not provider._request_running
+    assert [request.text for request in provider._pending_requests] == ["stale"]
 
 
 def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]

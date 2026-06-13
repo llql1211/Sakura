@@ -17,6 +17,7 @@ from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
 from app.agent.tools.registry import Tool
+from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
 
 
@@ -252,8 +253,11 @@ class TodoStore:
         return {"tasks": [t for t in data["tasks"] if isinstance(t, dict)]}
 
     def _save(self, data: dict[str, list[dict[str, Any]]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(
+            self.path,
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _required_text(arguments: dict[str, Any], key: str) -> str:

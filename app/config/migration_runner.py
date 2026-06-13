@@ -25,6 +25,7 @@ from typing import Callable
 
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.core.debug_log import debug_log
+from app.storage.atomic import atomic_write_text, rename_with_retry
 from app.storage.paths import StoragePaths
 
 CONFIG_VERSION_KEY = "config_version"
@@ -194,7 +195,7 @@ def _migrate_dotenv(context: MigrationContext) -> None:
         for key in _parse_env_keys(env_path)
         if key not in migrated
     ]
-    env_path.rename(env_path.with_name(env_path.name + _ENV_MIGRATED_SUFFIX))
+    rename_with_retry(env_path, env_path.with_name(env_path.name + _ENV_MIGRATED_SUFFIX))
     debug_log(
         "Migration",
         "migration.v0_to_v1.env.applied",
@@ -236,7 +237,7 @@ def _migrate_legacy_single_chat_history(context: MigrationContext) -> None:
             {"target": str(target)},
         )
     # 归档旧文件（已备份 + 已拆分/目标已存在），避免每次启动重复判断
-    legacy_path.rename(legacy_path.with_name(legacy_path.name + _ENV_MIGRATED_SUFFIX))
+    rename_with_retry(legacy_path, legacy_path.with_name(legacy_path.name + _ENV_MIGRATED_SUFFIX))
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +317,7 @@ def _merge_variant_files_in_dir(
             context.backup_file(canonical)
             context.backup_file(variant)
             _merge_jsonl(variant, canonical)
-            variant.rename(variant.with_name(variant.name + _ENV_MIGRATED_SUFFIX))
+            rename_with_retry(variant, variant.with_name(variant.name + _ENV_MIGRATED_SUFFIX))
             debug_log(
                 "Migration",
                 "migration.v1_to_v2.variant.merged",
@@ -334,9 +335,7 @@ def _merge_jsonl(source: Path, target: Path) -> None:
         merged = [line for _, line in sorted(zip(timestamps, merged), key=lambda p: p[0])]
     target.parent.mkdir(parents=True, exist_ok=True)
     # 行级合并后整体重写；调用方已对 target 做过备份
-    tmp = target.with_name(target.name + ".merging")
-    tmp.write_text("".join(merged), encoding="utf-8")
-    tmp.replace(target)
+    atomic_write_text(target, "".join(merged), encoding="utf-8", backup=False)
 
 
 def _read_jsonl_lines(path: Path) -> list[str]:

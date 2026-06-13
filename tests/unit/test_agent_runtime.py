@@ -21,6 +21,7 @@ from app.agent.runtime import (
     AgentRuntime,
     _build_vision_unsupported_reply,
 )
+from app.core.cancellation import CancellationToken, OperationCancelled
 from app.agent.tool_routing import (
     _filter_openai_tools_for_browser_routing,
     _should_block_windows_tool_for_browser_page,
@@ -358,3 +359,42 @@ class TestAgentRuntimeBasics:
         runtime.update_character("新", reply_tones=["傲娇"])
         assert runtime.tools.get("my_tool") is not None
         assert runtime.reply_tones == ["傲娇"]
+
+    def test_cancel_after_planning_stops_before_tool_execution(self) -> None:
+        token = CancellationToken()
+        executed: list[str] = []
+        tool = _dummy_tool(
+            "my_tool",
+            handler=lambda _args: executed.append("called") or {"ok": True},
+        )
+        registry = ToolRegistry([tool])
+        client = _dummy_api_client()
+
+        def complete_with_tools(*_args: object, **_kwargs: object) -> MagicMock:
+            token.cancel()
+            return MagicMock(
+                content="準備するね。",
+                tool_calls=[NativeToolCall(id="call_1", name="my_tool", arguments={})],
+                message={
+                    "role": "assistant",
+                    "content": "準備するね。",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "my_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+            )
+
+        client.complete_with_tools.side_effect = complete_with_tools
+        runtime = AgentRuntime(client, _dummy_system_prompt(), tools=registry)
+
+        with pytest.raises(OperationCancelled):
+            runtime.handle_user_message(
+                [ChatMessage(role="user", content="do it")],
+                cancel_checker=token.throw_if_cancelled,
+            )
+
+        assert executed == []

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from app.storage.atomic import rename_with_retry, replace_with_retry
 from app.storage.paths import StoragePaths
 from app.voice.runtime_compat import current_platform_label, current_system_name, find_usable_runtime_python
 
@@ -445,7 +446,7 @@ def migrate_bundle_to_short_path(
         )
 
     _migration_state_path(work_dir).unlink(missing_ok=True)
-    work_dir.replace(migration.target_dir)
+    rename_with_retry(work_dir, migration.target_dir)
     source_parent = migration.source_dir.parent
     shutil.rmtree(migration.source_dir, ignore_errors=True)
     _remove_empty_legacy_parents(source_parent)
@@ -690,12 +691,12 @@ def _replace_installed_bundle_dir(source_dir: Path, target_dir: Path) -> None:
         shutil.rmtree(backup_dir, ignore_errors=True)
     had_previous = target_dir.exists()
     if had_previous:
-        target_dir.rename(backup_dir)
+        rename_with_retry(target_dir, backup_dir)
     try:
         shutil.move(str(source_dir), str(target_dir))
     except Exception:
         if had_previous and backup_dir.exists() and not target_dir.exists():
-            backup_dir.rename(target_dir)
+            rename_with_retry(backup_dir, target_dir)
         raise
     if had_previous:
         shutil.rmtree(backup_dir, ignore_errors=True)
@@ -818,7 +819,7 @@ def _try_fast_migration_rename(migration: TTSBundleMigration) -> bool:
     try:
         if migration.source_dir.resolve().anchor != migration.target_dir.resolve().anchor:
             return False
-        migration.source_dir.rename(migration.target_dir)
+        rename_with_retry(migration.source_dir, migration.target_dir)
     except OSError:
         return False
     _cleanup_migration_work_dir(migration)
@@ -893,7 +894,7 @@ def _copy_file_resumable(source: Path, target: Path) -> None:
                 dst.write(chunk)
                 time.sleep(0)
         shutil.copystat(source, tmp_target)
-        os.replace(tmp_target, target)
+        replace_with_retry(tmp_target, target)
     except Exception:
         tmp_target.unlink(missing_ok=True)
         raise
@@ -1050,7 +1051,7 @@ def _download_archive(
         actual_sha256 = hasher.hexdigest()
         if actual_sha256.lower() != entry.sha256.lower():
             raise RuntimeError(f"SHA256 不匹配：期望 {entry.sha256}，实际 {actual_sha256}")
-        part.replace(archive)
+        replace_with_retry(part, archive)
     except Exception:
         if part.exists():
             part.unlink()

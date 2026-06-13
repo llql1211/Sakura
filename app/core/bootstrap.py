@@ -10,6 +10,7 @@ from app.agent.memory_curator import MemoryCurator, MemoryCurationState
 from app.config.settings_service import AppSettingsService
 from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.core.app_context import AppContext, CoreServices, FeatureServices, StorageServices
+from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.extensions import ExtensionRegistry
 from app.config.character_loader import (
     CharacterProfile,
@@ -205,58 +206,78 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     )
 
 
-def build_deferred_services(base_dir: Path, context: AppContext) -> DeferredStartupServices:
+def build_deferred_services(
+    base_dir: Path,
+    context: AppContext,
+    *,
+    cancel_checker: CancelChecker | None = None,
+) -> DeferredStartupServices:
     """后台创建启动首帧之后才需要的耗时服务。"""
 
     errors: list[str] = []
     settings_service = context.settings_service
     character_profile = context.character_profile
-
-    # 启动时清空 data/cache/tts 残留（崩溃/强退遗留的临时 wav），失败不影响启动
-    try:
-        purge_tts_cache(base_dir)
-    except OSError as exc:
-        debug_log("Startup", "TTS 缓存启动清理失败，已忽略", {"error": str(exc)})
+    tts_provider: TTSProvider | None = None
+    plugin_manager: PluginManager | None = None
+    mcp_tool_provider: MCPToolProvider | None = None
 
     try:
-        tts_settings = settings_service.load_tts_settings(
-            character_profile=character_profile,
+        check_cancelled(cancel_checker)
+        # 启动时清空 data/cache/tts 残留（崩溃/强退遗留的临时 wav），失败不影响启动
+        try:
+            purge_tts_cache(base_dir)
+        except OSError as exc:
+            debug_log("Startup", "TTS 缓存启动清理失败，已忽略", {"error": str(exc)})
+        check_cancelled(cancel_checker)
+
+        try:
+            tts_settings = settings_service.load_tts_settings(
+                character_profile=character_profile,
+            )
+            tts_provider = create_tts_provider(tts_settings, base_dir=base_dir)
+        except TTSConfigError as exc:
+            debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})
+            errors.append(f"TTS 配置无效，已禁用：{exc}")
+            tts_provider = NullTTSProvider()
+        check_cancelled(cancel_checker)
+        debug_log(
+            "Startup",
+            "TTS Provider 已创建",
+            {"provider": type(tts_provider).__name__},
         )
-        tts_provider = create_tts_provider(tts_settings, base_dir=base_dir)
-    except TTSConfigError as exc:
-        debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})
-        errors.append(f"TTS 配置无效，已禁用：{exc}")
-        tts_provider = NullTTSProvider()
-    debug_log(
-        "Startup",
-        "TTS Provider 已创建",
-        {"provider": type(tts_provider).__name__},
-    )
 
-    tool_registry = create_builtin_tool_registry(
-        base_dir,
-        context.memory_store,
-        context.reminder_store,
-    )
-    tool_registry.set_free_access_enabled(context.tool_registry.free_access_enabled)
-    extension_registry = ExtensionRegistry()
-    extension_registry.apply_tools(tool_registry)
-    plugin_manager = PluginManager(base_dir=base_dir)
-    try:
-        plugin_manager.load_from_config(tool_registry)
-    except Exception as exc:  # noqa: BLE001
-        debug_log("Plugin", "启动加载失败，已跳过插件", {"error": str(exc)})
-        debug_log("PluginManager", "启动加载失败，已跳过插件", {"error": str(exc)})
-        errors.append(f"插件加载失败，已跳过：{exc}")
-    for result in plugin_manager.results:
-        if result.error:
-            errors.append(f"插件 {result.spec.plugin_id or result.spec.entry} 加载失败：{result.error}")
-    mcp_settings = settings_service.load_mcp_runtime_settings()
-    mcp_tool_provider = register_mcp_tools_from_config(
-        base_dir,
-        tool_registry,
-        runtime_settings=mcp_settings,
-    )
+        tool_registry = create_builtin_tool_registry(
+            base_dir,
+            context.memory_store,
+            context.reminder_store,
+        )
+        tool_registry.set_free_access_enabled(context.tool_registry.free_access_enabled)
+        extension_registry = ExtensionRegistry()
+        extension_registry.apply_tools(tool_registry)
+        plugin_manager = PluginManager(base_dir=base_dir)
+        try:
+            check_cancelled(cancel_checker)
+            plugin_manager.load_from_config(tool_registry)
+        except OperationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            debug_log("Plugin", "启动加载失败，已跳过插件", {"error": str(exc)})
+            debug_log("PluginManager", "启动加载失败，已跳过插件", {"error": str(exc)})
+            errors.append(f"插件加载失败，已跳过：{exc}")
+        check_cancelled(cancel_checker)
+        for result in plugin_manager.results:
+            if result.error:
+                errors.append(f"插件 {result.spec.plugin_id or result.spec.entry} 加载失败：{result.error}")
+        mcp_settings = settings_service.load_mcp_runtime_settings()
+        mcp_tool_provider = register_mcp_tools_from_config(
+            base_dir,
+            tool_registry,
+            runtime_settings=mcp_settings,
+        )
+        check_cancelled(cancel_checker)
+    except OperationCancelled:
+        _close_deferred_service_objects(tts_provider, mcp_tool_provider, plugin_manager)
+        raise
 
     debug_log(
         "Startup",
@@ -278,6 +299,31 @@ def build_deferred_services(base_dir: Path, context: AppContext) -> DeferredStar
         mcp_tool_provider=mcp_tool_provider,
         errors=tuple(errors),
     )
+
+
+def _close_deferred_service_objects(
+    tts_provider: TTSProvider | None,
+    mcp_tool_provider: MCPToolProvider | None,
+    plugin_manager: PluginManager | None,
+) -> None:
+    close_tts = getattr(tts_provider, "close", None)
+    if callable(close_tts):
+        try:
+            close_tts()
+        except Exception as exc:  # noqa: BLE001
+            debug_log("TTS", "取消后台启动时关闭 TTS Provider 失败", {"error": str(exc)})
+    close_mcp = getattr(mcp_tool_provider, "close", None)
+    if callable(close_mcp):
+        try:
+            close_mcp()
+        except Exception as exc:  # noqa: BLE001
+            debug_log("MCP", "取消后台启动时关闭 MCP Provider 失败", {"error": str(exc)})
+    shutdown_all = getattr(plugin_manager, "shutdown_all", None)
+    if callable(shutdown_all):
+        try:
+            shutdown_all()
+        except Exception as exc:  # noqa: BLE001
+            debug_log("PluginManager", "取消后台启动时关闭插件失败", {"error": str(exc)})
 
 
 def _normalize_portrait_scale_percent(value: object) -> int:

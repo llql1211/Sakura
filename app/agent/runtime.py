@@ -33,6 +33,7 @@ from app.llm.api_client import (
     messages_contain_image,
 )
 from app.llm.chat_reply import ChatReply, parse_chat_reply, parse_chat_reply_result
+from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_log, summarize_messages
 from app.agent.runtime_limits import (
     MAX_AGENT_STEPS_PER_TURN,
@@ -113,8 +114,11 @@ class AgentRuntime:
         system_prompt: str,
         working_messages: list[ChatMessage],
         raw_content: str,
+        *,
+        cancel_checker: CancelChecker | None = None,
     ) -> ChatReply:
         """最终回复结构不合格时，只重试一次格式修复，避免坏 JSON 进入 UI。"""
+        check_cancelled(cancel_checker)
         parsed = parse_chat_reply_result(raw_content)
         retry_reason = parsed.reason if parsed.needs_retry else ""
         if not parsed.needs_retry and _reply_has_display_translation(parsed.reply):
@@ -149,11 +153,13 @@ class AgentRuntime:
                 tool_choice="none",
                 temperature=0.2,
                 structured_response=True,
+                cancel_checker=cancel_checker,
             )
         except ApiRequestError as exc:
             debug_log("AgentRuntime", "最终回复修复请求失败，使用安全兜底", {"error": str(exc)})
             return parsed.reply
 
+        check_cancelled(cancel_checker)
         repaired = parse_chat_reply_result(repaired_turn.content)
         if repaired.needs_retry:
             debug_log(
@@ -169,7 +175,9 @@ class AgentRuntime:
         self,
         messages: list[ChatMessage],
         progress_callback: ProgressCallback | None = None,
+        cancel_checker: CancelChecker | None = None,
     ) -> AgentResult:
+        check_cancelled(cancel_checker)
         turn_started_at = time.perf_counter()
         allow_screen_observation = (
             self.model_vision_enabled
@@ -194,6 +202,7 @@ class AgentRuntime:
             turn_started_at=turn_started_at,
             vision_unsupported_reply=_build_vision_unsupported_reply(),
             progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
         )
 
     def _run_tool_loop(
@@ -207,6 +216,7 @@ class AgentRuntime:
         initial_actions: list[AgentAction] | None = None,
         vision_unsupported_reply: ChatReply | None = None,
         progress_callback: ProgressCallback | None = None,
+        cancel_checker: CancelChecker | None = None,
     ) -> AgentResult:
         """执行 OpenAI 原生 tools/tool_calls 循环。"""
         working_messages: list[ChatMessage] = [*messages]
@@ -215,6 +225,7 @@ class AgentRuntime:
         total_tool_calls = 0
         active_groups: set[str] = {"default", "mcp", "memory"}
         for step_index in range(MAX_AGENT_STEPS_PER_TURN):
+            check_cancelled(cancel_checker)
             browser_page_mode = tool_routing._should_prefer_browser_page_tools(working_messages)
             browser_page_guard_active = (
                 browser_page_mode
@@ -266,6 +277,7 @@ class AgentRuntime:
                     # in message.content instead of native tool_calls when
                     # response_format=json_object is combined with tools.
                     structured_response=not bool(tool_defs),
+                    cancel_checker=cancel_checker,
                     **dialogue_extra_params,
                 )
             except ApiRequestError as exc:
@@ -276,6 +288,7 @@ class AgentRuntime:
                         actions=emitted_actions,
                     )
                 raise
+            check_cancelled(cancel_checker)
             debug_log(
                 "AgentRuntime",
                 "原生工具模型返回",
@@ -304,6 +317,7 @@ class AgentRuntime:
                         system_prompt,
                         working_messages,
                         turn.content,
+                        cancel_checker=cancel_checker,
                     ),
                     _debug=_build_debug_meta(
                         self.api_client, execution_results,
@@ -321,6 +335,7 @@ class AgentRuntime:
                     "tool_names": [call.name for call in turn.tool_calls],
                     "tool_call_count": len(turn.tool_calls),
                 },
+                cancel_checker=cancel_checker,
             )
             step_results: list[ToolExecutionResult] = []
             pending_actions: list[PendingToolAction] = []
@@ -333,6 +348,7 @@ class AgentRuntime:
                 max(0, MAX_TOOL_CALLS_PER_TURN - total_tool_calls),
             )
             for call in turn.tool_calls[:allowed_calls]:
+                check_cancelled(cancel_checker)
                 total_tool_calls += 1
                 execution_arguments = _tool_arguments_for_execution(call, self.tools)
                 call_data = _native_tool_call_to_policy_call(call, execution_arguments)
@@ -381,6 +397,7 @@ class AgentRuntime:
                     _tool_call_reason(call),
                     tool_call_id=call.id,
                 )
+                check_cancelled(cancel_checker)
                 if isinstance(prepared, PendingToolAction):
                     prepared = prepared.with_continuation_messages(
                         _build_pending_continuation_messages(
@@ -503,7 +520,9 @@ class AgentRuntime:
                 for call in turn.tool_calls[:allowed_calls]
             ]
             if tool_routing._should_auto_snapshot_after_browser_navigation(executed_calls, step_results, self.tools):
+                check_cancelled(cancel_checker)
                 snapshot_result = tool_routing._execute_auto_browser_snapshot(self.tools, step_index)
+                check_cancelled(cancel_checker)
                 step_results.append(snapshot_result)
                 execution_results.append(snapshot_result)
                 tool_messages.extend(
@@ -578,13 +597,18 @@ class AgentRuntime:
                 break
 
         try:
+            check_cancelled(cancel_checker)
             final_started_at = time.perf_counter()
             final_reply = self.api_client.chat(
                 self._build_final_reply_prompt(),
                 working_messages,
                 self.reply_tones,
                 self.reply_portraits,
+                cancel_checker=cancel_checker,
             )
+            check_cancelled(cancel_checker)
+        except OperationCancelled:
+            raise
         except Exception as exc:
             debug_log("AgentRuntime", "工具结果总结失败，使用本地兜底回复", {"error": str(exc)})
             final_reply = _build_fallback_tool_reply(execution_results)
@@ -607,10 +631,13 @@ class AgentRuntime:
         self,
         action: PendingToolAction,
         progress_callback: ProgressCallback | None = None,
+        cancel_checker: CancelChecker | None = None,
     ) -> AgentResult:
+        check_cancelled(cancel_checker)
         turn_started_at = time.perf_counter()
         debug_log("AgentRuntime", "执行已确认动作", action.to_dict())
         result = self.tools.execute(action.tool_name, action.arguments)
+        check_cancelled(cancel_checker)
         results = [result]
         verification_result = _verify_confirmed_windows_click(self.tools, action.tool_name)
         if verification_result is not None:
@@ -669,8 +696,10 @@ class AgentRuntime:
                 planning_extra_instructions=_build_confirmed_action_continuation_rules(action),
                 initial_actions=emitted_actions,
                 progress_callback=progress_callback,
+                cancel_checker=cancel_checker,
             )
         try:
+            check_cancelled(cancel_checker)
             reply = self.api_client.chat(
                 self._build_final_reply_prompt(),
                 [
@@ -678,7 +707,11 @@ class AgentRuntime:
                 ],
                 self.reply_tones,
                 self.reply_portraits,
+                cancel_checker=cancel_checker,
             )
+            check_cancelled(cancel_checker)
+        except OperationCancelled:
+            raise
         except Exception as exc:
             debug_log("AgentRuntime", "确认动作总结失败，使用本地兜底回复", {"error": str(exc)})
             reply = _build_fallback_tool_reply(results)
@@ -725,7 +758,9 @@ class AgentRuntime:
         self,
         event: AgentEvent,
         progress_callback: ProgressCallback | None = None,
+        cancel_checker: CancelChecker | None = None,
     ) -> AgentResult:
+        check_cancelled(cancel_checker)
         if event.type not in {"reminder_due", "proactive_check"}:
             return AgentResult(reply=parse_chat_reply("未対応のイベントだよ。"))
 
@@ -752,15 +787,19 @@ class AgentRuntime:
                 initial_actions=[event_action],
                 vision_unsupported_reply=_build_proactive_vision_unsupported_reply(),
                 progress_callback=progress_callback,
+                cancel_checker=cancel_checker,
             )
 
         try:
+            check_cancelled(cancel_checker)
             reply = self.api_client.chat(
                 self._build_event_reply_prompt(event.type),
                 event_messages,
                 self.reply_tones,
                 self.reply_portraits,
+                cancel_checker=cancel_checker,
             )
+            check_cancelled(cancel_checker)
         except ApiRequestError as exc:
             if messages_contain_image(event_messages) and is_vision_unsupported_error(exc):
                 debug_log("AgentRuntime", "主动事件视觉输入不受支持，返回兜底回复", {"error": str(exc)})
@@ -923,7 +962,9 @@ def _emit_progress_from_content(
     *,
     stage: str,
     metadata: dict[str, Any],
+    cancel_checker: CancelChecker | None = None,
 ) -> None:
+    check_cancelled(cancel_checker)
     if progress_callback is None or not content.strip():
         return
     if not _should_emit_progress(metadata):
@@ -935,7 +976,10 @@ def _emit_progress_from_content(
     if not reply.text.strip():
         return
     try:
+        check_cancelled(cancel_checker)
         progress_callback(AgentProgress(reply=reply, stage=stage, metadata=metadata))
+    except OperationCancelled:
+        raise
     except Exception as exc:
         debug_log("AgentRuntime", "中间回复回调失败，已忽略", {"error": str(exc), "stage": stage})
 
