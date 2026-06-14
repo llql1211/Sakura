@@ -190,6 +190,7 @@ def test_screen_awareness_settings_default_to_enabled() -> None:
     assert settings.check_interval_minutes == 2
     assert settings.cooldown_minutes == 10
     assert settings.screen_context_batch_limit == 6
+    assert settings.screen_context_resolution_p == 720
 
 
 def test_screen_awareness_settings_clamp_intervals() -> None:
@@ -202,6 +203,7 @@ def test_screen_awareness_settings_clamp_intervals() -> None:
             "check_interval_minutes": 999,
             "cooldown_minutes": 999,
             "screen_context_batch_limit": 999,
+            "screen_context_resolution_p": 1080,
         },
     )
 
@@ -212,6 +214,7 @@ def test_screen_awareness_settings_clamp_intervals() -> None:
     assert settings.check_interval_minutes == 120
     assert settings.cooldown_minutes == 120
     assert settings.screen_context_batch_limit == 20
+    assert settings.screen_context_resolution_p == 1080
 
 
 def test_screen_awareness_settings_min_intervals_are_one_minute() -> None:
@@ -250,6 +253,15 @@ def test_screen_awareness_settings_invalid_batch_limit_uses_default() -> None:
     assert settings.screen_context_batch_limit == 6
 
 
+def test_screen_awareness_settings_invalid_resolution_uses_default() -> None:
+    service = AppSettingsService(_runtime_root_path("screen_awareness_invalid_resolution"))
+    service.save_system_values("screen_awareness", {"screen_context_resolution_p": 999})
+
+    settings = service.load_screen_awareness_settings().normalized()
+
+    assert settings.screen_context_resolution_p == 720
+
+
 def test_screen_awareness_settings_save_writes_yaml() -> None:
     service = AppSettingsService(_runtime_root_path("screen_awareness_save_cooldown"))
 
@@ -260,6 +272,7 @@ def test_screen_awareness_settings_save_writes_yaml() -> None:
             check_interval_minutes=3,
             cooldown_minutes=7,
             screen_context_batch_limit=4,
+            screen_context_resolution_p=1080,
         )
     )
 
@@ -269,6 +282,7 @@ def test_screen_awareness_settings_save_writes_yaml() -> None:
     assert config["screen_awareness"]["check_interval_minutes"] == 3
     assert config["screen_awareness"]["cooldown_minutes"] == 7
     assert config["screen_awareness"]["screen_context_batch_limit"] == 4
+    assert config["screen_awareness"]["screen_context_resolution_p"] == 1080
 
 
 def test_screen_awareness_settings_save_normalizes_enabled_flag() -> None:

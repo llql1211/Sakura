@@ -1825,6 +1825,7 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
             check_interval_minutes=20,
             cooldown_minutes=10,
             screen_context_batch_limit=6,
+            screen_context_resolution_p=1080,
         ),
     )
 
@@ -1832,18 +1833,26 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
+    assert not dialog.proactive_resolution_combo.isEnabled()
+    assert not dialog.proactive_token_estimate_label.isEnabled()
+    assert dialog.proactive_resolution_combo.currentData() == 1080
+    assert "6 张约 12,240 tokens" in dialog.proactive_token_estimate_label.text()
 
     dialog.proactive_screen_context_enabled_check.setChecked(True)
     app.processEvents()
     assert dialog.proactive_check_interval_spin.isEnabled()
     assert dialog.proactive_cooldown_spin.isEnabled()
     assert dialog.proactive_batch_limit_spin.isEnabled()
+    assert dialog.proactive_resolution_combo.isEnabled()
+    assert dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.proactive_screen_context_enabled_check.setChecked(False)
     app.processEvents()
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
+    assert not dialog.proactive_resolution_combo.isEnabled()
+    assert not dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.deleteLater()
     app.processEvents()
@@ -6399,6 +6408,27 @@ def test_screen_awareness_batches_screenshots_until_cooldown(monkeypatch) -> Non
     assert window.screen_awareness_contexts == []
 
 
+def test_screen_awareness_capture_uses_selected_resolution(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+
+    contexts: list[dict[str, object]] = []
+    window = _build_minimal_screen_awareness_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=2,
+        screen_context_resolution_p=1080,
+    )
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
+    window._start_screen_observation_encode = lambda _captured, context: (
+        contexts.append(context) or True
+    )
+
+    window._capture_screen_awareness_context(60)
+
+    assert contexts[0]["resolution_p"] == 1080
+    assert contexts[0]["max_edge"] == 1920
+
+
 def test_proactive_care_event_includes_recent_conversation() -> None:
     from app.agent.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
     from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
@@ -7772,12 +7802,15 @@ def _build_minimal_proactive_window(
     check_interval_minutes: int,
     cooldown_minutes: int,
     screen_context_batch_limit: int = 6,
+    screen_context_resolution_p: int = 720,
     events=None,  # type: ignore[no-untyped-def]
     history=None,  # type: ignore[no-untyped-def]
 ):
     from app.ui.pet_window import PetWindow
 
     class MinimalProactiveWindow:
+        _current_screen_awareness_settings = PetWindow._current_screen_awareness_settings
+        _screen_awareness_encode_options = PetWindow._screen_awareness_encode_options
         _can_run_proactive_care = PetWindow._can_run_proactive_care
         _check_proactive_care = PetWindow._check_proactive_care
         _should_capture_proactive_screen_context = (
@@ -7798,6 +7831,7 @@ def _build_minimal_proactive_window(
         check_interval_minutes=check_interval_minutes,
         cooldown_minutes=cooldown_minutes,
         screen_context_batch_limit=screen_context_batch_limit,
+        screen_context_resolution_p=screen_context_resolution_p,
     )
     window.worker_thread = None
     window.active_reminder_id = None
@@ -7833,6 +7867,7 @@ def _build_minimal_screen_awareness_window(
     check_interval_minutes: int,
     cooldown_minutes: int,
     screen_context_batch_limit: int = 6,
+    screen_context_resolution_p: int = 720,
     events=None,  # type: ignore[no-untyped-def]
     history=None,  # type: ignore[no-untyped-def]
 ):
@@ -7850,6 +7885,7 @@ def _build_minimal_screen_awareness_window(
         _should_send_screen_awareness_batch = PetWindow._should_send_screen_awareness_batch
         _build_screen_awareness_event = PetWindow._build_screen_awareness_event
         _screen_awareness_context_allowed = PetWindow._screen_awareness_context_allowed
+        _screen_awareness_encode_options = PetWindow._screen_awareness_encode_options
         _clear_screen_awareness_context_batch = PetWindow._clear_screen_awareness_context_batch
 
     window = MinimalScreenAwarenessWindow()
@@ -7859,6 +7895,7 @@ def _build_minimal_screen_awareness_window(
         check_interval_minutes=check_interval_minutes,
         cooldown_minutes=cooldown_minutes,
         screen_context_batch_limit=screen_context_batch_limit,
+        screen_context_resolution_p=screen_context_resolution_p,
     )
     window.worker_thread = None
     window.active_reminder_id = None

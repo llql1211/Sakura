@@ -74,6 +74,9 @@ from app.ui.subtitle_controller import (
 )
 from app.agent.screen_awareness import (
     ScreenAwarenessSettings,
+    estimate_screen_context_batch_tokens,
+    estimate_screen_context_image_tokens,
+    normalize_screen_context_resolution_p,
 )
 from app.voice.tts_settings import (
     DEFAULT_GENIE_TTS_API_URL,
@@ -457,8 +460,23 @@ class SettingsDialog(QDialog):
                 self.proactive_check_interval_spin,
                 self.proactive_cooldown_spin,
                 self.proactive_batch_limit_spin,
+                self.proactive_resolution_combo,
+                self.proactive_token_estimate_label,
             ),
             enabled,
+        )
+
+    def _sync_proactive_token_estimate(self, *_args: object) -> None:
+        """根据分辨率和批量张数刷新主动感知图像 token 粗估。"""
+        if not hasattr(self, "proactive_token_estimate_label"):
+            return
+        resolution_p = _combo_int_data(self.proactive_resolution_combo, default=720)
+        resolution_p = normalize_screen_context_resolution_p(resolution_p)
+        image_count = max(1, int(self.proactive_batch_limit_spin.value()))
+        per_image = estimate_screen_context_image_tokens(resolution_p)
+        total = estimate_screen_context_batch_tokens(resolution_p, image_count)
+        self.proactive_token_estimate_label.setText(
+            f"约 {per_image:,} tokens/张；{image_count} 张约 {total:,} tokens。"
         )
 
     @Slot(bool)
@@ -1355,6 +1373,10 @@ class SettingsDialog(QDialog):
                 check_interval_minutes=self.proactive_check_interval_spin.value(),
                 cooldown_minutes=self.proactive_cooldown_spin.value(),
                 screen_context_batch_limit=self.proactive_batch_limit_spin.value(),
+                screen_context_resolution_p=_combo_int_data(
+                    self.proactive_resolution_combo,
+                    default=720,
+                ),
             ),
             "mcp_settings": MCPRuntimeSettings(
                 windows_enabled=self.windows_mcp_enabled_check.isChecked(),
@@ -2208,6 +2230,14 @@ class SettingsDialog(QDialog):
 def _is_http_url(url: str) -> bool:
     parsed_url = urlparse(url)
     return parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
+
+
+def _combo_int_data(combo: object, *, default: int) -> int:
+    current_data = getattr(combo, "currentData", lambda: None)()
+    try:
+        return int(current_data)
+    except (TypeError, ValueError):
+        return default
 
 
 def _default_tts_api_url(provider: str) -> str:

@@ -107,10 +107,12 @@ from app.agent.screen_awareness import (
     SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS,
     SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS,
     ScreenAwarenessSettings,
+    screen_context_max_edge_for_resolution_p,
 )
 from app.agent.screen_observation import (
     CapturedScreenImage,
     SCREEN_OBSERVATION_HISTORY_MARKER,
+    SCREEN_OBSERVATION_MAX_EDGE,
     ScreenObservation,
     append_manual_observation_marker,
     append_observation_marker,
@@ -406,7 +408,10 @@ class ScreenObservationEncodeWorker(QObject):
     def run(self) -> None:
         try:
             self._cancel_token.throw_if_cancelled()
-            observation = build_screen_observation_from_image(self.captured)
+            observation = build_screen_observation_from_image(
+                self.captured,
+                max_edge=_screen_observation_max_edge_from_context(self.context),
+            )
             self._cancel_token.throw_if_cancelled()
         except OperationCancelled:
             self.cancelled.emit(self.context)
@@ -418,6 +423,15 @@ class ScreenObservationEncodeWorker(QObject):
             self.failed.emit(self.context, str(exc))
             return
         self.finished.emit(self.context, observation)
+
+
+def _screen_observation_max_edge_from_context(context: dict[str, Any]) -> int:
+    value = context.get("max_edge")
+    try:
+        max_edge = int(value)
+    except (TypeError, ValueError):
+        return SCREEN_OBSERVATION_MAX_EDGE
+    return max(1, max_edge)
 
 
 class PetWindow(QWidget):
@@ -2378,6 +2392,7 @@ class PetWindow(QWidget):
                 "event": event,
                 "reminder_id": reminder_id,
                 "reason": reason,
+                **self._screen_awareness_encode_options(),
             },
         ):
             self.screen_observation_followup_in_progress = False
@@ -2745,7 +2760,11 @@ class PetWindow(QWidget):
             return
         if not self._start_screen_observation_encode(
             captured,
-            {"kind": "screen_awareness_context", "captured_at_monotonic": now},
+            {
+                "kind": "screen_awareness_context",
+                "captured_at_monotonic": now,
+                **self._screen_awareness_encode_options(),
+            },
         ):
             debug_log("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
             return
@@ -2832,6 +2851,14 @@ class PetWindow(QWidget):
 
     def _screen_awareness_context_allowed(self) -> bool:
         return self._current_screen_awareness_settings().allows_screen_context()
+
+    def _screen_awareness_encode_options(self) -> dict[str, int]:
+        settings = self._current_screen_awareness_settings().normalized()
+        resolution_p = settings.screen_context_resolution_p
+        return {
+            "resolution_p": resolution_p,
+            "max_edge": screen_context_max_edge_for_resolution_p(resolution_p),
+        }
 
     def _sync_screen_awareness_timer(self) -> None:
         if self._screen_awareness_context_allowed():
@@ -2924,7 +2951,11 @@ class PetWindow(QWidget):
             return
         if not self._start_screen_observation_encode(
             captured,
-            {"kind": "screen_awareness_context", "captured_at_monotonic": now},
+            {
+                "kind": "screen_awareness_context",
+                "captured_at_monotonic": now,
+                **self._screen_awareness_encode_options(),
+            },
         ):
             debug_log("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
             return
