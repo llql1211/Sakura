@@ -111,6 +111,41 @@ class RuleClassifier:
         )
         return BackchannelLabel(intent=intent, emotion=emotion, confidence=confidence)
 
+    def classify_high_precision(self, text: str) -> BackchannelLabel | None:
+        """只返回闭集/结构化的高精度信号,供 probe-primary 架构做前置快路径。
+
+        审计(2026-06-14)证实关键词子串匹配在情感/语义意图上粗颗粒度、精度低
+        (support 48% / positive 62% / request 68%),是错接主因。故仅保留两类
+        不依赖语义、近乎无歧义的信号:
+        - greeting:程式化社交闭集(短句短路,精度 100%);
+        - error:无歧义技术故障(已剪枝的高精度词表 + 代码块 / Traceback)。
+        其余 complaint/support/positive/affection/request 一律交给 probe。
+        """
+        content = (text or "").strip()
+        if not content:
+            return None
+        greeting = self._classify_greeting(content)
+        if greeting is not None:
+            return greeting
+        hits = self._error_signal_score(content)
+        if hits:
+            confidence = min(
+                _MAX_CONFIDENCE,
+                _BASE_CONFIDENCE + _CONFIDENCE_STEP * max(0, hits - 1),
+            )
+            return BackchannelLabel(
+                intent="error",
+                emotion=self._classify_emotion(content, "error"),
+                confidence=confidence,
+            )
+        return None
+
+    def _error_signal_score(self, content: str) -> int:
+        hits = sum(1 for keyword in _INTENT_KEYWORDS["error"] if keyword in content)
+        if _CODE_FENCE in content or '  File "' in content:
+            hits += 2
+        return hits
+
     def classify_emotion_for_intent(self, text: str, intent: str) -> str:
         """按规则层语义为已知 intent 补用户情绪。"""
 

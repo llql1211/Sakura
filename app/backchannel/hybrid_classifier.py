@@ -7,10 +7,12 @@ from app.backchannel.probe_classifier import ProbeIntentClassifier
 
 
 class HybridBackchannelClassifier:
-    """rules-first hybrid classifier。
+    """probe-primary hybrid classifier。
 
-    规则层负责高精度信号(问候/报错等关键词);probe 层(bge 句向量 +
-    标注数据训练出的分类头)补足规则无命中的中文情感/意图泛化。
+    架构(2026-06-14 翻转):规则层只保留闭集/结构化的高精度前置快路径
+    (程式化问候 + 无歧义技术报错);其余 complaint/support/positive/affection/
+    request 与一切语义/情感泛化交给 probe 层(bge 句向量 + 保守分类头,弃权即
+    落中性兜底)。审计证实规则关键词子串匹配粗颗粒度、是错接主因,故大幅删减。
     """
 
     # 首次 classify 会冷加载句向量模型(数秒),必须派发到后台线程。
@@ -41,10 +43,12 @@ class HybridBackchannelClassifier:
             preload_fn()
 
     def classify(self, text: str) -> BackchannelLabel | None:
-        rule_label = self._rule_classifier.classify(text)
-        if rule_label is not None:
-            return rule_label
+        # 前置快路径:仅闭集/结构化的高精度规则(问候 + 技术报错)。
+        high_precision = self._rule_classifier.classify_high_precision(text)
+        if high_precision is not None:
+            return high_precision
 
+        # 其余全部交给 probe(保守,弃权→None→中性兜底),避免规则粗颗粒度错接。
         result = self._probe_classifier.classify_intent(text)
         if result is None:
             return None
