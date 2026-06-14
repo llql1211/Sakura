@@ -23,8 +23,6 @@ def classifier() -> RuleClassifier:
         ("今天好累,心情不好", "support", "sad"),
         ("最喜欢你了,贴贴", "affection", "embarrassed"),
         ("帮我搜一下明天的天气", "request", "neutral"),
-        ("这是什么意思?", "question", "confused"),
-        ("为什么会这样?", "question", "confused"),
         ("跑通了!太好了!!", "positive", "happy"),
     ],
 )
@@ -115,17 +113,18 @@ def test_no_signal_returns_none(classifier: RuleClassifier, text: str) -> None:
     assert classifier.classify(text) is None
 
 
-def test_question_mark_alone_is_question(classifier: RuleClassifier) -> None:
-    label = classifier.classify("这样也行?")
-    assert label is not None
-    assert label.intent == "question"
+def test_bare_question_falls_through_to_fallback(classifier: RuleClassifier) -> None:
+    # 疑问句不再被规则层接管(旧逻辑判 question→confused 是错接主因);
+    # 无其他可靠信号时返回 None,落中性兜底,由 probe 层做保守泛化。
+    assert classifier.classify("这样也行?") is None
 
 
-@pytest.mark.parametrize("text", ["没有什么特别的", "怎么会有这样的人"])
-def test_false_question_contexts_do_not_trigger_question(
+@pytest.mark.parametrize("text", ["没有什么特别的", "怎么会有这样的人", "你喜欢听什么样的音乐", "下午喝什么"])
+def test_question_words_do_not_trigger_backchannel(
     classifier: RuleClassifier,
     text: str,
 ) -> None:
+    # 疑问词(什么/怎么)不再触发接话,偏好/事实/闲聊提问一律落兜底,避免错接。
     assert classifier.classify(text) is None
 
 

@@ -15,6 +15,22 @@ from app.backchannel.model_cache import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_hf_cache(tmp_path_factory, monkeypatch):  # type: ignore[no-untyped-def]
+    # 把全局 HuggingFace 缓存指向空临时目录,确保 backchannel_model_cached 只反映项目内
+    # runtime/hf-cache/hub。否则开发机 ~/.cache/huggingface 里真实存在的 bge 模型会让
+    # 判定恒为 True,污染本文件所有用例(尤其是断言 is False 的拒绝路径用例)。
+    isolated_home = tmp_path_factory.mktemp("hf-home")
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("HF_HOME", str(isolated_home / "huggingface"))
+    for var in (
+        "SENTENCE_TRANSFORMERS_HOME",
+        "HUGGINGFACE_HUB_CACHE",
+        "TRANSFORMERS_CACHE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 def _write_model_zip(path: Path, *, prefix: str = "") -> None:
     root = prefix.strip("/")
     base = f"{root}/" if root else ""

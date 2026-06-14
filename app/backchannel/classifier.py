@@ -12,11 +12,13 @@ from app.backchannel.models import DEFAULT_EMOTION, BackchannelLabel
 
 # 意图关键词。匹配计数决定置信度;多意图命中时按 _INTENT_PRIORITY 决胜。
 _INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    # 仅保留无歧义的技术故障信号。已剔除审计证实的高假阳性子串:
+    # "崩"(心态崩溃→support)、"坏了"(灯泡/心情坏了→none)、"不工作"(不想工作)、
+    # "还是不行/又不行"(泛化不满,非报错)——它们把情绪/闲聊误接成 error(原精度仅 35%)。
     "error": (
         "报错", "出错", "错误", "bug", "Bug", "BUG", "error", "Error",
-        "Traceback", "traceback", "exception", "Exception", "崩", "闪退",
-        "失败", "跑不起来", "运行不了", "不工作", "坏了", "404", "500",
-        "还是不行", "又不行", "无法运行", "无法打开",
+        "Traceback", "traceback", "exception", "Exception", "闪退",
+        "失败", "跑不起来", "运行不了", "无法运行", "无法打开", "404", "500",
     ),
     "complaint": (
         "好烦", "很烦", "真烦", "烦死", "烦人", "气死", "讨厌", "受不了",
@@ -26,16 +28,13 @@ _INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
         "难过", "想哭", "哭了", "累了", "好累", "心情不好", "emo", "难受",
         "委屈", "睡不着", "压力好大", "撑不住",
     ),
+    # 剔除"可爱"(过泛:可爱的猫/这个设计很可爱,非对角色亲昵,精度仅 29%)。
     "affection": (
-        "喜欢你", "爱你", "想你", "抱抱", "亲亲", "摸摸", "贴贴", "可爱",
+        "喜欢你", "爱你", "想你", "抱抱", "亲亲", "摸摸", "贴贴",
     ),
     "request": (
         "帮我", "给我", "替我", "麻烦你", "搜一下", "搜索", "查一下", "查查",
         "打开", "写一个", "写个", "做一个", "生成", "翻译", "总结", "整理一下",
-    ),
-    "question": (
-        "什么", "怎么", "为什么", "为啥", "如何", "哪里", "哪个", "是不是",
-        "能不能", "可以吗",
     ),
     "positive": (
         "成功", "搞定", "解决了", "太好了", "好耶", "通过了", "完成了",
@@ -43,24 +42,17 @@ _INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# 多意图命中同分时的决胜顺序:特异性强的信号优先
-#(报错/抱怨/求安慰的关键词比疑问词更不容易误触)。
+# 多意图命中同分时的决胜顺序:特异性强的信号优先。
+# 不含 question:疑问句没有可靠的接话信号(偏好/事实/闲聊都带疑问词),
+# 旧逻辑把它们硬判成 question→confused 立绘,是「错接」的主要来源。
+# 现交给 probe 层做保守泛化:命中不了具体情绪/社交信号就落 none 中性兜底。
 _INTENT_PRIORITY = (
-    "error", "complaint", "support", "affection", "request", "question", "positive",
+    "error", "complaint", "support", "affection", "request", "positive",
 )
 
 # 情绪信号,按优先级检查,首个命中即采用。
 _EXCLAMATION_RUN = re.compile(r"[!！]{2,}")
-_QUESTION_MARKS = re.compile(r"[?？]")
 _CODE_FENCE = "```"
-
-# 否定/虚指语境里的 什么/怎么 不表疑问(没有什么/什么都没/怎么会…)。
-# 计 question 信号前先抹掉,避免把陈述句("没有什么特别的")和情绪反问
-# ("怎么会有这样的人")误判成提问——这是规则层在情感域 OOS 误接的主因。
-_QUESTION_FALSE_CONTEXTS = re.compile(
-    r"没有什么|没什么|什么都|什么也|不算什么|算不了什么|"
-    r"怎么会|怎么能|怎么这么|怎么总是|怎么老是|怎么又"
-)
 
 # 社交礼仪句(greeting 家族):高度程式化的封闭集,会话分析中的相邻对首件。
 # 仅对短输入短路(长句里"我回来了,帮我查…"应让任务意图按正常计分胜出)。
@@ -161,26 +153,15 @@ class RuleClassifier:
         suffix = normalized[len(base):]
         return all(char in _GREETING_ALLOWED_SUFFIX for char in suffix)
 
-    def _count_question_signals(self, content: str) -> int:
-        # 先抹掉否定/虚指里的 什么/怎么,再计疑问词,避免"没有什么/怎么会"假触发。
-        masked = _QUESTION_FALSE_CONTEXTS.sub("", content)
-        return sum(1 for keyword in _INTENT_KEYWORDS["question"] if keyword in masked)
-
     def _classify_intent(self, content: str) -> tuple[str | None, int]:
         scores: dict[str, int] = {}
         for intent, keywords in _INTENT_KEYWORDS.items():
-            if intent == "question":
-                count = self._count_question_signals(content)
-            else:
-                count = sum(1 for keyword in keywords if keyword in content)
+            count = sum(1 for keyword in keywords if keyword in content)
             if count:
                 scores[intent] = count
         # 代码块/报错栈是 error 的强信号(报错往往整段粘贴而不含中文关键词)。
         if _CODE_FENCE in content or "  File \"" in content:
             scores["error"] = scores.get("error", 0) + 2
-        # 问号本身就是 question 信号,即便没有疑问词。
-        if _QUESTION_MARKS.search(content):
-            scores["question"] = scores.get("question", 0) + 1
         if not scores:
             return None, 0
         best = max(scores.values())
@@ -201,8 +182,6 @@ class RuleClassifier:
         if intent == "affection":
             # 表白/亲昵语境的情绪缺省:害羞(对应模板键 embarrassed)。
             return "embarrassed"
-        if intent == "question":
-            return "confused"
         if intent == "complaint":
             return "angry"
         if intent == "support":
