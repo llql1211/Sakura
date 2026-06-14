@@ -858,6 +858,56 @@ def test_shutdown_ignores_late_progress_and_reply() -> None:
     assert window.messages == []
 
 
+def test_silent_screen_awareness_reply_ends_interaction() -> None:
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class MinimalWindow:
+        _handle_event_reply = PetWindow._handle_event_reply
+        _clear_active_event = PetWindow._clear_active_event
+
+        def __init__(self) -> None:
+            self._shutdown_in_progress = False
+            self.messages = [
+                {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+            ]
+            self.active_event = AgentEvent(type="screen_awareness_check", payload={})
+            self.active_event_type = "screen_awareness_check"
+            self.active_reminder_id = None
+            self.active_reminder_text = ""
+            self.active_interaction_id = "interaction-1"
+            self.logged = []
+            self.ended = []
+
+        def _log_interaction_stage(self, *args):  # type: ignore[no-untyped-def]
+            self.logged.append(args)
+
+        def _queue_event_screen_observation_followup(self, *args):  # type: ignore[no-untyped-def]
+            return False
+
+        def _filter_screen_awareness_reply(self, result, event):  # type: ignore[no-untyped-def]
+            return result
+
+        def _consume_agent_result(self, _result):  # type: ignore[no-untyped-def]
+            raise AssertionError("静默主动事件不应进入回复展示")
+
+        def _mark_reminder_completed(self, _reminder_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("本用例没有提醒 id")
+
+        def _end_interaction(self, outcome: str) -> None:
+            self.ended.append(outcome)
+            self.active_interaction_id = ""
+
+    window = MinimalWindow()
+    result = AgentResult(reply=ChatReply([]), actions=[])
+
+    window._handle_event_reply(result)
+
+    assert window.messages == []
+    assert window.active_event_type == ""
+    assert window.active_interaction_id == ""
+    assert window.ended == ["event_silent"]
+
+
 def test_event_error_cleans_transient_progress_during_shutdown() -> None:
     from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 

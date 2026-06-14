@@ -3125,6 +3125,9 @@ class PetWindow(QWidget):
         self._clear_active_event()
         if not result.reply.text.strip() and not result.reply.translation.strip() and not result.actions:
             self._log_interaction_stage("event_silent", {"event_type": event.type if event else ""})
+            if reminder_id is not None:
+                self._mark_reminder_completed(reminder_id)
+            self._end_interaction("event_silent")
             return
         self._consume_agent_result(result)
         if reminder_id is not None:
