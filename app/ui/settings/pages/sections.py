@@ -618,8 +618,17 @@ class PrivacySettingsPage:
         owner.proactive_batch_limit_spin.setValue(
             normalized_screen_awareness_settings.screen_context_batch_limit
         )
+        owner.proactive_token_estimate_label = QLabel(tab)
+        owner.proactive_token_estimate_label.setWordWrap(True)
+        owner.proactive_token_estimate_label.setObjectName("secondaryText")
+        owner.proactive_token_estimate_label.setToolTip(
+            "按当前屏幕原始尺寸和高细节图像规则估算，不包含文字、工具协议和非 OpenAI 兼容方差异。"
+        )
         owner.proactive_screen_context_enabled_check.toggled.connect(
             owner._sync_proactive_screen_context_controls
+        )
+        owner.proactive_batch_limit_spin.valueChanged.connect(
+            owner._sync_proactive_token_estimate
         )
 
         form_layout = QFormLayout()
@@ -629,8 +638,10 @@ class PrivacySettingsPage:
         form_layout.addRow("主动检查间隔", owner.proactive_check_interval_spin)
         form_layout.addRow("主动发言冷却", owner.proactive_cooldown_spin)
         form_layout.addRow("单次最多发送截图", owner.proactive_batch_limit_spin)
+        form_layout.addRow("预计图像 token", owner.proactive_token_estimate_label)
         owner._proactive_form_layout = form_layout
         tab.setLayout(form_layout)
+        owner._sync_proactive_token_estimate()
         owner._sync_proactive_screen_context_controls(
             owner.proactive_screen_context_enabled_check.isChecked()
         )

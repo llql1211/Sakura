@@ -130,12 +130,16 @@ def capture_screen_observation(excluded_widget: QWidget | None = None) -> Screen
     return build_screen_observation_from_image(capture_screen_image(excluded_widget))
 
 
-def build_screen_observation_from_image(captured: CapturedScreenImage) -> ScreenObservation:
+def build_screen_observation_from_image(
+    captured: CapturedScreenImage,
+    *,
+    max_edge: int = SCREEN_OBSERVATION_MAX_EDGE,
+) -> ScreenObservation:
     """从已复制的 QImage 构造观察结果，可在后台线程执行。"""
     if captured.image.isNull():
         raise RuntimeError("屏幕截图为空。")
 
-    encoded_image = _scaled_image(captured.image)
+    encoded_image = _scaled_image(captured.image, max_edge=max_edge)
     return ScreenObservation(
         data_url=_encode_image_to_data_url(encoded_image),
         width=encoded_image.width(),
@@ -162,15 +166,16 @@ def build_screen_observation_from_pixmap(
     )
 
 
-def _scaled_image(image: QImage) -> QImage:
+def _scaled_image(image: QImage, *, max_edge: int = SCREEN_OBSERVATION_MAX_EDGE) -> QImage:
     from PySide6.QtCore import Qt
 
+    max_edge = max(1, int(max_edge or SCREEN_OBSERVATION_MAX_EDGE))
     longest_edge = max(image.width(), image.height())
-    if longest_edge <= SCREEN_OBSERVATION_MAX_EDGE:
+    if longest_edge <= max_edge:
         return image
     return image.scaled(
-        SCREEN_OBSERVATION_MAX_EDGE,
-        SCREEN_OBSERVATION_MAX_EDGE,
+        max_edge,
+        max_edge,
         Qt.AspectRatioMode.KeepAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )

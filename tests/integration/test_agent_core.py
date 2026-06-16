@@ -49,6 +49,8 @@ from app.llm.prompt_templates import (
 )
 from app.agent.screen_awareness import (
     ScreenAwarenessSettings,
+    estimate_screen_context_batch_tokens_for_size,
+    estimate_screen_context_image_tokens_for_size,
 )
 from app.agent.screen_observation import (
     SCREEN_OBSERVATION_HISTORY_MARKER,
@@ -190,6 +192,25 @@ def test_screen_awareness_settings_default_to_enabled() -> None:
     assert settings.check_interval_minutes == 2
     assert settings.cooldown_minutes == 10
     assert settings.screen_context_batch_limit == 6
+
+
+def test_screen_awareness_token_estimate_uses_high_detail_rules() -> None:
+    assert estimate_screen_context_image_tokens_for_size(
+        1920,
+        1080,
+        model="gpt-4o",
+    ) == 1105
+    assert estimate_screen_context_image_tokens_for_size(
+        3840,
+        2160,
+        model="gpt-4o",
+    ) == 1105
+    assert estimate_screen_context_batch_tokens_for_size(
+        1920,
+        1080,
+        6,
+        model="gpt-4o",
+    ) == 6630
 
 
 def test_screen_awareness_settings_clamp_intervals() -> None:
@@ -3027,6 +3048,7 @@ def test_proactive_check_event_attaches_screen_context_image() -> None:
     content = client.messages[0][0]["content"]
     assert isinstance(content, list)
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,abc123"
+    assert content[1]["image_url"]["detail"] == "high"
     assert "abc123" not in content[0]["text"]
     assert "image_attached" in content[0]["text"]
     assert "先理解屏幕画面本身" in client.prompts[0]
@@ -3067,6 +3089,8 @@ def test_proactive_check_event_attaches_screen_context_image_batch() -> None:
     assert isinstance(content, list)
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,first"
     assert content[2]["image_url"]["url"] == "data:image/jpeg;base64,second"
+    assert content[1]["image_url"]["detail"] == "high"
+    assert content[2]["image_url"]["detail"] == "high"
     assert "first" not in content[0]["text"]
     assert "second" not in content[0]["text"]
     assert "image_attached" in content[0]["text"]
@@ -3097,6 +3121,7 @@ def test_proactive_check_event_includes_recent_conversation_text() -> None:
 
     assert isinstance(content, list)
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,screen"
+    assert content[1]["image_url"]["detail"] == "high"
     assert "recent_conversation" in content[0]["text"]
     assert "访问 GitHub 看看 Sakura 内容" in content[0]["text"]
     assert "我打开看看。" in content[0]["text"]

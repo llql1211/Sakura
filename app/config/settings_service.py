@@ -360,16 +360,15 @@ class AppSettingsService:
 
     def save_screen_awareness_settings(self, settings: ScreenAwarenessSettings) -> None:
         normalized = settings.normalized()
-        self.save_system_values(
-            "screen_awareness",
-            {
-                "enabled": bool(normalized.enabled),
-                "screen_context_enabled": bool(normalized.screen_context_enabled),
-                "check_interval_minutes": int(normalized.check_interval_minutes),
-                "cooldown_minutes": int(normalized.cooldown_minutes),
-                "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
-            },
-        )
+        data = load_yaml_mapping(self.system_config_path)
+        data["screen_awareness"] = {
+            "enabled": bool(normalized.enabled),
+            "screen_context_enabled": bool(normalized.screen_context_enabled),
+            "check_interval_minutes": int(normalized.check_interval_minutes),
+            "cooldown_minutes": int(normalized.cooldown_minutes),
+            "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
+        }
+        save_yaml_mapping(self.system_config_path, data)
 
     def load_proactive_care_settings(self) -> ScreenAwarenessSettings:
         """兼容旧调用点；新代码请使用 load_screen_awareness_settings。"""

@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -74,6 +75,8 @@ from app.ui.subtitle_controller import (
 )
 from app.agent.screen_awareness import (
     ScreenAwarenessSettings,
+    estimate_screen_context_batch_tokens_for_size,
+    estimate_screen_context_image_tokens_for_size,
 )
 from app.voice.tts_settings import (
     DEFAULT_GENIE_TTS_API_URL,
@@ -457,9 +460,44 @@ class SettingsDialog(QDialog):
                 self.proactive_check_interval_spin,
                 self.proactive_cooldown_spin,
                 self.proactive_batch_limit_spin,
+                self.proactive_token_estimate_label,
             ),
             enabled,
         )
+
+    def _sync_proactive_token_estimate(self, *_args: object) -> None:
+        """根据当前屏幕原始尺寸和批量张数刷新主动感知图像 token 粗估。"""
+        if not hasattr(self, "proactive_token_estimate_label"):
+            return
+        screen_width, screen_height = self._screen_awareness_estimate_size()
+        image_count = max(1, int(self.proactive_batch_limit_spin.value()))
+        model = self._initial_api_settings.model
+        per_image = estimate_screen_context_image_tokens_for_size(
+            screen_width,
+            screen_height,
+            model=model,
+        )
+        total = estimate_screen_context_batch_tokens_for_size(
+            screen_width,
+            screen_height,
+            image_count,
+            model=model,
+        )
+        self.proactive_token_estimate_label.setText(
+            f"按原始屏幕 {screen_width}x{screen_height}、高细节估算："
+            f"约 {per_image:,} tokens/张；{image_count} 张约 {total:,} tokens。"
+        )
+
+    def _screen_awareness_estimate_size(self) -> tuple[int, int]:
+        screen = self.screen()
+        if screen is None:
+            app = QApplication.instance()
+            screen = app.primaryScreen() if app is not None else None
+        if screen is not None:
+            geometry = screen.geometry()
+            return max(1, geometry.width()), max(1, geometry.height())
+
+        return 1280, 720
 
     @Slot(bool)
     def _sync_bubble_auto_hide_controls(self, enabled: bool) -> None:
@@ -2210,6 +2248,14 @@ class SettingsDialog(QDialog):
 def _is_http_url(url: str) -> bool:
     parsed_url = urlparse(url)
     return parsed_url.scheme in {"http", "https"} and bool(parsed_url.netloc)
+
+
+def _combo_int_data(combo: object, *, default: int) -> int:
+    current_data = getattr(combo, "currentData", lambda: None)()
+    try:
+        return int(current_data)
+    except (TypeError, ValueError):
+        return default
 
 
 def _default_tts_api_url(provider: str) -> str:

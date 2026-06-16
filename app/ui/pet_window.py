@@ -106,6 +106,7 @@ from app.ui.history_window import HistoryWindow
 from app.ui.log_window import RuntimeLogWindow
 from app.agent.screen_awareness import (
     SCREEN_AWARENESS_CONTEXT_HISTORY_MARKER,
+    SCREEN_AWARENESS_IMAGE_DETAIL,
     SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS,
     SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS,
     ScreenAwarenessSettings,
@@ -113,6 +114,7 @@ from app.agent.screen_awareness import (
 from app.agent.screen_observation import (
     CapturedScreenImage,
     SCREEN_OBSERVATION_HISTORY_MARKER,
+    SCREEN_OBSERVATION_MAX_EDGE,
     ScreenObservation,
     append_manual_observation_marker,
     append_observation_marker,
@@ -408,7 +410,13 @@ class ScreenObservationEncodeWorker(QObject):
     def run(self) -> None:
         try:
             self._cancel_token.throw_if_cancelled()
-            observation = build_screen_observation_from_image(self.captured)
+            max_edge = _screen_observation_max_edge_from_context(self.context)
+            if self.context.get("preserve_original_resolution") is True:
+                max_edge = max(1, self.captured.image.width(), self.captured.image.height())
+            observation = build_screen_observation_from_image(
+                self.captured,
+                max_edge=max_edge,
+            )
             self._cancel_token.throw_if_cancelled()
         except OperationCancelled:
             self.cancelled.emit(self.context)
@@ -420,6 +428,15 @@ class ScreenObservationEncodeWorker(QObject):
             self.failed.emit(self.context, str(exc))
             return
         self.finished.emit(self.context, observation)
+
+
+def _screen_observation_max_edge_from_context(context: dict[str, Any]) -> int:
+    value = context.get("max_edge")
+    try:
+        max_edge = int(value)
+    except (TypeError, ValueError):
+        return SCREEN_OBSERVATION_MAX_EDGE
+    return max(1, max_edge)
 
 
 class PetWindow(QWidget):
@@ -2542,6 +2559,7 @@ class PetWindow(QWidget):
                 "event": event,
                 "reminder_id": reminder_id,
                 "reason": reason,
+                **self._screen_awareness_encode_options(),
             },
         ):
             self.screen_observation_followup_in_progress = False
@@ -2909,7 +2927,11 @@ class PetWindow(QWidget):
             return
         if not self._start_screen_observation_encode(
             captured,
-            {"kind": "screen_awareness_context", "captured_at_monotonic": now},
+            {
+                "kind": "screen_awareness_context",
+                "captured_at_monotonic": now,
+                **self._screen_awareness_encode_options(),
+            },
         ):
             debug_log("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
             return
@@ -2928,6 +2950,7 @@ class PetWindow(QWidget):
             "height": observation.height,
             "captured_at": observation.captured_at,
             "screen_name": observation.screen_name,
+            "detail": str(context_data.get("detail") or SCREEN_AWARENESS_IMAGE_DETAIL),
         }
         if not self.screen_awareness_contexts:
             self.screen_awareness_context_batch_started_at = float(captured_at_monotonic)
@@ -2996,6 +3019,12 @@ class PetWindow(QWidget):
 
     def _screen_awareness_context_allowed(self) -> bool:
         return self._current_screen_awareness_settings().allows_screen_context()
+
+    def _screen_awareness_encode_options(self) -> dict[str, Any]:
+        return {
+            "preserve_original_resolution": True,
+            "detail": SCREEN_AWARENESS_IMAGE_DETAIL,
+        }
 
     def _sync_screen_awareness_timer(self) -> None:
         if self._screen_awareness_context_allowed():
@@ -3088,7 +3117,11 @@ class PetWindow(QWidget):
             return
         if not self._start_screen_observation_encode(
             captured,
-            {"kind": "screen_awareness_context", "captured_at_monotonic": now},
+            {
+                "kind": "screen_awareness_context",
+                "captured_at_monotonic": now,
+                **self._screen_awareness_encode_options(),
+            },
         ):
             debug_log("ScreenAwareness", "主动屏幕上下文编码忙，跳过本次截图")
             return
@@ -3258,6 +3291,9 @@ class PetWindow(QWidget):
         self._clear_active_event()
         if not result.reply.text.strip() and not result.reply.translation.strip() and not result.actions:
             self._log_interaction_stage("event_silent", {"event_type": event.type if event else ""})
+            if reminder_id is not None:
+                self._mark_reminder_completed(reminder_id)
+            self._end_interaction("event_silent")
             return
         self._consume_agent_result(result)
         if reminder_id is not None:
@@ -3278,10 +3314,14 @@ class PetWindow(QWidget):
         if self._screen_awareness_health_reminder_seen(night_key):
             debug_log(
                 "ScreenAwareness",
-                "夜间健康类主动提醒已达上限，本次静默",
+                "夜间健康类主动提醒已达上限，改为屏幕内容分析",
                 {"night_key": night_key},
             )
-            return AgentResult(reply=ChatReply([]), actions=[])
+            return AgentResult(
+                reply=_build_screen_awareness_non_health_reply(result.reply, event),
+                actions=result.actions,
+                _debug=result._debug,
+            )
         self._record_screen_awareness_health_reminder(night_key)
         return result
 
@@ -3350,6 +3390,9 @@ class PetWindow(QWidget):
             self._consume_agent_result(result)
         elif _is_screen_awareness_event_type(event_type):
             self._log_interaction_stage("screen_awareness_error_silent")
+            # 主动感知失败时静默结束本轮交互。若不结束，active_interaction_id 会一直占用，
+            # _can_run_proactive_care 会持续返回 False，导致此后不再触发任何主动感知。
+            self._end_interaction("screen_awareness_error_silent")
         if reminder_id is not None:
             self._mark_reminder_completed(reminder_id)
 
@@ -5279,13 +5322,122 @@ def _is_screen_awareness_event_type(event_type: str) -> bool:
 
 
 def _is_screen_awareness_health_reply(reply: ChatReply) -> bool:
+    return any(
+        _is_screen_awareness_health_segment(segment)
+        for segment in reply.segments
+    )
+
+
+def _is_screen_awareness_health_segment(segment: ChatSegment) -> bool:
     text = "\n".join(
         part
-        for segment in reply.segments
         for part in (segment.text, segment.translation)
         if part
     )
     return any(keyword in text for keyword in SCREEN_AWARENESS_HEALTH_KEYWORDS)
+
+
+def _build_screen_awareness_non_health_reply(
+    reply: ChatReply,
+    event: AgentEvent | None,
+) -> ChatReply:
+    non_health_segments = [
+        segment
+        for segment in reply.segments
+        if not _is_screen_awareness_health_segment(segment)
+    ]
+    if non_health_segments:
+        return ChatReply(non_health_segments)
+    return _build_screen_awareness_screen_content_reply(event)
+
+
+def _build_screen_awareness_screen_content_reply(event: AgentEvent | None) -> ChatReply:
+    visual_context = _first_screen_awareness_visual_context(event)
+    summary = _screen_awareness_text_value(
+        visual_context.get("summary") if visual_context else None
+    )
+    visible_texts = _screen_awareness_text_list(
+        visual_context.get("visible_texts") if visual_context else None,
+        limit=3,
+    )
+    notable_elements = _screen_awareness_text_list(
+        visual_context.get("notable_elements") if visual_context else None,
+        limit=3,
+    )
+
+    if summary:
+        zh = f"我先按屏幕内容说：{summary}"
+        ja = f"画面内容のほうを見るね。{summary}"
+    else:
+        screen_count = _screen_awareness_screen_context_count(event)
+        if screen_count > 0:
+            zh = f"我先按屏幕内容说：这批主动感知拿到了 {screen_count} 张屏幕上下文，可以顺着当前窗口和任务状态继续看。"
+            ja = f"画面内容のほうを見るね。今回は {screen_count} 枚の画面文脈をもとに、今のウィンドウと作業状態に沿って見るよ。"
+        else:
+            zh = "我先按屏幕内容说：当前画面有新的上下文，可以顺着可见窗口和任务状态继续推进。"
+            ja = "画面内容のほうを見るね。今の画面の文脈に沿って、見えているウィンドウと作業状態から続けるよ。"
+
+    if visible_texts:
+        visible = "、".join(visible_texts)
+        zh += f" 画面里比较明确的文字有：{visible}。"
+        ja += f" 見えている文字は「{visible}」あたり。"
+    elif notable_elements:
+        notable = "、".join(notable_elements)
+        zh += f" 比较值得关注的是：{notable}。"
+        ja += f" 目立つ要素は「{notable}」あたり。"
+
+    return ChatReply(
+        [
+            ChatSegment(
+                text=ja,
+                translation=zh,
+                tone="中性",
+                portrait="思考",
+            )
+        ]
+    )
+
+
+def _first_screen_awareness_visual_context(event: AgentEvent | None) -> dict[str, Any] | None:
+    if event is None:
+        return None
+    visual_contexts = event.payload.get("visual_contexts")
+    if not isinstance(visual_contexts, list):
+        return None
+    for context in visual_contexts:
+        if isinstance(context, dict):
+            return context
+    return None
+
+
+def _screen_awareness_screen_context_count(event: AgentEvent | None) -> int:
+    if event is None:
+        return 0
+    count = event.payload.get("screen_context_count")
+    if isinstance(count, int) and count > 0:
+        return count
+    screen_contexts = event.payload.get("screen_contexts")
+    if isinstance(screen_contexts, list):
+        return len(screen_contexts)
+    return 0
+
+
+def _screen_awareness_text_value(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _screen_awareness_text_list(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = _screen_awareness_text_value(item)
+        if not text:
+            continue
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def _screen_awareness_night_key(now: datetime | None = None) -> str:

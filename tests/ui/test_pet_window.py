@@ -858,6 +858,56 @@ def test_shutdown_ignores_late_progress_and_reply() -> None:
     assert window.messages == []
 
 
+def test_silent_screen_awareness_reply_ends_interaction() -> None:
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class MinimalWindow:
+        _handle_event_reply = PetWindow._handle_event_reply
+        _clear_active_event = PetWindow._clear_active_event
+
+        def __init__(self) -> None:
+            self._shutdown_in_progress = False
+            self.messages = [
+                {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+            ]
+            self.active_event = AgentEvent(type="screen_awareness_check", payload={})
+            self.active_event_type = "screen_awareness_check"
+            self.active_reminder_id = None
+            self.active_reminder_text = ""
+            self.active_interaction_id = "interaction-1"
+            self.logged = []
+            self.ended = []
+
+        def _log_interaction_stage(self, *args):  # type: ignore[no-untyped-def]
+            self.logged.append(args)
+
+        def _queue_event_screen_observation_followup(self, *args):  # type: ignore[no-untyped-def]
+            return False
+
+        def _filter_screen_awareness_reply(self, result, event):  # type: ignore[no-untyped-def]
+            return result
+
+        def _consume_agent_result(self, _result):  # type: ignore[no-untyped-def]
+            raise AssertionError("静默主动事件不应进入回复展示")
+
+        def _mark_reminder_completed(self, _reminder_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("本用例没有提醒 id")
+
+        def _end_interaction(self, outcome: str) -> None:
+            self.ended.append(outcome)
+            self.active_interaction_id = ""
+
+    window = MinimalWindow()
+    result = AgentResult(reply=ChatReply([]), actions=[])
+
+    window._handle_event_reply(result)
+
+    assert window.messages == []
+    assert window.active_event_type == ""
+    assert window.active_interaction_id == ""
+    assert window.ended == ["event_silent"]
+
+
 def test_event_error_cleans_transient_progress_during_shutdown() -> None:
     from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
@@ -878,6 +928,48 @@ def test_event_error_cleans_transient_progress_during_shutdown() -> None:
 
     assert window.messages == []
     assert window.active_event_type == ""
+
+
+def test_screen_awareness_event_error_ends_interaction() -> None:
+    """主动感知 API 失败时必须结束交互，否则 active_interaction_id 卡住会让后续主动感知永久停摆。"""
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _handle_event_error = PetWindow._handle_event_error
+        _clear_active_event = PetWindow._clear_active_event
+
+        def __init__(self) -> None:
+            self._shutdown_in_progress = False
+            self.messages = []
+            self.active_event = None
+            self.active_event_type = "screen_awareness_check"
+            self.active_reminder_id = None
+            self.active_reminder_text = ""
+            self.active_interaction_id = "interaction-3"
+            self.logged = []
+            self.ended = []
+
+        def _log_interaction_stage(self, *args):  # type: ignore[no-untyped-def]
+            self.logged.append(args)
+
+        def _consume_agent_result(self, _result):  # type: ignore[no-untyped-def]
+            raise AssertionError("静默主动感知失败不应进入回复展示")
+
+        def _mark_reminder_completed(self, _reminder_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("本用例没有提醒 id")
+
+        def _end_interaction(self, outcome: str) -> None:
+            self.ended.append(outcome)
+            self.active_interaction_id = ""
+
+    window = MinimalWindow()
+
+    window._handle_event_error("API 请求超时。")
+
+    assert window.active_event_type == ""
+    # 关键断言：交互已结束，active_interaction_id 被清空，主动感知总闸不会被永久卡住
+    assert window.active_interaction_id == ""
+    assert window.ended == ["screen_awareness_error_silent"]
 
 
 def test_speaking_state_timeout_cancels_reply_and_ends_interaction() -> None:
@@ -1888,18 +1980,24 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
+    assert not dialog.proactive_token_estimate_label.isEnabled()
+    assert "按原始屏幕" in dialog.proactive_token_estimate_label.text()
+    assert "高细节估算" in dialog.proactive_token_estimate_label.text()
+    assert "6 张约" in dialog.proactive_token_estimate_label.text()
 
     dialog.proactive_screen_context_enabled_check.setChecked(True)
     app.processEvents()
     assert dialog.proactive_check_interval_spin.isEnabled()
     assert dialog.proactive_cooldown_spin.isEnabled()
     assert dialog.proactive_batch_limit_spin.isEnabled()
+    assert dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.proactive_screen_context_enabled_check.setChecked(False)
     app.processEvents()
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
+    assert not dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.deleteLater()
     app.processEvents()
@@ -6455,6 +6553,26 @@ def test_screen_awareness_batches_screenshots_until_cooldown(monkeypatch) -> Non
     assert window.screen_awareness_contexts == []
 
 
+def test_screen_awareness_capture_uses_selected_resolution(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+
+    contexts: list[dict[str, object]] = []
+    window = _build_minimal_screen_awareness_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=2,
+    )
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
+    window._start_screen_observation_encode = lambda _captured, context: (
+        contexts.append(context) or True
+    )
+
+    window._capture_screen_awareness_context(60)
+
+    assert contexts[0]["preserve_original_resolution"] is True
+    assert contexts[0]["detail"] == "high"
+
+
 def test_proactive_care_event_includes_recent_conversation() -> None:
     from app.agent.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
     from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
@@ -6680,7 +6798,7 @@ def test_proactive_care_disabled_does_not_capture_or_send(monkeypatch) -> None: 
     assert window.proactive_screen_contexts == []
 
 
-def test_screen_awareness_limits_night_health_reminders(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_screen_awareness_redirects_limited_night_health_reminders(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
 
@@ -6709,7 +6827,18 @@ def test_screen_awareness_limits_night_health_reminders(monkeypatch) -> None:  #
 
     monkeypatch.setattr(pet_window_module, "_screen_awareness_night_key", lambda: "2026-06-12")
     window = MinimalWindow()
-    event = AgentEvent(type="screen_awareness_check", payload={})
+    event = AgentEvent(
+        type="screen_awareness_check",
+        payload={
+            "visual_contexts": [
+                {
+                    "summary": "用户正在查看代码编辑器和 Git 客户端。",
+                    "visible_texts": ["event_result_received", "GitHub Desktop"],
+                    "notable_elements": ["代码窗口", "提交列表"],
+                }
+            ],
+        },
+    )
     result = AgentResult(
         reply=ChatReply(
             [
@@ -6726,7 +6855,10 @@ def test_screen_awareness_limits_night_health_reminders(monkeypatch) -> None:  #
     second = window._filter_screen_awareness_reply(result, event)
 
     assert first.reply.translation == "稍微休息一下也可以。"
-    assert second.reply.segments == []
+    assert second.reply.segments
+    assert "用户正在查看代码编辑器和 Git 客户端" in second.reply.translation
+    assert "event_result_received" in second.reply.translation
+    assert "休息" not in second.reply.translation
 
 
 def test_user_activity_keeps_pending_proactive_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -7835,6 +7967,8 @@ def _build_minimal_proactive_window(
     from app.ui.pet_window import PetWindow
 
     class MinimalProactiveWindow:
+        _current_screen_awareness_settings = PetWindow._current_screen_awareness_settings
+        _screen_awareness_encode_options = PetWindow._screen_awareness_encode_options
         _can_run_proactive_care = PetWindow._can_run_proactive_care
         _check_proactive_care = PetWindow._check_proactive_care
         _should_capture_proactive_screen_context = (
@@ -7907,6 +8041,7 @@ def _build_minimal_screen_awareness_window(
         _should_send_screen_awareness_batch = PetWindow._should_send_screen_awareness_batch
         _build_screen_awareness_event = PetWindow._build_screen_awareness_event
         _screen_awareness_context_allowed = PetWindow._screen_awareness_context_allowed
+        _screen_awareness_encode_options = PetWindow._screen_awareness_encode_options
         _clear_screen_awareness_context_batch = PetWindow._clear_screen_awareness_context_batch
 
     window = MinimalScreenAwarenessWindow()
