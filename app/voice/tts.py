@@ -56,6 +56,19 @@ _AUDIO_FINISH_FALLBACK_MIN_MS = 2000
 # 播放完成兜底的上限：时长无法解析或异常超长时按此值兜底，防止流程永久挂起
 _AUDIO_FINISH_FALLBACK_MAX_MS = 60_000
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
+# 可发音字符:数字/拉丁字母/假名/汉字/谚文(含全角)。纯标点、emoji、符号不算——
+# 这类文本喂给 GPT-SoVITS 归一化后音素为空,会触发服务端 [Errno 22] Invalid argument。
+_VOICEABLE_CHAR_RE = re.compile(
+    "[0-9A-Za-z"
+    "぀-ヿ"  # 平假名/片假名
+    "㐀-䶿"  # CJK 扩展 A
+    "一-鿿"  # CJK 基本
+    "豈-﫿"  # CJK 兼容
+    "가-힣"  # 谚文音节
+    "０-９Ａ-Ｚａ-ｚ"  # 全角数字/字母
+    "ｦ-ﾟ"  # 半角片假名
+    "]"
+)
 _CJK_TEXT_LANGS = {"ja", "all_ja", "zh", "all_zh", "ko", "all_ko", "yue", "all_yue"}
 _LOCAL_SERVICE_STARTUP_TIMEOUT_MAX = 180
 
@@ -254,6 +267,11 @@ class _AttachedLocalProcess:
 
 
 class TTSProvider(Protocol):
+    @property
+    def service_ready(self) -> bool:
+        """本地 TTS 服务是否已探测/预热完成。"""
+        ...
+
     def speak(
         self,
         text: str,
@@ -288,6 +306,10 @@ class TTSProvider(Protocol):
 
 
 class NullTTSProvider:
+    @property
+    def service_ready(self) -> bool:
+        return False
+
     def speak(
         self,
         text: str,
@@ -355,6 +377,7 @@ class GPTSoVITSTTSProvider(QObject):
     _audio_ready = Signal(str, object, object, str)
     _prepared_audio_ready = Signal(object, str)
     _prepared_audio_failed = Signal(object, str)
+    _prepared_audio_skipped = Signal(object)
     _failed = Signal(str)
     _started = Signal(object)
     _finished = Signal(object)
@@ -409,11 +432,22 @@ class GPTSoVITSTTSProvider(QObject):
         self._audio_ready.connect(self._enqueue_audio)
         self._prepared_audio_ready.connect(self._store_prepared_audio)
         self._prepared_audio_failed.connect(self._fail_prepared_audio)
+        self._prepared_audio_skipped.connect(self._skip_prepared_audio)
         self._failed.connect(self._log_error)
         self._started.connect(self._run_callback)
         self._finished.connect(self._run_callback)
         if adopt_existing_service:
             self._adopt_existing_configured_service()
+
+    @property
+    def service_ready(self) -> bool:
+        """服务探测是否已成功(实际可达)。
+
+        供接话音频预生成等调用方做就绪门控:provider 实例存在不代表
+        服务已启动,未就绪时发起 prepare 只会得到静默失败。
+        Genie 子类共用 _service_checked,无需覆写。
+        """
+        return self._service_checked
 
     def speak(
         self,
@@ -631,6 +665,13 @@ class GPTSoVITSTTSProvider(QObject):
                 debug_log("TTS", "请求已取消，跳过音频生成", {"text": tts_request.text})
                 return
 
+            # 纯标点/emoji/符号段没有可发音内容，喂给服务端会归一化成空音素并触发
+            # [Errno 22]；提前判定为“无需发音”，正常走完回调但不发请求、不报错。
+            if not _is_voiceable_text(tts_request.text):
+                debug_log("TTS", "文本无可发音内容，跳过合成", {"text": tts_request.text})
+                self._skip_audio_request(tts_request, "无可发音内容")
+                return
+
             fail = lambda message: self._fail_audio_request(tts_request, message)
             if not self._ensure_service_available(fail):
                 return
@@ -704,10 +745,13 @@ class GPTSoVITSTTSProvider(QObject):
                         "error_body": error_body,
                     },
                 )
-                self._fail_audio_request(
-                    tts_request,
-                    _format_gpt_sovits_http_error(exc.code, error_body),
-                )
+                message = _format_gpt_sovits_http_error(exc.code, error_body)
+                if _is_soft_synth_failure(exc.code, error_body):
+                    # 单段合成失败（服务端 tts failed）：文本已照常显示，语音缺一段无需
+                    # 打断用户，静默跳过、正常完成回调，不向 UI 弹 TTS 异常。
+                    self._skip_audio_request(tts_request, message)
+                else:
+                    self._fail_audio_request(tts_request, message)
                 return
             except urllib.error.URLError as exc:
                 debug_log("TTS", "GPT-SoVITS 请求失败", {"reason": str(exc.reason)})
@@ -1145,6 +1189,20 @@ class GPTSoVITSTTSProvider(QObject):
         handle.on_started = None
         handle.on_finished = None
 
+    @Slot(object)
+    def _skip_prepared_audio(self, handle: TTSPreparedAudio) -> None:
+        """预生成句柄静默失败：标记 failed 并完成回调，但不触发 error_occurred。
+
+        与 _fail_prepared_audio 的唯一区别是不调用 _log_error，因此不会向 UI 报错。
+        """
+        handle.failed = True
+        if handle.cancelled or not handle.play_requested:
+            return
+        self._started.emit(handle.on_started)
+        self._finished.emit(handle.on_finished)
+        handle.on_started = None
+        handle.on_finished = None
+
     @Slot(QMediaPlayer.MediaStatus)
     def _handle_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
         debug_log(
@@ -1233,6 +1291,19 @@ class GPTSoVITSTTSProvider(QObject):
             self._fail_request(message, request.on_started, request.on_finished)
             return
         self._prepared_audio_failed.emit(request.prepared_audio, message)
+
+    def _skip_audio_request(self, request: _TTSRequest, reason: str) -> None:
+        """本段无需/无法发音但不算故障：正常走完回调让流程推进，不向 UI 报错。
+
+        与 _fail_audio_request 相比，不 emit _failed/error_occurred，只记 debug；
+        用于纯标点段（无可发音内容）与服务端单段 tts failed 的优雅降级。
+        """
+        debug_log("TTS", "跳过本段合成", {"text": request.text, "reason": reason})
+        if request.prepared_audio is None:
+            self._started.emit(request.on_started)
+            self._finished.emit(request.on_finished)
+            return
+        self._prepared_audio_skipped.emit(request.prepared_audio)
 
     def _enqueue_prepared_audio(self, handle: TTSPreparedAudio) -> None:
         if _provider_is_closed(self):
@@ -1667,6 +1738,12 @@ class GenieTTSProvider(GPTSoVITSTTSProvider):
                 return
             if tts_request.prepared_audio is not None and tts_request.prepared_audio.cancelled:
                 debug_log("TTS", "请求已取消，跳过 Genie 音频生成", {"text": tts_request.text})
+                return
+
+            # 与 GPT-SoVITS 同理：纯标点/符号段无可发音内容，提前静默跳过。
+            if not _is_voiceable_text(tts_request.text):
+                debug_log("TTS", "文本无可发音内容，跳过 Genie 合成", {"text": tts_request.text})
+                self._skip_audio_request(tts_request, "无可发音内容")
                 return
 
             fail = lambda message: self._fail_audio_request(tts_request, message)
@@ -2317,6 +2394,27 @@ def _format_gpt_sovits_http_error(status_code: int, error_body: str) -> str:
 def _looks_like_charmap_encode_error(error_body: str) -> bool:
     normalized = error_body.lower()
     return "charmap" in normalized and "can't encode" in normalized
+
+
+def _is_soft_synth_failure(status_code: int, error_body: str) -> bool:
+    """判断是否为可静默降级的单段合成失败，区别于需提示用户的服务/配置故障。
+
+    GPT-SoVITS api_v2 在推理异常时统一返回 400 + {"message":"tts failed",...}，
+    多由个别文本段触发（如归一化后为空、含服务端不支持的内容），属偶发且无害，
+    文本已照常显示，按单段静默跳过即可。charmap 编码错误是运行时配置问题，
+    会持续影响所有中日文合成，仍需保留提示，故在此排除。
+    """
+    if status_code != 400:
+        return False
+    if _looks_like_charmap_encode_error(error_body):
+        return False
+    return "tts failed" in error_body.lower()
+
+
+def _is_voiceable_text(text: str) -> bool:
+    """文本是否含可发音内容。纯标点/emoji/符号归一化后音素为空，会触发服务端
+    [Errno 22] Invalid argument，提前判定可避免无谓的失败往返。"""
+    return bool(_VOICEABLE_CHAR_RE.search(text))
 
 
 def _probe_tcp_port(host: str, port: int, timeout: int) -> bool:

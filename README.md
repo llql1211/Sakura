@@ -10,7 +10,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/github/license/Rvosy/sakura)](LICENSE)
 
-[English](docs/README.en.md) [安装教程](docs/SETUP.md) [API配置教程](docs/API_CONFIG.md)  [插件开发文档](docs/SAKURA_PLUGIN_SDK.md)  [技术文档](docs/TECHNICAL_README.md) 
+[English](docs/README.en.md) [安装教程](docs/SETUP.md) [API配置教程](docs/API_CONFIG.md)  [插件开发文档](docs/SAKURA_PLUGIN_SDK.md)  [技术文档](docs/TECHNICAL_README.md)
 
 </div>
 

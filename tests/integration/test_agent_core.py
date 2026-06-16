@@ -14,6 +14,7 @@ import zipfile
 
 import pytest
 
+import app.agent.memory as memory_module
 from app.agent.actions import AgentEvent, PendingToolAction
 from app.agent.builtin_tools import create_builtin_tool_registry
 from app.agent.memory import MemoryModelImportError, MemoryStore
@@ -665,6 +666,63 @@ def test_memory_store_imports_embedding_model_archive_structures(prefix: str) ->
     assert result.snapshot_count == 1
     assert (expected_model_dir / "snapshots" / "revision" / "model.safetensors").is_file()
     assert store.needs_embedding_model_download() is False
+
+
+def test_memory_store_downloads_embedding_model_to_project_cache(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = _runtime_root_path("memory_model_download")
+    calls: list[tuple[str, Path]] = []
+
+    def fake_download(repo_id: str, cache_folder: Path) -> str:
+        calls.append((repo_id, cache_folder))
+        snapshot = (
+            cache_folder
+            / "models--sentence-transformers--all-MiniLM-L6-v2"
+            / "snapshots"
+            / "revision"
+        )
+        snapshot.mkdir(parents=True)
+        (snapshot / "model.safetensors").write_bytes(b"fake")
+        return str(snapshot)
+
+    monkeypatch.setattr(memory_module, "_download_hf_snapshot", fake_download)
+    store = MemoryStore(base_dir=root, memory_client=FakeMem0())
+
+    result = store.download_embedding_model()
+
+    expected_cache = root / "runtime" / "hf-cache" / "hub"
+    expected_model_dir = expected_cache / "models--sentence-transformers--all-MiniLM-L6-v2"
+    assert calls == [("sentence-transformers/all-MiniLM-L6-v2", expected_cache)]
+    assert result.cache_folder == expected_cache
+    assert result.model_dir == expected_model_dir
+    assert result.snapshot_count == 1
+    assert store.needs_embedding_model_download() is False
+
+
+def test_memory_hf_snapshot_download_uses_minimal_file_allowlist(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, object] = {}
+
+    def fake_snapshot_download(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return "snapshot"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    result = memory_module._download_hf_snapshot(
+        "sentence-transformers/all-MiniLM-L6-v2",
+        Path("runtime/hf-cache/hub"),
+    )
+
+    assert result == "snapshot"
+    assert captured["repo_id"] == "sentence-transformers/all-MiniLM-L6-v2"
+    assert captured["allow_patterns"] == list(memory_module.DEFAULT_EMBEDDING_MODEL_ALLOW_PATTERNS)
+    assert "onnx/*" not in captured["allow_patterns"]
+    assert "openvino/*" not in captured["allow_patterns"]
+    assert "tf_model.h5" not in captured["allow_patterns"]
+    assert "rust_model.ot" not in captured["allow_patterns"]
 
 
 def test_memory_store_import_does_not_reload_ready_runtime() -> None:

@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+from app.llm.chat_reply import ChatReply, parse_chat_reply, sanitize_reply_tones
 from app.core.cancellation import CancelChecker, cancellable_sleep, check_cancelled
-from app.llm.chat_reply import ChatReply, parse_chat_reply
 from app.core.debug_log import debug_log, summarize_messages
 from app.llm.prompt_templates import build_segmented_reply_instruction
 
@@ -173,7 +173,7 @@ class OpenAICompatibleClient:
         )
         check_cancelled(cancel_checker)
 
-        reply = parse_chat_reply(content)
+        reply = sanitize_reply_tones(parse_chat_reply(content), reply_tones)
         debug_log(
             "API",
             "聊天回复解析完成",

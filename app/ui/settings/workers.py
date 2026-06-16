@@ -10,11 +10,15 @@ from __future__ import annotations
 import base64
 import mimetypes
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from app.agent.memory import MemoryStore
+from app.backchannel.model_cache import (
+    download_backchannel_model,
+    import_backchannel_model_archive,
+)
 from app.config.character_archive import (
     CharacterArchiveError,
     export_character_archive,
@@ -155,6 +159,81 @@ class MemoryModelImportWorker(QObject):
     def run(self) -> None:
         try:
             result = self.memory_store.import_embedding_model_archive(self.archive_path)
+        except Exception as exc:  # UI 边界统一转成可读错误。
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class MemoryModelDownloadWorker(QObject):
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, memory_store: MemoryStore) -> None:
+        super().__init__()
+        self.memory_store = memory_store
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self.memory_store.download_embedding_model()
+        except Exception as exc:  # UI 边界统一转成可读错误。
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class BackchannelModelImportWorker(QObject):
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        base_dir: Path,
+        archive_path: Path,
+        import_model: Callable[[Path, Path], object] = import_backchannel_model_archive,
+    ) -> None:
+        super().__init__()
+        self.base_dir = base_dir
+        self.archive_path = archive_path
+        self.import_model = import_model
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self.import_model(self.archive_path, self.base_dir)
+        except Exception as exc:  # UI 边界统一转成可读错误。
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class BackchannelModelDownloadWorker(QObject):
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        base_dir: Path,
+        download_model: Callable[[Path], object] = download_backchannel_model,
+    ) -> None:
+        super().__init__()
+        self.base_dir = base_dir
+        self.download_model = download_model
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self.download_model(self.base_dir)
         except Exception as exc:  # UI 边界统一转成可读错误。
             self.failed.emit(str(exc))
         else:
