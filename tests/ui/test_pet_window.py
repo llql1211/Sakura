@@ -8851,6 +8851,7 @@ def test_pet_window_toggle_always_on_top_saves_and_applies() -> None:
 
     class MinimalWindow:
         _toggle_always_on_top = PetWindow._toggle_always_on_top
+        _sync_secondary_windows_topmost = PetWindow._sync_secondary_windows_topmost
 
         def __init__(self) -> None:
             self.always_on_top_enabled = False

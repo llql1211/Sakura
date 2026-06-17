@@ -4842,8 +4842,11 @@ class PetWindow(QWidget):
             )
         self.history_window.set_subtitle_language(self.subtitle_language)
         self.history_window.set_theme_settings(self.theme_settings)
-        # 作为普通窗口打开：可最小化、有独立任务栏按钮，不置顶。
-        _configure_secondary_window(self.history_window)
+        # 独立窗口：可最小化、有独立任务栏按钮；桌宠置顶时同步置顶以免被桌宠盖住。
+        _configure_secondary_window(
+            self.history_window,
+            keep_on_top=bool(getattr(self, "always_on_top_enabled", False)),
+        )
         self.history_window.refresh()
         _present_secondary_window(self.history_window)
 
@@ -4855,8 +4858,11 @@ class PetWindow(QWidget):
                 parent=self,
             )
         self.runtime_log_window.set_theme_settings(self.theme_settings)
-        # 作为普通窗口打开：可最小化、有独立任务栏按钮、不置顶（与设置/历史窗口一致）。
-        _configure_secondary_window(self.runtime_log_window)
+        # 独立窗口：可最小化、有独立任务栏按钮；桌宠置顶时同步置顶（与设置/历史窗口一致）。
+        _configure_secondary_window(
+            self.runtime_log_window,
+            keep_on_top=bool(getattr(self, "always_on_top_enabled", False)),
+        )
         self.runtime_log_window.refresh(reset=True)
         _present_secondary_window(self.runtime_log_window)
 
@@ -4978,8 +4984,12 @@ class PetWindow(QWidget):
             on_layout_preview=self._preview_layout,
         )
         self.settings_dialog = dialog
-        # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮、不置顶。
-        _configure_secondary_window(dialog)
+        # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮；
+        # 桌宠置顶时同步置顶，避免设置窗口被置顶的桌宠盖住。
+        _configure_secondary_window(
+            dialog,
+            keep_on_top=bool(getattr(self, "always_on_top_enabled", False)),
+        )
         # 记录打开前的立绘缩放与控制组布局，便于取消时回滚实时预览。
         original_layout = (
             self.portrait_scale_percent,
@@ -5375,8 +5385,23 @@ class PetWindow(QWidget):
         self._apply_window_flags()
         if checked:
             self.raise_()
+        # 已打开的设置/历史/日志窗口需跟随桌宠置顶状态更新，否则桌宠置顶后会反盖住它们。
+        self._sync_secondary_windows_topmost()
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
+
+    def _sync_secondary_windows_topmost(self) -> None:
+        """桌宠置顶状态切换时，让已打开的副窗口跟随更新置顶，保持在桌宠之上。"""
+        keep_on_top = bool(getattr(self, "always_on_top_enabled", False))
+        for window in (
+            getattr(self, "settings_dialog", None),
+            getattr(self, "history_window", None),
+            getattr(self, "runtime_log_window", None),
+        ):
+            if window is None or not window.isVisible():
+                continue
+            _configure_secondary_window(window, keep_on_top=keep_on_top)
+            _present_secondary_window(window)
 
     def _create_tts_provider_from_settings(
         self,
@@ -6542,8 +6567,8 @@ def _should_write_character_theme(theme_write_mode: object, profile: CharacterPr
     return theme_write_mode in {"manual", "ai"}
 
 
-def _configure_secondary_window(window) -> None:  # type: ignore[no-untyped-def]
-    # 设置/历史窗口作为普通窗口处理：不再钉在最上层，点击其他窗口时正常退到后面。
+def _configure_secondary_window(window, *, keep_on_top: bool = False) -> None:  # type: ignore[no-untyped-def]
+    # 设置/历史窗口作为独立窗口处理：可最小化、有独立任务栏按钮，点击其他窗口时正常退到后面。
     #
     # 根因：这两个窗口以桌宠（Qt.Tool）为父窗口，在 Windows 上属于“被拥有窗口”。
     # 当桌宠开启置顶（WS_EX_TOPMOST）时，系统强制让被拥有窗口在 z 序上位于拥有者
@@ -6551,15 +6576,19 @@ def _configure_secondary_window(window) -> None:  # type: ignore[no-untyped-def]
     # show 后再用 SetWindowPos 下推也会被系统打回。唯一可靠的办法是切断原生拥有
     # 关系：setParent(None) 把它变成独立顶层窗口，就不再继承桌宠的置顶。
     #
+    # keep_on_top：桌宠开启置顶时，桌宠自身是 HWND_TOPMOST，而脱离父子关系后的副窗口
+    # 属于普通层，会被桌宠永久盖住。此时需让副窗口同样置顶（独立窗口设 Qt 置顶标志即可
+    # 生效），再靠 raise 浮在桌宠之上；桌宠未置顶时副窗口保持普通层，可正常退到后面。
+    #
     # 注意：setParent(None) 会重置 window flags，所以必须先 detach、再设 flags。
-    # 窗口的 Python 引用由调用方持有（设置窗口靠局部变量 + 模态 exec，历史窗口靠
-    # self.history_window），脱离 Qt 对象树后生命周期仍安全。
+    # 窗口的 Python 引用由调用方持有（设置窗口靠 self.settings_dialog，历史/日志窗口靠
+    # self.history_window / self.runtime_log_window），脱离 Qt 对象树后生命周期仍安全。
     set_parent = getattr(window, "setParent", None)
     if callable(set_parent) and window.parent() is not None:
         set_parent(None)
     set_flag = getattr(window, "setWindowFlag", None)
     if callable(set_flag):
-        set_flag(Qt.WindowType.WindowStaysOnTopHint, False)
+        set_flag(Qt.WindowType.WindowStaysOnTopHint, keep_on_top)
         # QDialog 默认标题栏只有关闭按钮，补上系统菜单与最小化按钮，让窗口可被最小化。
         set_flag(Qt.WindowType.WindowTitleHint, True)
         set_flag(Qt.WindowType.WindowSystemMenuHint, True)
