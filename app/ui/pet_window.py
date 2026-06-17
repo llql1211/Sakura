@@ -528,6 +528,8 @@ class PetWindow(QWidget):
         self.free_access_enabled = self._load_free_access_enabled()
         self.tool_registry.set_free_access_enabled(self.free_access_enabled)
         self.always_on_top_enabled = self._load_always_on_top_enabled()
+        # 设置窗口打开期间临时压低桌宠的实际置顶层级，避免设置被桌宠盖住；不改变用户配置。
+        self._settings_window_suppresses_topmost = False
         self.history_window: HistoryWindow | None = None
         self.runtime_log_window: RuntimeLogWindow | None = None
         self.settings_dialog: SettingsDialog | None = None
@@ -1997,12 +1999,13 @@ class PetWindow(QWidget):
             self._set_widget_dynamic_property(self.input_edit, "replyWaiting", waiting)
         if hasattr(self, "send_button"):
             self._set_widget_dynamic_property(self.send_button, "replyWaiting", waiting)
-        if was_waiting and not waiting:
-            self._release_empty_input_focus_after_reply_waiting()
+        release_empty_focus = getattr(self, "_release_empty_input_focus_after_reply_waiting", None)
+        if (waiting or (was_waiting and not waiting)) and callable(release_empty_focus):
+            release_empty_focus()
         self._sync_input_bar_waiting_visibility()
 
     def _release_empty_input_focus_after_reply_waiting(self) -> None:
-        """回复等待结束后释放空输入框焦点，避免输入栏被焦点状态永久固定。"""
+        """回复等待切换时释放空输入框焦点，避免输入栏被焦点状态固定。"""
         input_edit = getattr(self, "input_edit", None)
         text = getattr(input_edit, "text", None)
         if callable(text) and str(text()).strip():
@@ -2521,8 +2524,8 @@ class PetWindow(QWidget):
     def _input_bar_pinned(self) -> bool:
         """输入栏在以下任一情况保持常显，避免用户操作中途被收起。
 
-        注意：不把「对话进行中(active_interaction_id)」整体算进来；但等待模型回复时输入栏有状态提示
-        与呼吸动效，需要保持可见直到回复流程结束。
+        注意：不把「对话进行中(active_interaction_id)」和「等待模型回复」算进来；
+        思考中只更新输入区状态，不强制输入栏常显。
         """
         # 设置/历史窗口打开时不固定输入栏，配合 hover 禁用一起彻底收起。
         if self._any_dialog_open():
@@ -2532,7 +2535,6 @@ class PetWindow(QWidget):
         return (
             self.input_edit.hasFocus()
             or bool(self.input_edit.text().strip())
-            or bool(getattr(self, "reply_waiting_ui_active", False))
             # 用待确认动作状态而非 panel.isVisible()：输入栏卡片收起时 panel 的可见性会假阴性。
             or self.pending_tool_action is not None
         )
@@ -4843,12 +4845,9 @@ class PetWindow(QWidget):
             memory_curation_settings=getattr(self, "memory_curation_settings", None),
         )
         self.settings_dialog = dialog
-        # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮；
-        # 桌宠置顶时同步置顶，避免设置窗口被置顶的桌宠盖住。
-        _configure_secondary_window(
-            dialog,
-            keep_on_top=bool(getattr(self, "always_on_top_enabled", False)),
-        )
+        # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮、不置顶。
+        _configure_secondary_window(dialog)
+        self._set_settings_window_topmost_suppressed(True)
         # 记录打开前的立绘缩放与控制组布局，便于取消时回滚实时预览。
         original_layout = (
             self.portrait_scale_percent,
@@ -4857,13 +4856,14 @@ class PetWindow(QWidget):
             self.control_panel_vertical_offset,
             self.input_bar_offset,
         )
-        # 设置期间保持气泡与输入栏常显并停掉自动隐藏，方便实时观察调整效果。
+        # 设置期间保持气泡稳定，但隐藏输入栏，避免输入栏挡住设置窗口或跟设置抢层级。
         bubble_auto_hide = getattr(self, "bubble_auto_hide", None)
         if bubble_auto_hide is not None:
             bubble_auto_hide.notify_speaking()
         input_bar_animator = getattr(self, "input_bar_animator", None)
-        if input_bar_animator is not None:
-            input_bar_animator.set_force_visible(True)
+        set_force_hidden = getattr(input_bar_animator, "set_force_hidden", None)
+        if callable(set_force_hidden):
+            set_force_hidden(True)
         # 非模态没有阻塞返回值，结果处理改由 finished 信号驱动；闭包捕获打开前状态用于回滚。
         dialog.finished.connect(
             lambda result: self._on_settings_dialog_finished(
@@ -4887,11 +4887,13 @@ class PetWindow(QWidget):
         """设置窗口关闭后的结果处理（原 exec() 之后的同步逻辑，迁移到非模态信号回调）。"""
         if getattr(self, "settings_dialog", None) is dialog:
             self.settings_dialog = None
+        self._set_settings_window_topmost_suppressed(False)
         # 关闭设置后恢复气泡自动隐藏计时与输入栏常规显隐。
         if bubble_auto_hide is not None:
             bubble_auto_hide.notify_settled()
-        if input_bar_animator is not None:
-            input_bar_animator.set_force_visible(False)
+        set_force_hidden = getattr(input_bar_animator, "set_force_hidden", None)
+        if callable(set_force_hidden):
+            set_force_hidden(False)
         if dialog_result != QDialog.DialogCode.Accepted:
             # 取消/关闭：回滚到打开前的立绘与控制组布局，撤销实时预览的改动。
             self._preview_layout(*original_layout)
@@ -5266,7 +5268,7 @@ class PetWindow(QWidget):
             return
 
         self._apply_window_flags()
-        if checked:
+        if checked and not bool(getattr(self, "_settings_window_suppresses_topmost", False)):
             self.raise_()
         # 已打开的设置/历史/日志窗口需跟随桌宠置顶状态更新，否则桌宠置顶后会反盖住它们。
         self._sync_secondary_windows_topmost()
@@ -5564,9 +5566,34 @@ class PetWindow(QWidget):
 
     def _window_flags(self) -> Qt.WindowType:
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-        if self.always_on_top_enabled:
+        if self.always_on_top_enabled and not bool(
+            getattr(self, "_settings_window_suppresses_topmost", False)
+        ):
             flags |= Qt.WindowType.WindowStaysOnTopHint
         return flags
+
+    def _set_settings_window_topmost_suppressed(self, suppressed: bool) -> None:
+        """设置窗口存活期间临时取消桌宠实际置顶，关闭后按用户配置恢复。"""
+        suppressed = bool(suppressed)
+        if suppressed == bool(getattr(self, "_settings_window_suppresses_topmost", False)):
+            return
+        self._settings_window_suppresses_topmost = suppressed
+        apply_flags = getattr(self, "_apply_window_flags", None)
+        if callable(apply_flags):
+            apply_flags()
+        sync_native_topmost = getattr(self, "_sync_native_topmost_state", None)
+        if callable(sync_native_topmost):
+            sync_native_topmost()
+        is_visible = getattr(self, "isVisible", None)
+        raise_window = getattr(self, "raise_", None)
+        if (
+            not suppressed
+            and bool(getattr(self, "always_on_top_enabled", False))
+            and callable(is_visible)
+            and is_visible()
+            and callable(raise_window)
+        ):
+            raise_window()
 
     def _apply_window_flags(self) -> None:
         was_visible = self.isVisible()
@@ -5595,7 +5622,11 @@ class PetWindow(QWidget):
                 swp_no_size = 0x0001
                 swp_no_move = 0x0002
                 swp_no_activate = 0x0010
-                insert_after = hwnd_topmost if self.always_on_top_enabled else hwnd_notopmost
+                effective_topmost = bool(
+                    self.always_on_top_enabled
+                    and not bool(getattr(self, "_settings_window_suppresses_topmost", False))
+                )
+                insert_after = hwnd_topmost if effective_topmost else hwnd_notopmost
                 flags = swp_no_size | swp_no_move | swp_no_activate
                 for window in self._topmost_sync_windows():
                     ctypes.windll.user32.SetWindowPos(
@@ -5608,7 +5639,11 @@ class PetWindow(QWidget):
         if sys.platform == "darwin":
             try:
                 for window in self._topmost_sync_windows():
-                    _set_macos_window_topmost(int(window.winId()), self.always_on_top_enabled)
+                    effective_topmost = bool(
+                        self.always_on_top_enabled
+                        and not bool(getattr(self, "_settings_window_suppresses_topmost", False))
+                    )
+                    _set_macos_window_topmost(int(window.winId()), effective_topmost)
                 self._stack_renderer_overlay_below()
             except Exception as exc:  # noqa: BLE001
                 debug_log("PetWindow", "同步 macOS 原生置顶状态失败", {"error": str(exc)})
@@ -6467,7 +6502,8 @@ def _configure_secondary_window(window, *, keep_on_top: bool = False) -> None:  
     # 窗口的 Python 引用由调用方持有（设置窗口靠 self.settings_dialog，历史/日志窗口靠
     # self.history_window / self.runtime_log_window），脱离 Qt 对象树后生命周期仍安全。
     set_parent = getattr(window, "setParent", None)
-    if callable(set_parent) and window.parent() is not None:
+    parent = getattr(window, "parent", None)
+    if callable(set_parent) and callable(parent) and parent() is not None:
         set_parent(None)
     set_flag = getattr(window, "setWindowFlag", None)
     if callable(set_flag):

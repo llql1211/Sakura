@@ -6360,6 +6360,56 @@ def test_show_settings_reuses_active_dialog_from_tray(monkeypatch) -> None:  # t
     assert getattr(window, "settings_dialog", None) is not None
 
 
+def test_show_settings_hides_input_bar_and_temporarily_suppresses_topmost(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    api_settings = ApiSettings("https://api.example.com/v1", "test-key", "test-model")
+    tts_settings = _minimal_tts_settings()
+    input_hidden_events: list[bool] = []
+    suppress_events: list[bool] = []
+    raise_events: list[str] = []
+
+    class SettingsServiceStub:
+        def load_tts_settings(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return tts_settings
+
+    class ApiClientStub:
+        settings = api_settings
+
+    class MemoryStoreStub:
+        pass
+
+    class InputBarAnimatorStub:
+        def set_force_hidden(self, value: bool) -> None:
+            input_hidden_events.append(value)
+
+    class DialogStub(_NonModalSettingsDialogStub):
+        _dialog_result = pet_window_module.QDialog.DialogCode.Rejected
+
+    window = _minimal_settings_window(
+        PetWindow,
+        SettingsServiceStub(),
+        ApiClientStub(),
+        MemoryStoreStub(),
+    )
+    window.always_on_top_enabled = True
+    window.input_bar_animator = InputBarAnimatorStub()
+    window._apply_window_flags = (
+        lambda: suppress_events.append(window._settings_window_suppresses_topmost)
+    )
+    window.isVisible = lambda: True
+    window.raise_ = lambda: raise_events.append("raise")
+    monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
+
+    window.show_settings()
+
+    assert input_hidden_events == [True, False]
+    assert suppress_events == [True, False]
+    assert raise_events == ["raise"]
+    assert window._settings_window_suppresses_topmost is False
+
+
 def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
@@ -8524,7 +8574,7 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
     assert window.input_bar_animator.sync_count == 2
 
 
-def test_reply_waiting_end_releases_empty_input_focus() -> None:
+def test_reply_waiting_state_releases_empty_input_focus() -> None:
     from app.ui.pet_window import PetWindow
 
     class FocusedInput(_DummyEditableInput):
@@ -8556,13 +8606,22 @@ def test_reply_waiting_end_releases_empty_input_focus() -> None:
     window.input_edit = FocusedInput("")
     window.send_button = _DummyButton()
     window.input_bar_animator = _DummyInputBarAnimator()
+    window.reply_waiting_ui_active = False
+
+    window._set_reply_waiting_ui(True)
+
+    assert not window.input_edit.focused
+    assert window.input_edit.clear_focus_count == 1
+    assert window.input_bar_animator.sync_count == 1
+
+    window.input_edit.focused = True
     window.reply_waiting_ui_active = True
 
     window._set_reply_waiting_ui(False)
 
     assert not window.input_edit.focused
-    assert window.input_edit.clear_focus_count == 1
-    assert window.input_bar_animator.sync_count == 1
+    assert window.input_edit.clear_focus_count == 2
+    assert window.input_bar_animator.sync_count == 2
 
 
 def test_reply_waiting_end_keeps_focus_when_next_input_exists() -> None:
@@ -8606,7 +8665,7 @@ def test_reply_waiting_end_keeps_focus_when_next_input_exists() -> None:
     assert window.input_bar_animator.sync_count == 1
 
 
-def test_input_bar_pinned_while_waiting_reply() -> None:
+def test_input_bar_not_pinned_just_because_reply_is_waiting() -> None:
     from app.ui.pet_window import PetWindow
 
     class MinimalInputBarWindow:
@@ -8623,7 +8682,7 @@ def test_input_bar_pinned_while_waiting_reply() -> None:
 
     window.reply_waiting_ui_active = True
 
-    assert window._input_bar_pinned()
+    assert not window._input_bar_pinned()
 
 
 def test_progress_reply_displays_and_records_assistant_message() -> None:
@@ -9930,6 +9989,9 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
         _on_settings_dialog_finished = pet_window_cls._on_settings_dialog_finished
         _activate_settings_dialog = pet_window_cls._activate_settings_dialog
         _preview_layout = pet_window_cls._preview_layout
+        _set_settings_window_topmost_suppressed = (
+            pet_window_cls._set_settings_window_topmost_suppressed
+        )
         _retire_tts_provider = pet_window_cls._retire_tts_provider
         _apply_subtitle_display_speed = pet_window_cls._apply_subtitle_display_speed
         _apply_launch_at_login_settings = pet_window_cls._apply_launch_at_login_settings

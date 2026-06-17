@@ -71,3 +71,32 @@ def test_suspend_for_drag_hides_and_blocks_sync() -> None:
 
     bar.deleteLater()
     card.deleteLater()
+
+
+def test_force_hidden_overrides_hover_pin_and_force_visible() -> None:
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+
+    _qt_app_or_skip()
+    bar = QWidget()
+    card = QWidget()
+    effect = QGraphicsOpacityEffect(card)
+    animator = InputBarAnimator(
+        bar,
+        card,
+        effect,
+        is_pinned=lambda: True,
+        is_hover_active=lambda: True,
+    )
+
+    animator._hover = True
+    animator.set_force_visible(True)
+    assert animator._target_visible() is True
+
+    animator.set_force_hidden(True)
+    assert animator._target_visible() is False
+
+    animator.set_force_hidden(False)
+    assert animator._target_visible() is True
+
+    bar.deleteLater()
+    card.deleteLater()
