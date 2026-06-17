@@ -100,3 +100,56 @@ def test_force_hidden_overrides_hover_pin_and_force_visible() -> None:
 
     bar.deleteLater()
     card.deleteLater()
+
+
+def test_set_polling_enabled_toggles_poll_timer() -> None:
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+
+    _qt_app_or_skip()
+    bar = QWidget()
+    card = QWidget()
+    effect = QGraphicsOpacityEffect(card)
+    animator = InputBarAnimator(
+        bar,
+        card,
+        effect,
+        is_pinned=lambda: False,
+        is_hover_active=lambda: False,
+    )
+    animator.start()
+    assert animator._poll_timer.isActive()
+
+    # 副窗口打开：停轮询，减少后台命中测试与重绘。
+    animator.set_polling_enabled(False)
+    assert not animator._poll_timer.isActive()
+
+    # 副窗口关闭：恢复轮询。
+    animator.set_polling_enabled(True)
+    assert animator._poll_timer.isActive()
+
+    bar.deleteLater()
+    card.deleteLater()
+
+
+def test_set_polling_enabled_noop_before_start_or_when_suspended() -> None:
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+
+    _qt_app_or_skip()
+    bar = QWidget()
+    card = QWidget()
+    effect = QGraphicsOpacityEffect(card)
+    animator = InputBarAnimator(bar, card, effect, lambda: False, lambda: False)
+
+    # 未 start：空操作，不会意外启动轮询。
+    animator.set_polling_enabled(True)
+    assert not animator._poll_timer.isActive()
+
+    animator.start()
+    animator.suspend_for_drag()
+    assert not animator._poll_timer.isActive()
+    # 拖动挂起期间不被 set_polling_enabled(True) 误拉起轮询，避免与挂起状态机打架。
+    animator.set_polling_enabled(True)
+    assert not animator._poll_timer.isActive()
+
+    bar.deleteLater()
+    card.deleteLater()

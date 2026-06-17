@@ -485,6 +485,11 @@ class PetWindow(QWidget):
         self.deferred_startup_worker: QObject | None = None
         self.tts_ready_warmup_thread: QThread | None = None
         self.tts_ready_warmup_worker: QObject | None = None
+        # 在途预热线程正在探测的 provider；该 provider 在预热结束前不得 close()，
+        # 否则主线程与预热线程并发拆解同一原生服务进程会引发闪退。
+        self._tts_warmup_provider: TTSProvider | None = None
+        # 因预热在途而被推迟关闭的 provider，待预热线程结束后在 cleanup 槽里补关。
+        self._tts_pending_provider_closes: list[tuple[TTSProvider, bool]] = []
         self.screen_observation_encode_thread: QThread | None = None
         self.screen_observation_encode_worker: QObject | None = None
         self.settings_service = context.settings_service
@@ -528,8 +533,12 @@ class PetWindow(QWidget):
         self.free_access_enabled = self._load_free_access_enabled()
         self.tool_registry.set_free_access_enabled(self.free_access_enabled)
         self.always_on_top_enabled = self._load_always_on_top_enabled()
-        # 设置窗口打开期间临时压低桌宠的实际置顶层级，避免设置被桌宠盖住；不改变用户配置。
-        self._settings_window_suppresses_topmost = False
+        # 普通副窗口打开期间临时压低桌宠的实际置顶层级，避免副窗口被桌宠盖住；不改变用户配置。
+        self._secondary_windows_suppress_topmost = False
+        self._secondary_windows_hide_input_bar = False
+        # 副窗口可见期间暂停桌宠后台 hover 轮询，减少与副窗口下拉弹层抢占合成器。
+        self._secondary_windows_background_quiesced = False
+        self._registered_secondary_windows: set[QWidget] = set()
         self.history_window: HistoryWindow | None = None
         self.runtime_log_window: RuntimeLogWindow | None = None
         self.settings_dialog: SettingsDialog | None = None
@@ -1038,6 +1047,17 @@ class PetWindow(QWidget):
         if application is not None and watched is application:
             if event.type() == QEvent.Type.ApplicationActivate:
                 self._handle_application_activated()
+            return super().eventFilter(watched, event)
+        if self._is_registered_secondary_window(watched):
+            if event.type() == QEvent.Type.Destroy:
+                self._unregister_secondary_window(watched)
+                QTimer.singleShot(0, self._sync_secondary_window_state)
+            elif event.type() in {
+                QEvent.Type.Show,
+                QEvent.Type.Hide,
+                QEvent.Type.Close,
+            }:
+                QTimer.singleShot(0, self._sync_secondary_window_state)
             return super().eventFilter(watched, event)
         if watched is self.input_edit:
             if event.type() == QEvent.Type.KeyPress:
@@ -2190,15 +2210,16 @@ class PetWindow(QWidget):
             getattr(self, "history_window", None),
             getattr(self, "runtime_log_window", None),
         ):
-            if dialog is not None and dialog.isVisible():
+            if self._is_secondary_window_visible(dialog):
                 dialog.raise_()
 
     def _any_dialog_open(self) -> bool:
         for dialog in (
             getattr(self, "settings_dialog", None),
             getattr(self, "history_window", None),
+            getattr(self, "runtime_log_window", None),
         ):
-            if dialog is not None and dialog.isVisible():
+            if self._is_secondary_window_visible(dialog):
                 return True
         return False
 
@@ -2458,7 +2479,7 @@ class PetWindow(QWidget):
         return make_blurred_pixmap(cropped, radius=4.0, downscale=2)
 
     def _cursor_in_pet_region(self) -> bool:
-        # 设置/历史窗口打开时禁用输入栏浮现，避免盖住对话框。
+        # 普通副窗口打开时禁用输入栏浮现，避免盖住对话框。
         if self._any_dialog_open():
             return False
         if not self._input_bar_foreground_allowed():
@@ -4504,6 +4525,7 @@ class PetWindow(QWidget):
             return
 
         worker = TTSReadyWarmupWorker(provider)
+        self._tts_warmup_provider = provider
         self.resource_manager.spawn_qt_worker(
             worker,
             parent=self,
@@ -4515,6 +4537,7 @@ class PetWindow(QWidget):
                 (worker.failed, self._handle_tts_ready_warmup_failed),
             ],
             quit_on=[worker.finished],
+            on_finished=self._cleanup_tts_ready_warmup_worker,
         )
 
     @Slot(str)
@@ -4528,6 +4551,17 @@ class PetWindow(QWidget):
         if getattr(self, "_shutdown_in_progress", False):
             return
         self._show_tts_error(message)
+
+    @Slot()
+    def _cleanup_tts_ready_warmup_worker(self) -> None:
+        # 预热线程已结束(ensure_ready 必已返回),此刻补关之前因预热在途而推迟关闭的
+        # provider 才不会与预热线程并发拆解同一服务进程。
+        self._tts_warmup_provider = None
+        pending = self._tts_pending_provider_closes
+        self._tts_pending_provider_closes = []
+        for provider, keep_local_service in pending:
+            self._close_retired_tts_provider(provider, keep_local_service=keep_local_service)
+
 
     def _apply_startup_initializing_state(self) -> None:
         self.input_edit.setPlaceholderText(STARTUP_INITIALIZING_TEXT)
@@ -4763,13 +4797,10 @@ class PetWindow(QWidget):
             )
         self.history_window.set_subtitle_language(self.subtitle_language)
         self.history_window.set_theme_settings(self.theme_settings)
-        # 独立窗口：可最小化、有独立任务栏按钮；桌宠置顶时同步置顶以免被桌宠盖住。
-        _configure_secondary_window(
-            self.history_window,
-            keep_on_top=bool(getattr(self, "always_on_top_enabled", False)),
-        )
+        # 作为普通窗口打开：可最小化、有独立任务栏按钮，不置顶。
+        self._prepare_secondary_window(self.history_window)
         self.history_window.refresh()
-        _present_secondary_window(self.history_window)
+        self._present_registered_secondary_window(self.history_window)
 
     @Slot()
     def show_runtime_log(self) -> None:
@@ -4779,13 +4810,10 @@ class PetWindow(QWidget):
                 parent=self,
             )
         self.runtime_log_window.set_theme_settings(self.theme_settings)
-        # 独立窗口：可最小化、有独立任务栏按钮；桌宠置顶时同步置顶（与设置/历史窗口一致）。
-        _configure_secondary_window(
-            self.runtime_log_window,
-            keep_on_top=bool(getattr(self, "always_on_top_enabled", False)),
-        )
+        # 作为普通窗口打开：可最小化、有独立任务栏按钮、不置顶（与设置/历史窗口一致）。
+        self._prepare_secondary_window(self.runtime_log_window)
         self.runtime_log_window.refresh(reset=True)
-        _present_secondary_window(self.runtime_log_window)
+        self._present_registered_secondary_window(self.runtime_log_window)
 
     @Slot()
     def show_settings(self) -> None:
@@ -4846,8 +4874,7 @@ class PetWindow(QWidget):
         )
         self.settings_dialog = dialog
         # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮、不置顶。
-        _configure_secondary_window(dialog)
-        self._set_settings_window_topmost_suppressed(True)
+        self._prepare_secondary_window(dialog)
         # 记录打开前的立绘缩放与控制组布局，便于取消时回滚实时预览。
         original_layout = (
             self.portrait_scale_percent,
@@ -4860,10 +4887,6 @@ class PetWindow(QWidget):
         bubble_auto_hide = getattr(self, "bubble_auto_hide", None)
         if bubble_auto_hide is not None:
             bubble_auto_hide.notify_speaking()
-        input_bar_animator = getattr(self, "input_bar_animator", None)
-        set_force_hidden = getattr(input_bar_animator, "set_force_hidden", None)
-        if callable(set_force_hidden):
-            set_force_hidden(True)
         # 非模态没有阻塞返回值，结果处理改由 finished 信号驱动；闭包捕获打开前状态用于回滚。
         dialog.finished.connect(
             lambda result: self._on_settings_dialog_finished(
@@ -4871,10 +4894,9 @@ class PetWindow(QWidget):
                 result,
                 original_layout,
                 bubble_auto_hide,
-                input_bar_animator,
             )
         )
-        _present_secondary_window(dialog)
+        self._present_registered_secondary_window(dialog)
 
     def _on_settings_dialog_finished(
         self,
@@ -4882,18 +4904,15 @@ class PetWindow(QWidget):
         dialog_result: int,
         original_layout: tuple[int, int, int, int, int],
         bubble_auto_hide: object,
-        input_bar_animator: object,
     ) -> None:
         """设置窗口关闭后的结果处理（原 exec() 之后的同步逻辑，迁移到非模态信号回调）。"""
         if getattr(self, "settings_dialog", None) is dialog:
             self.settings_dialog = None
-        self._set_settings_window_topmost_suppressed(False)
+        self._unregister_secondary_window(dialog)
+        self._sync_secondary_window_state()
         # 关闭设置后恢复气泡自动隐藏计时与输入栏常规显隐。
         if bubble_auto_hide is not None:
             bubble_auto_hide.notify_settled()
-        set_force_hidden = getattr(input_bar_animator, "set_force_hidden", None)
-        if callable(set_force_hidden):
-            set_force_hidden(False)
         if dialog_result != QDialog.DialogCode.Accepted:
             # 取消/关闭：回滚到打开前的立绘与控制组布局，撤销实时预览的改动。
             self._preview_layout(*original_layout)
@@ -5189,7 +5208,7 @@ class PetWindow(QWidget):
 
     def _activate_settings_dialog(self, dialog: SettingsDialog) -> None:
         """重复打开设置时激活已有窗口，避免托盘菜单创建多个设置页。"""
-        _present_secondary_window(dialog)
+        self._present_registered_secondary_window(dialog)
 
     @Slot(bool)
     def _toggle_chinese_subtitles(self, checked: bool) -> None:
@@ -5268,7 +5287,7 @@ class PetWindow(QWidget):
             return
 
         self._apply_window_flags()
-        if checked and not bool(getattr(self, "_settings_window_suppresses_topmost", False)):
+        if checked and not bool(getattr(self, "_secondary_windows_suppress_topmost", False)):
             self.raise_()
         # 已打开的设置/历史/日志窗口需跟随桌宠置顶状态更新，否则桌宠置顶后会反盖住它们。
         self._sync_secondary_windows_topmost()
@@ -5323,6 +5342,37 @@ class PetWindow(QWidget):
         *,
         keep_local_service: bool = False,
     ) -> None:
+        # 先持有引用,避免 provider 在(可能推迟的)关闭前被 GC 回收。
+        self.retired_tts_providers.append(provider)
+        # 该 provider 的预热线程仍在途时不能立即 close():主线程 close() 与预热线程
+        # ensure_ready() 并发拆解同一本地服务进程会引发原生闪退。推迟到预热结束的
+        # _cleanup_tts_ready_warmup_worker 里补关,届时 ensure_ready 必已返回。
+        warmup_thread = getattr(self, "tts_ready_warmup_thread", None)
+        warmup_provider = getattr(self, "_tts_warmup_provider", None)
+        if warmup_thread is not None and provider is warmup_provider:
+            self._tts_pending_provider_closes.append((provider, keep_local_service))
+            debug_log(
+                "TTS",
+                "服务预热在途,推迟关闭旧 TTS Provider",
+                {
+                    "provider": type(provider).__name__,
+                    "keep_local_service": keep_local_service,
+                },
+            )
+            return
+        self._close_retired_tts_provider(provider, keep_local_service=keep_local_service)
+
+    def _close_retired_tts_provider(
+        self,
+        provider: TTSProvider,
+        *,
+        keep_local_service: bool = False,
+    ) -> None:
+        """实际拆解一个已退休的 provider(detach 本地服务 + close)。
+
+        调用方需保证此刻没有预热/请求线程正在该 provider 上并发拆解服务进程。
+        provider 的引用应已在 retired_tts_providers 中,本方法不重复登记。
+        """
         if keep_local_service:
             detach = getattr(provider, "detach_local_service", None)
             if callable(detach):
@@ -5349,7 +5399,6 @@ class PetWindow(QWidget):
                     "切换配置时关闭旧 TTS Provider 失败",
                     {"provider": type(provider).__name__, "error": str(exc)},
                 )
-        self.retired_tts_providers.append(provider)
 
     def _default_tts_settings(self) -> GPTSoVITSTTSSettings:
         if self.character_profile.voice is not None:
@@ -5566,21 +5615,110 @@ class PetWindow(QWidget):
 
     def _window_flags(self) -> Qt.WindowType:
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-        if self.always_on_top_enabled and not bool(
-            getattr(self, "_settings_window_suppresses_topmost", False)
-        ):
+        if self.always_on_top_enabled:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         return flags
 
-    def _set_settings_window_topmost_suppressed(self, suppressed: bool) -> None:
-        """设置窗口存活期间临时取消桌宠实际置顶，关闭后按用户配置恢复。"""
-        suppressed = bool(suppressed)
-        if suppressed == bool(getattr(self, "_settings_window_suppresses_topmost", False)):
+    def _prepare_secondary_window(self, window: QWidget) -> None:
+        """配置并登记普通副窗口，使其显示期间统一压低桌宠层级。"""
+        _configure_secondary_window(window)
+        self._register_secondary_window(window)
+
+    def _present_registered_secondary_window(self, window: QWidget) -> None:
+        """打开已登记的普通副窗口，并在显示前临时取消桌宠实际置顶。"""
+        self._set_secondary_windows_topmost_suppressed(True)
+        self._set_secondary_windows_input_bar_hidden(True)
+        _present_secondary_window(window)
+        self._sync_secondary_window_state()
+
+    def _register_secondary_window(self, window: QWidget) -> None:
+        registered = getattr(self, "_registered_secondary_windows", None)
+        if registered is None:
+            registered = set()
+            self._registered_secondary_windows = registered
+        if window in registered:
             return
-        self._settings_window_suppresses_topmost = suppressed
-        apply_flags = getattr(self, "_apply_window_flags", None)
-        if callable(apply_flags):
-            apply_flags()
+        registered.add(window)
+        install_event_filter = getattr(window, "installEventFilter", None)
+        if callable(install_event_filter):
+            install_event_filter(self)
+
+    def _unregister_secondary_window(self, window: QWidget) -> None:
+        registered = getattr(self, "_registered_secondary_windows", None)
+        if registered is not None:
+            registered.discard(window)
+        remove_event_filter = getattr(window, "removeEventFilter", None)
+        if callable(remove_event_filter):
+            try:
+                remove_event_filter(self)
+            except RuntimeError:
+                pass
+
+    def _is_registered_secondary_window(self, window: object) -> bool:
+        registered = getattr(self, "_registered_secondary_windows", None)
+        return registered is not None and window in registered
+
+    def _sync_secondary_window_state(self) -> None:
+        has_visible_secondary_window = any(
+            self._is_secondary_window_visible(window)
+            for window in tuple(getattr(self, "_registered_secondary_windows", set()))
+        )
+        self._set_secondary_windows_topmost_suppressed(has_visible_secondary_window)
+        self._set_secondary_windows_input_bar_hidden(has_visible_secondary_window)
+        set_background_quiesced = getattr(
+            self,
+            "_set_secondary_windows_background_quiesced",
+            None,
+        )
+        if callable(set_background_quiesced):
+            set_background_quiesced(has_visible_secondary_window)
+
+    def _set_secondary_windows_background_quiesced(self, quiesced: bool) -> None:
+        """副窗口可见期间暂停桌宠后台 hover 轮询，关闭后恢复。
+
+        设置/历史/日志窗口打开时输入栏已被强制隐藏、hover 也不生效，此时轮询纯属
+        无谓的原生命中测试与重绘，会与副窗口（尤其设置里的下拉弹层）抢占合成器。
+        仅停/起轮询计时器，零视觉变化。
+        """
+        quiesced = bool(quiesced)
+        if quiesced == bool(getattr(self, "_secondary_windows_background_quiesced", False)):
+            return
+        self._secondary_windows_background_quiesced = quiesced
+        polling_enabled = not quiesced
+        for controller_attr in ("input_bar_animator", "bubble_auto_hide"):
+            controller = getattr(self, controller_attr, None)
+            set_polling_enabled = getattr(controller, "set_polling_enabled", None)
+            if callable(set_polling_enabled):
+                set_polling_enabled(polling_enabled)
+
+    def _is_secondary_window_visible(self, window: object | None) -> bool:
+        if window is None:
+            return False
+        is_visible = getattr(window, "isVisible", None)
+        if callable(is_visible):
+            try:
+                return bool(is_visible())
+            except RuntimeError:
+                return False
+        return bool(getattr(window, "visible", False))
+
+    def _set_secondary_windows_input_bar_hidden(self, hidden: bool) -> None:
+        """副窗口打开期间强制隐藏输入栏，避免输入区挡住副窗口。"""
+        hidden = bool(hidden)
+        if hidden == bool(getattr(self, "_secondary_windows_hide_input_bar", False)):
+            return
+        self._secondary_windows_hide_input_bar = hidden
+        input_bar_animator = getattr(self, "input_bar_animator", None)
+        set_force_hidden = getattr(input_bar_animator, "set_force_hidden", None)
+        if callable(set_force_hidden):
+            set_force_hidden(hidden)
+
+    def _set_secondary_windows_topmost_suppressed(self, suppressed: bool) -> None:
+        """副窗口存活期间临时取消桌宠原生置顶，关闭后按用户配置恢复。"""
+        suppressed = bool(suppressed)
+        if suppressed == bool(getattr(self, "_secondary_windows_suppress_topmost", False)):
+            return
+        self._secondary_windows_suppress_topmost = suppressed
         sync_native_topmost = getattr(self, "_sync_native_topmost_state", None)
         if callable(sync_native_topmost):
             sync_native_topmost()
@@ -5594,6 +5732,10 @@ class PetWindow(QWidget):
             and callable(raise_window)
         ):
             raise_window()
+
+    def _set_settings_window_topmost_suppressed(self, suppressed: bool) -> None:
+        """兼容旧调用：设置窗口也走统一副窗口置顶压低逻辑。"""
+        self._set_secondary_windows_topmost_suppressed(suppressed)
 
     def _apply_window_flags(self) -> None:
         was_visible = self.isVisible()
@@ -5624,7 +5766,7 @@ class PetWindow(QWidget):
                 swp_no_activate = 0x0010
                 effective_topmost = bool(
                     self.always_on_top_enabled
-                    and not bool(getattr(self, "_settings_window_suppresses_topmost", False))
+                    and not bool(getattr(self, "_secondary_windows_suppress_topmost", False))
                 )
                 insert_after = hwnd_topmost if effective_topmost else hwnd_notopmost
                 flags = swp_no_size | swp_no_move | swp_no_activate
@@ -5641,7 +5783,7 @@ class PetWindow(QWidget):
                 for window in self._topmost_sync_windows():
                     effective_topmost = bool(
                         self.always_on_top_enabled
-                        and not bool(getattr(self, "_settings_window_suppresses_topmost", False))
+                        and not bool(getattr(self, "_secondary_windows_suppress_topmost", False))
                     )
                     _set_macos_window_topmost(int(window.winId()), effective_topmost)
                 self._stack_renderer_overlay_below()

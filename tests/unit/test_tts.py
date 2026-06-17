@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import threading
 import types
 import urllib.error
 import uuid
@@ -376,8 +377,52 @@ def test_invalid_playback_endpoint_discards_result_without_qt_emit(tmp_path: Pat
     assert not audio_path.exists()
 
 
+def test_stop_local_service_serialized_by_lifecycle_lock(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # 防御「保存设置闪退」根因:close()/_stop_local_service 与启动/采用本地服务并发
+    # 拆解同一子进程会原生崩溃。两者用同一把 _service_lifecycle_lock 串行化:持锁期间
+    # 后台 stop 必须被挡住。
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.pid = 4321
+            self.terminated = False
+
+        def poll(self) -> object | None:
+            return None  # 仍在运行
+
+    fake = FakeProcess()
+    provider._server_process = fake
+
+    terminated = threading.Event()
+
+    def fake_terminate(process, timeout):  # type: ignore[no-untyped-def]
+        process.terminated = True
+        terminated.set()
+
+    monkeypatch.setattr("app.voice.tts._terminate_process_tree", fake_terminate)
+
+    # 主线程先占住服务生命周期锁,模拟一次启动/采用正在进行。
+    provider._service_lifecycle_lock.acquire()
+    worker = threading.Thread(target=provider._stop_local_service)
+    worker.start()
+    try:
+        # 锁被占用期间后台 stop 应被挡住,不会终止进程。
+        assert not terminated.wait(0.2)
+        assert fake.terminated is False
+        assert provider._server_process is fake
+    finally:
+        provider._service_lifecycle_lock.release()
+
+    # 释放锁后 stop 立即完成并清理进程。
+    assert terminated.wait(2.0)
+    worker.join(2.0)
+    assert fake.terminated is True
+    assert provider._server_process is None
+
+
 def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings()
     provider._service_checked = False
     messages: list[str] = []
@@ -393,7 +438,7 @@ def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # 
 
 
 def test_tts_service_probe_uses_tcp_connection_without_get(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings()
     provider._service_checked = False
     messages: list[str] = []
@@ -422,7 +467,7 @@ def test_tts_service_probe_uses_tcp_connection_without_get(monkeypatch) -> None:
 
 
 def test_tts_service_probe_does_not_start_process_when_port_is_ready(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(
         work_dir=Path("data/tts_bundles/installed/gpt_sovits_v2pro")
     )
@@ -450,7 +495,7 @@ def test_genie_service_probe_adopts_existing_local_process_when_port_is_ready(mo
     work_dir = _runtime_root("genie_adopt") / "genie"
     (work_dir / "runtime").mkdir(parents=True)
     _write_fake_runtime_python(work_dir / "runtime" / "python.exe")
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
     provider._service_checked = False
     provider._server_process = None
@@ -555,7 +600,7 @@ def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch)
     _write_fake_runtime_python(runtime_python)
     (work_dir / "api_v2.py").write_text("fake", encoding="utf-8")
     monkeypatch.chdir(work_dir.parent)
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
@@ -638,7 +683,7 @@ def test_tts_service_waits_past_thirty_seconds_for_slow_gptsovits_start(monkeypa
     _write_fake_runtime_python(work_dir / "runtime" / "python.exe")
     (work_dir / "api_v2.py").write_text("fake", encoding="utf-8")
     monkeypatch.chdir(work_dir.parent)
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = replace(_minimal_tts_settings(work_dir=work_dir), timeout_seconds=55)
     provider._service_checked = False
     provider._server_process = None
@@ -695,7 +740,7 @@ def test_tts_service_waits_past_thirty_seconds_for_slow_gptsovits_start(monkeypa
 def test_tts_service_probe_reports_missing_local_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     work_dir = _runtime_root("gptsovits_missing_runtime") / "gpt-sovits"
     work_dir.mkdir()
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
@@ -719,7 +764,7 @@ def test_tts_service_probe_reports_incompatible_windows_runtime_on_macos(monkeyp
     runtime_python.write_bytes(b"MZ\x00\x00")
     runtime_python.chmod(0o755)
     (work_dir / "api_v2.py").write_text("fake", encoding="utf-8")
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
     provider._server_process = None
@@ -796,7 +841,7 @@ def test_genie_service_probe_starts_local_server_when_port_is_down(monkeypatch) 
     (work_dir / "runtime").mkdir(parents=True)
     runtime_python = work_dir / "runtime" / "python.exe"
     _write_fake_runtime_python(runtime_python)
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9881/")
     provider._service_checked = False
     provider._server_process = None
@@ -890,7 +935,7 @@ def test_genie_service_probe_moves_to_fallback_port_when_9880_is_gptsovits(monke
     (work_dir / "runtime").mkdir(parents=True)
     runtime_python = work_dir / "runtime" / "python.exe"
     _write_fake_runtime_python(runtime_python)
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(provider="genie-tts", work_dir=work_dir, api_url="http://127.0.0.1:9880/")
     provider._service_checked = False
     provider._server_process = None
@@ -941,7 +986,7 @@ def test_genie_service_probe_moves_to_fallback_port_when_9880_is_gptsovits(monke
 
 
 def test_genie_service_probe_rejects_non_genie_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings(provider="genie-tts", api_url="http://127.0.0.1:9880/")
     provider._service_checked = False
     provider._server_process = None
@@ -992,6 +1037,7 @@ def test_tts_provider_stop_local_service_terminates_owned_process(monkeypatch) -
     provider = types.SimpleNamespace(
         settings=_minimal_tts_settings(),
         _server_process=FakeProcess(),
+        _service_lifecycle_lock=threading.RLock(),
     )
 
     TTSServiceSupervisor._stop_local_service(provider)
@@ -1027,6 +1073,7 @@ def test_tts_provider_stop_local_service_uses_taskkill_tree_on_windows(monkeypat
     provider = types.SimpleNamespace(
         settings=_minimal_tts_settings(),
         _server_process=FakeProcess(),
+        _service_lifecycle_lock=threading.RLock(),
     )
     monkeypatch.setattr("app.voice.tts_service.sys.platform", "win32")
     monkeypatch.setattr("app.voice.tts_service.subprocess.run", fake_run)
@@ -1072,7 +1119,7 @@ def test_gptsovits_broken_pipe_restart_resets_local_service_state(monkeypatch) -
 
 
 def test_tts_weight_switch_error_includes_endpoint_and_path(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    provider = types.SimpleNamespace()
+    provider = types.SimpleNamespace(_service_lifecycle_lock=threading.RLock())
     provider.settings = _minimal_tts_settings()
     messages: list[str] = []
 

@@ -118,6 +118,20 @@ class InputBarAnimator(QObject):
         if self._started and not self._suspended:
             self._sync()
 
+    def set_polling_enabled(self, enabled: bool) -> None:
+        """临时停/起 hover 轮询（如副窗口打开期间），减少后台无谓的命中测试与重绘。
+
+        仅作用于轮询计时器，不改变当前可见性/动画；未启动或拖动挂起时为空操作，
+        以免与 suspend_for_drag 的状态机相互打架。
+        """
+        if not self._started or self._suspended:
+            return
+        if enabled:
+            if not self._poll_timer.isActive():
+                self._poll_timer.start()
+        else:
+            self._poll_timer.stop()
+
     def suspend_for_drag(self) -> None:
         """拖动开始：停轮询并淡出隐藏输入栏，避免静态模糊背景与移动后的真实桌面穿帮。"""
         self._suspended = True

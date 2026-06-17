@@ -296,6 +296,19 @@ def test_show_runtime_log_uses_non_modal_show(monkeypatch) -> None:  # type: ign
     class Host(qtwidgets.QWidget):
         show_runtime_log = pet_window_module.PetWindow.show_runtime_log
         _any_dialog_open = pet_window_module.PetWindow._any_dialog_open
+        _prepare_secondary_window = pet_window_module.PetWindow._prepare_secondary_window
+        _present_registered_secondary_window = (
+            pet_window_module.PetWindow._present_registered_secondary_window
+        )
+        _register_secondary_window = pet_window_module.PetWindow._register_secondary_window
+        _sync_secondary_window_state = pet_window_module.PetWindow._sync_secondary_window_state
+        _is_secondary_window_visible = pet_window_module.PetWindow._is_secondary_window_visible
+        _set_secondary_windows_input_bar_hidden = (
+            pet_window_module.PetWindow._set_secondary_windows_input_bar_hidden
+        )
+        _set_secondary_windows_topmost_suppressed = (
+            pet_window_module.PetWindow._set_secondary_windows_topmost_suppressed
+        )
 
     monkeypatch.setattr(pet_window_module, "RuntimeLogWindow", RuntimeLogWindowStub)
 
@@ -310,7 +323,7 @@ def test_show_runtime_log_uses_non_modal_show(monkeypatch) -> None:  # type: ign
 
     assert events == ["theme", "refresh:True", "show", "raise", "activate"]
     assert host.runtime_log_window.kwargs["parent"] is host
-    assert host._any_dialog_open() is False
+    assert host._any_dialog_open() is True
 
     host.deleteLater()
     app.processEvents()
@@ -4611,6 +4624,7 @@ def test_pet_window_retires_tts_provider_by_closing_it() -> None:
 
     class MinimalWindow:
         _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
 
     window = MinimalWindow()
     window.retired_tts_providers = []
@@ -4636,6 +4650,7 @@ def test_pet_window_retires_tts_provider_without_stopping_kept_service() -> None
 
     class MinimalWindow:
         _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
 
     window = MinimalWindow()
     window.retired_tts_providers = []
@@ -4645,6 +4660,79 @@ def test_pet_window_retires_tts_provider_without_stopping_kept_service() -> None
 
     assert calls == ["detach", "close"]
     assert window.retired_tts_providers == [provider]
+
+
+def test_pet_window_defers_closing_provider_with_inflight_warmup() -> None:
+    # 防御「保存设置闪退」根因:退休的 provider 正被后台预热线程探测时,不能立即 close()
+    # (主线程 close 与预热 ensure_ready 并发拆解服务进程会原生崩溃),应推迟到预热结束。
+    from app.ui.pet_window import PetWindow
+
+    calls: list[str] = []
+
+    class ProviderStub:
+        def close(self) -> None:
+            calls.append("close")
+
+    class MinimalWindow:
+        _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
+        _cleanup_tts_ready_warmup_worker = PetWindow._cleanup_tts_ready_warmup_worker
+
+    window = MinimalWindow()
+    window.retired_tts_providers = []
+    window._tts_pending_provider_closes = []
+    provider = ProviderStub()
+    # 模拟该 provider 正有一个在途预热线程。
+    window.tts_ready_warmup_thread = object()
+    window.tts_ready_warmup_worker = object()
+    window._tts_warmup_provider = provider
+
+    window._retire_tts_provider(provider)
+
+    # 预热在途:暂不 close,仅登记引用与待关闭项。
+    assert calls == []
+    assert window.retired_tts_providers == [provider]
+    assert window._tts_pending_provider_closes == [(provider, False)]
+
+    # 预热线程结束 → cleanup 槽补关被推迟的 provider。
+    window._cleanup_tts_ready_warmup_worker()
+
+    assert calls == ["close"]
+    assert window.tts_ready_warmup_thread is None
+    assert window._tts_warmup_provider is None
+    assert window._tts_pending_provider_closes == []
+
+
+def test_pet_window_retires_other_provider_immediately_during_warmup() -> None:
+    # 预热线程绑定的是另一个 provider 时,退休当前 provider 不受影响,应立即 close。
+    from app.ui.pet_window import PetWindow
+
+    calls: list[str] = []
+
+    class ProviderStub:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+    class MinimalWindow:
+        _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
+
+    window = MinimalWindow()
+    window.retired_tts_providers = []
+    window._tts_pending_provider_closes = []
+    warming = ProviderStub("warming")
+    retiring = ProviderStub("retiring")
+    window.tts_ready_warmup_thread = object()
+    window._tts_warmup_provider = warming
+
+    window._retire_tts_provider(retiring)
+
+    assert calls == ["close:retiring"]
+    assert window._tts_pending_provider_closes == []
+    assert window.retired_tts_providers == [retiring]
 
 
 def test_tts_local_service_reuse_requires_same_runtime() -> None:
@@ -6360,14 +6448,15 @@ def test_show_settings_reuses_active_dialog_from_tray(monkeypatch) -> None:  # t
     assert getattr(window, "settings_dialog", None) is not None
 
 
-def test_show_settings_hides_input_bar_and_temporarily_suppresses_topmost(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_show_settings_hides_input_bar_and_temporarily_suppresses_topmost_without_reapplying_flags(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
 
     api_settings = ApiSettings("https://api.example.com/v1", "test-key", "test-model")
     tts_settings = _minimal_tts_settings()
     input_hidden_events: list[bool] = []
-    suppress_events: list[bool] = []
+    native_sync_events: list[bool] = []
+    apply_flag_events: list[str] = []
     raise_events: list[str] = []
 
     class SettingsServiceStub:
@@ -6395,9 +6484,10 @@ def test_show_settings_hides_input_bar_and_temporarily_suppresses_topmost(monkey
     )
     window.always_on_top_enabled = True
     window.input_bar_animator = InputBarAnimatorStub()
-    window._apply_window_flags = (
-        lambda: suppress_events.append(window._settings_window_suppresses_topmost)
+    window._sync_native_topmost_state = (
+        lambda: native_sync_events.append(window._secondary_windows_suppress_topmost)
     )
+    window._apply_window_flags = lambda: apply_flag_events.append("apply_flags")
     window.isVisible = lambda: True
     window.raise_ = lambda: raise_events.append("raise")
     monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
@@ -6405,9 +6495,85 @@ def test_show_settings_hides_input_bar_and_temporarily_suppresses_topmost(monkey
     window.show_settings()
 
     assert input_hidden_events == [True, False]
-    assert suppress_events == [True, False]
+    assert native_sync_events == [True, False]
+    assert apply_flag_events == []
     assert raise_events == ["raise"]
-    assert window._settings_window_suppresses_topmost is False
+    assert window._secondary_windows_suppress_topmost is False
+
+
+def test_registered_secondary_window_suppresses_topmost_and_input_until_hidden() -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    input_hidden_events: list[bool] = []
+    native_sync_events: list[bool] = []
+    raise_events: list[str] = []
+
+    class InputBarAnimatorStub:
+        def set_force_hidden(self, value: bool) -> None:
+            input_hidden_events.append(value)
+
+    class SecondaryWindowStub:
+        visible = False
+
+        def show(self) -> None:
+            self.visible = True
+
+        def isMinimized(self) -> bool:  # noqa: N802 - 匹配 Qt 接口名
+            return False
+
+        def windowState(self):  # noqa: N802 - 匹配 Qt 接口名
+            return pet_window_module.Qt.WindowState.WindowNoState
+
+        def setWindowState(self, _state) -> None:  # noqa: N802 - 匹配 Qt 接口名
+            pass
+
+        def raise_(self) -> None:  # noqa: N802 - 匹配 Qt 接口名
+            pass
+
+        def activateWindow(self) -> None:  # noqa: N802 - 匹配 Qt 接口名
+            pass
+
+    class Host:
+        _present_registered_secondary_window = PetWindow._present_registered_secondary_window
+        _register_secondary_window = PetWindow._register_secondary_window
+        _sync_secondary_window_state = PetWindow._sync_secondary_window_state
+        _is_secondary_window_visible = PetWindow._is_secondary_window_visible
+        _set_secondary_windows_input_bar_hidden = PetWindow._set_secondary_windows_input_bar_hidden
+        _set_secondary_windows_topmost_suppressed = PetWindow._set_secondary_windows_topmost_suppressed
+
+        always_on_top_enabled = True
+        input_bar_animator = InputBarAnimatorStub()
+
+        def __init__(self) -> None:
+            self._registered_secondary_windows = set()
+            self._secondary_windows_suppress_topmost = False
+            self._secondary_windows_hide_input_bar = False
+
+        def _sync_native_topmost_state(self) -> None:
+            native_sync_events.append(self._secondary_windows_suppress_topmost)
+
+        def isVisible(self) -> bool:
+            return True
+
+        def raise_(self) -> None:
+            raise_events.append("raise")
+
+    host = Host()
+    window = SecondaryWindowStub()
+
+    host._register_secondary_window(window)  # type: ignore[arg-type]
+    host._present_registered_secondary_window(window)  # type: ignore[arg-type]
+
+    assert input_hidden_events == [True]
+    assert native_sync_events == [True]
+
+    window.visible = False
+    host._sync_secondary_window_state()
+
+    assert input_hidden_events == [True, False]
+    assert native_sync_events == [True, False]
+    assert raise_events == ["raise"]
 
 
 def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -9989,10 +10155,23 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
         _on_settings_dialog_finished = pet_window_cls._on_settings_dialog_finished
         _activate_settings_dialog = pet_window_cls._activate_settings_dialog
         _preview_layout = pet_window_cls._preview_layout
+        _prepare_secondary_window = pet_window_cls._prepare_secondary_window
+        _present_registered_secondary_window = pet_window_cls._present_registered_secondary_window
+        _register_secondary_window = pet_window_cls._register_secondary_window
+        _unregister_secondary_window = pet_window_cls._unregister_secondary_window
+        _sync_secondary_window_state = pet_window_cls._sync_secondary_window_state
+        _is_secondary_window_visible = pet_window_cls._is_secondary_window_visible
+        _set_secondary_windows_input_bar_hidden = (
+            pet_window_cls._set_secondary_windows_input_bar_hidden
+        )
+        _set_secondary_windows_topmost_suppressed = (
+            pet_window_cls._set_secondary_windows_topmost_suppressed
+        )
         _set_settings_window_topmost_suppressed = (
             pet_window_cls._set_settings_window_topmost_suppressed
         )
         _retire_tts_provider = pet_window_cls._retire_tts_provider
+        _close_retired_tts_provider = pet_window_cls._close_retired_tts_provider
         _apply_subtitle_display_speed = pet_window_cls._apply_subtitle_display_speed
         _apply_launch_at_login_settings = pet_window_cls._apply_launch_at_login_settings
         _apply_bubble_settings = pet_window_cls._apply_bubble_settings

@@ -268,6 +268,13 @@ class SettingsDialog(QDialog):
         self._theme_ai_enabled = self.theme_settings.ai_enabled
         self._theme_write_mode: Literal["unchanged", "manual", "ai", "reset", "character"] = "unchanged"
         self._syncing_theme_controls = False
+        # 上次实际应用到对话框的 QSS,用于跳过内容未变的 setStyleSheet(避免无谓 re-polish)。
+        self._applied_dialog_stylesheet: str | None = None
+        # 颜色输入防抖:连续键入只在停顿后重建一次整张对话框 QSS,避免逐字符卡顿。
+        self._theme_stylesheet_debounce = QTimer(self)
+        self._theme_stylesheet_debounce.setSingleShot(True)
+        self._theme_stylesheet_debounce.setInterval(150)
+        self._theme_stylesheet_debounce.timeout.connect(self._apply_pending_theme_stylesheet)
         self._character_export_thread: QThread | None = None
         self._character_export_worker: settings_workers.CharacterArchiveExportWorker | None = None
         self._memory_reload_pending = False
@@ -1631,7 +1638,14 @@ class SettingsDialog(QDialog):
     def _apply_theme_stylesheet(self, settings: ThemeSettings) -> None:
         theme = settings.normalized()
         self.theme_settings = theme
-        self.setStyleSheet(build_settings_dialog_stylesheet(theme))
+        stylesheet = build_settings_dialog_stylesheet(theme)
+        # QSS 内容未变则跳过:setStyleSheet 会 re-polish 对话框内所有控件(含下拉弹层),
+        # 切角色/只改视觉效果等「配色实际没变」的场景无需重绘。内联 label 颜色同样源自
+        # theme,QSS 相同即这些颜色也相同,一并跳过安全。
+        if stylesheet == self._applied_dialog_stylesheet:
+            return
+        self._applied_dialog_stylesheet = stylesheet
+        self.setStyleSheet(stylesheet)
         inline_styles = {
             "theme_status_label": f"color: {theme.muted_text_color};",
             "memory_status_label": f"color: {theme.muted_text_color};",
@@ -1666,6 +1680,14 @@ class SettingsDialog(QDialog):
         normalized = normalize_hex_color(edit.text(), "")
         if button is not None and normalized:
             button.setStyleSheet(build_color_button_stylesheet(normalized))
+        # 颜色按钮预览即时更新(便宜);整张对话框 QSS 的重建走防抖,避免逐字符 re-polish
+        # 所有控件造成卡顿。程序化同步(_set_theme_controls)期间不调度,由其末尾统一应用。
+        if not self._syncing_theme_controls:
+            self._theme_stylesheet_debounce.start()
+
+    @Slot()
+    def _apply_pending_theme_stylesheet(self) -> None:
+        # 防抖到点:按当前颜色框的最新值重建并应用一次对话框 QSS。
         theme = self._selected_theme_settings(show_error=False)
         if theme is not None:
             self._apply_theme_stylesheet(theme)

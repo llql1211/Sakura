@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import sys
 import ctypes
+import faulthandler
+import traceback
+from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,6 +21,7 @@ from app.core.cancellation import CancellationToken, OperationCancelled
 from app.core.debug_log import debug_log
 from app.core.instance import SingleInstanceGuard
 from app.core.selfcheck import run_startup_self_check
+from app.storage.paths import StoragePaths
 from app.config.character_loader import CharacterConfigError
 from app.config.settings_service import AppSettingsService, StartupSettings
 from app.agent.mcp import MCPRuntimeSettings
@@ -47,6 +51,56 @@ from app.voice.tts_bundle import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# 保活 faulthandler 的写入句柄,避免被 GC 关闭后崩溃时写向失效 fd。
+_CRASH_LOG_HANDLE = None
+
+
+def _enable_crash_diagnostics(base_dir: Path) -> None:
+    """启用原生崩溃与未捕获异常的留痕（失败不阻断启动）。
+
+    - faulthandler：段错误时把**所有线程**的原生栈写入 data/logs/sakura-crash.log。
+      原生崩溃（如 TTS provider 与后台预热线程并发拆解服务进程）不会进 runtime
+      日志，这是定位「保存设置闪退」一类问题的唯一手段。
+    - sys.excepthook：未捕获的 Python 异常同时落 crash 日志与 runtime 日志，
+      避免在 PySide6 槽函数里被静默吞掉。
+    """
+    global _CRASH_LOG_HANDLE
+    try:
+        crash_log_path = StoragePaths(base_dir).crash_log_file()
+        crash_log_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = crash_log_path.open("a", encoding="utf-8", buffering=1)
+        handle.write(
+            f"\n===== Sakura 启动 "
+            f"{datetime.now().astimezone().isoformat(timespec='seconds')} =====\n"
+        )
+        handle.flush()
+        _CRASH_LOG_HANDLE = handle
+        faulthandler.enable(file=handle, all_threads=True)
+    except Exception as exc:  # noqa: BLE001
+        debug_log("Startup", "启用 faulthandler 失败", {"error": str(exc)})
+
+    previous_hook = sys.excepthook
+
+    def _log_uncaught(exc_type, exc_value, exc_tb):  # type: ignore[no-untyped-def]
+        if issubclass(exc_type, KeyboardInterrupt):
+            previous_hook(exc_type, exc_value, exc_tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        debug_log("Crash", "未捕获异常", {"error": text})
+        handle = _CRASH_LOG_HANDLE
+        if handle is not None:
+            try:
+                handle.write(
+                    f"\n[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                    f"未捕获异常\n{text}\n"
+                )
+                handle.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        previous_hook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _log_uncaught
 
 
 def _qt_message_handler(msg_type: QtMsgType, context: object, msg: str) -> None:
@@ -306,6 +360,7 @@ class TTSBundleMigrationDialog(QDialog):
 
 
 def main() -> int:
+    _enable_crash_diagnostics(BASE_DIR)
     qInstallMessageHandler(_qt_message_handler)
     _configure_windows_high_dpi()
     app = QApplication(sys.argv)
