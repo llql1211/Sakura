@@ -121,6 +121,8 @@ class OpenAICompatibleClient:
         """发送一次最小聊天请求，验证 Base URL、API Key 和模型是否可用。"""
         self._ensure_chat_config("缺少 API_KEY。请在设置中填写 API Key。")
 
+        # 连通性检测只需验证 Base URL / API Key / 模型可用，不发送 temperature：
+        # 部分模型（如 o1/o3/gpt-5 等推理模型）只接受默认温度，显式传值会直接报错。
         payload = {
             "model": self.settings.model,
             "messages": [
@@ -130,7 +132,6 @@ class OpenAICompatibleClient:
                 },
             ],
             "max_tokens": 8,
-            "temperature": 0,
         }
         data = self._post_chat_completions_with_compatibility_fallbacks(payload)
 

@@ -586,6 +586,38 @@ def test_chat_completions_normalizes_google_ai_studio_base_url(monkeypatch) -> N
     assert captured["url"] == "https://generativelanguage.googleapis.com/v1/openai/chat/completions"
 
 
+def test_connection_omits_temperature(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import json
+
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(base_url="https://api.example.com/v1", api_key="key", model="o3")
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return None
+
+        def read(self) -> bytes:
+            return b'{"choices":[{"message":{"content":"OK"}}]}'
+
+    def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+        _ = timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    # 只接受默认温度的模型在检测阶段不应被显式 temperature 拒绝。
+    assert client.test_connection() == "OK"
+    assert "temperature" not in captured["payload"]
+
+
 def test_list_models_allows_empty_model_but_requires_key() -> None:
     client = OpenAICompatibleClient(ApiSettings("https://api.example.com/v1", "", ""))
 
