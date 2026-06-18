@@ -166,8 +166,17 @@ class BackchannelController(QObject):
         timeout_ms = self._settings.timeout_ms
         if timeout_ms > 0:
             self._classify_timeout_timer.start(timeout_ms)
-        runnable = _ClassifyRunnable(self._classifier, text, token, self._classify_signals)
-        QThreadPool.globalInstance().start(runnable)
+        def run_classification() -> None:
+            try:
+                label = self._classifier.classify(text)
+            except Exception as exc:  # noqa: BLE001
+                debug_log("Backchannel", "后台分类异常,本轮按无标签处理", {"error": str(exc)})
+                label = None
+            self._classify_signals.done.emit(token, label)
+
+        import threading
+        thread = threading.Thread(target=run_classification, daemon=True)
+        thread.start()
 
     def _on_classify_done(self, token: int, label: object) -> None:
         if token != self._inflight_token:

@@ -1561,19 +1561,15 @@ class PetWindow(QWidget):
         if normalized.mode == "hybrid":
             classifier = HybridBackchannelClassifier.from_model_cache(self.base_dir)
             # 在后台线程异步预加载，避免阻塞 GUI 线程
-            from PySide6.QtCore import QRunnable, QThreadPool
-            class PrewarmRunnable(QRunnable):
-                def __init__(self, classifier: HybridBackchannelClassifier) -> None:
-                    super().__init__()
-                    self._classifier = classifier
-
-                def run(self) -> None:
-                    try:
-                        self._classifier.preload()
-                    except Exception as exc:
-                        from app.core.debug_log import debug_log
-                        debug_log("Backchannel", "后台预加载模型失败", {"error": str(exc)})
-            QThreadPool.globalInstance().start(PrewarmRunnable(classifier))
+            import threading
+            def run_preload() -> None:
+                try:
+                    classifier.preload()
+                except Exception as exc:
+                    from app.core.debug_log import debug_log
+                    debug_log("Backchannel", "后台预加载模型失败", {"error": str(exc)})
+            thread = threading.Thread(target=run_preload, daemon=True)
+            thread.start()
             return classifier
         return RuleClassifier()
 
