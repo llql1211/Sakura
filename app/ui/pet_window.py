@@ -1229,15 +1229,9 @@ class PetWindow(QWidget):
         if subtitle_controller is not None:
             subtitle_controller.cancel_reply_flow()
         backchannel_controller = getattr(self, "backchannel_controller", None)
-        shutdown_backchannel = getattr(backchannel_controller, "shutdown", None)
-        if callable(shutdown_backchannel) and not shutdown_backchannel(
-            THREAD_SHUTDOWN_WAIT_MS / 1000
-        ):
-            debug_log(
-                "PetWindow",
-                "接话分类线程未在退出等待时间内结束，将在后台自然完成",
-                {"wait_ms": THREAD_SHUTDOWN_WAIT_MS},
-            )
+        cancel_backchannel = getattr(backchannel_controller, "cancel", None)
+        if callable(cancel_backchannel):
+            cancel_backchannel()
         self.resource_manager.stop_all(THREAD_SHUTDOWN_WAIT_MS)
         self.close_tts_tools()
         self.close_mcp_tools()

@@ -891,11 +891,22 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
         def cancel_reply_flow(self) -> None:
             self.cancelled = True
 
+    order: list[str] = []
+
+    class BackchannelStub:
+        def cancel(self) -> None:
+            order.append("backchannel_cancel")
+
+    class RecordingResourceManager(ResourceManager):
+        def stop_all(self, timeout_ms: int = 1000) -> None:
+            order.append("stop_all")
+            super().stop_all(timeout_ms)
+
     class MinimalWindow:
         close_external_tools = PetWindow.close_external_tools
 
     window = MinimalWindow()
-    manager = ResourceManager()
+    manager = RecordingResourceManager()
     thread = ThreadStub()
     worker = WorkerStub()
     subtitle = SubtitleStub()
@@ -905,6 +916,7 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
         {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
     ]
     window.subtitle_controller = subtitle
+    window.backchannel_controller = BackchannelStub()
     window.worker_thread = thread
     window.worker = worker
     # close_external_tools 通过 resource_manager.stop_all 关闭已注册的 worker。
@@ -936,6 +948,7 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     assert manager._lingering == [(thread, worker)]
     assert window.messages == []
     assert subtitle.cancelled is True
+    assert order == ["backchannel_cancel", "stop_all"]
 
 
 def test_shutdown_ignores_late_progress_and_reply() -> None:
