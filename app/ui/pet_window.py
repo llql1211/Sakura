@@ -884,6 +884,7 @@ class PetWindow(QWidget):
             self._create_backchannel_classifier(self.backchannel_settings),
             self._display_backchannel,
             settings=self.backchannel_settings,
+            resource_manager=self.resource_manager,
             on_classified=self._log_backchannel_classification,
             parent=self,
         )
