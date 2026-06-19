@@ -88,7 +88,7 @@ jobs:
             libegl1 libxkbcommon0 libxcb-cursor0 libxcb-icccm4 \
             libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
             libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
-            libglib2.0-0 libportaudio2 portaudio19-dev libpulse0
+            libglib2.0-0 libportaudio2 portaudio19-dev libpulse0 xvfb
 
       - name: Install Python dependencies
         timeout-minutes: 8
@@ -100,7 +100,7 @@ jobs:
       - name: Run UI tests
         timeout-minutes: 6
         env:
-          QT_QPA_PLATFORM: offscreen
+          QT_QPA_PLATFORM: xcb
           PYTHONIOENCODING: utf-8
           PYTEST_QT_API: pyside6
         run: |
@@ -110,7 +110,7 @@ jobs:
             local name="$1"
             shift
             local log="/tmp/ui-tests-${name}.log"
-            python -m pytest "$@" -vv --tb=short --strict-markers -p no:warnings --timeout=60 --timeout-method=thread --durations=20 2>&1 | tee "$log"
+            xvfb-run -a python -m pytest "$@" -vv --tb=short --strict-markers -p no:warnings --timeout=60 --timeout-method=thread --durations=20 2>&1 | tee "$log"
             local exit_code=${PIPESTATUS[0]}
 
             local collected
