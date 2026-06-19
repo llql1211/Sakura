@@ -15,8 +15,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
-from dataclasses import dataclass, field, replace
-from enum import Enum
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -42,6 +41,15 @@ from app.voice.tts_settings import (
 )
 from app.voice import audio_checks as _audio_checks
 from app.voice.runtime_compat import find_usable_runtime_python, format_runtime_python_issue
+from app.voice.tts_types import (
+    TTSCallback,
+    TTSPreparedAudio,
+    TTSServiceState,
+    _parse_service_endpoint,
+    _provider_is_closed,
+    _set_service_state,
+    _TTSRequest,
+)
 
 if TYPE_CHECKING:
     from PySide6.QtMultimedia import QAudioOutput as QAudioOutputType
@@ -55,7 +63,6 @@ QMediaPlayer: type[Any] | None = None
 # 默认使用 AudioSink 后端
 _DEFAULT_PLAYBACK_BACKEND = _TTS_PLAYBACK_BACKEND_AUDIO_SINK
 
-TTSCallback = Callable[[], None]
 _AUDIO_CLEANUP_DELAY_MS = 5000
 _AUDIO_CLEANUP_MAX_ATTEMPTS = 5
 _AUDIO_FINISH_FALLBACK_GRACE_MS = 1500
@@ -127,84 +134,6 @@ def purge_tts_cache(base_dir: Path | None = None) -> None:
             entry.unlink()
         except OSError as exc:
             debug_log("TTS", "启动清理缓存文件失败，已跳过", {"path": str(entry), "error": str(exc)})
-
-
-@dataclass
-class TTSPreparedAudio:
-    """一段已提交预生成的 TTS 音频句柄。"""
-
-    text: str
-    tone: str | None = None
-    audio_path: Path | None = None
-    play_requested: bool = False
-    enqueued: bool = False
-    cancelled: bool = False
-    failed: bool = False
-    on_started: TTSCallback | None = None
-    on_finished: TTSCallback | None = None
-
-
-@dataclass(frozen=True)
-class _TTSRequest:
-    text: str
-    tone: str | None
-    on_started: TTSCallback | None = None
-    on_finished: TTSCallback | None = None
-    prepared_audio: TTSPreparedAudio | None = None
-    # 发起请求时的交互 ID；请求线程入口恢复，使 TTS 日志可与该次交互串联
-    interaction_id: str = ""
-
-
-class TTSServiceState(str, Enum):
-    """TTS 本地服务生命周期的显式状态；转移由 _set_service_state 统一记日志。
-
-    IDLE → PROBING → (READY | STARTING) ; STARTING → WAITING_READY → (READY | FAILED)
-    READY 后探测短路；FAILED 不缓存——下次请求重新走完整流程（服务可能被手动拉起）。
-    """
-
-    IDLE = "idle"
-    PROBING = "probing"
-    STARTING = "starting"
-    WAITING_READY = "waiting_ready"
-    READY = "ready"
-    FAILED = "failed"
-
-
-def _set_service_state(provider: object, new_state: TTSServiceState, detail: dict | None = None) -> None:
-    """记录服务状态转移；provider 可能是测试桩（SimpleNamespace），全程容错。"""
-    old_state = getattr(provider, "_service_state", TTSServiceState.IDLE)
-    try:
-        setattr(provider, "_service_state", new_state)
-    except (AttributeError, TypeError):
-        pass
-    if old_state == new_state:
-        return
-    payload = {"from": str(getattr(old_state, "value", old_state)), "to": new_state.value}
-    if detail:
-        payload.update(detail)
-    debug_log("TTS", "tts.service_state", payload)
-
-
-def _provider_is_closed(provider: object) -> bool:
-    is_closed = getattr(provider, "_is_closed", None)
-    if callable(is_closed):
-        return bool(is_closed())
-    return bool(getattr(provider, "_closed", False))
-
-
-def _parse_service_endpoint(api_url: str) -> tuple[str, int] | None:
-    """解析服务地址为 (host, port)；地址非法返回 None，由调用方给出服务名相关提示。"""
-    parsed_url = urlparse(api_url)
-    host = parsed_url.hostname
-    try:
-        port = parsed_url.port
-    except ValueError:
-        return None
-    if port is None:
-        port = 443 if parsed_url.scheme == "https" else 80
-    if not host:
-        return None
-    return host, port
 
 
 def _wait_local_service_ready(
