@@ -10937,6 +10937,38 @@ def test_input_bar_animator_visibility_follows_hover_and_pin() -> None:
     card.deleteLater()
 
 
+def test_input_bar_animator_force_visible_release_refreshes_hover() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+    from app.ui.input_bar_animator import InputBarAnimator
+
+    bar = QWidget()
+    card = QWidget()
+    effect = QGraphicsOpacityEffect(card)
+    hover = {"value": True}
+    animator = InputBarAnimator(
+        bar,
+        card,
+        effect,
+        lambda: False,
+        lambda: hover["value"],
+    )
+
+    animator._started = True
+    animator._hover = False
+    animator._shown = False
+
+    animator.set_force_visible(True)
+    assert animator._shown is True
+
+    # 释放强制显示时刷新真实 hover，避免旧缓存把刚唤出的输入栏立刻收回。
+    animator.set_force_visible(False)
+    assert animator._shown is True
+
+    bar.deleteLater()
+    card.deleteLater()
+
+
 def test_input_bar_animator_send_feedback_starts_animation() -> None:
     _qt_app_or_skip()
     from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget

@@ -19,6 +19,10 @@ from app.agent.screen_tools import (
     SCREEN_OBSERVATION_REQUEST_ACTION,
 )
 from app.agent.screen_policy import ScreenPolicy
+from app.agent.session_state_context import (
+    SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES,
+    build_session_state_fragment,
+)
 from app.agent.tool_policy import (
     BROWSER_NAVIGATE_TOOL_NAME,
     BROWSER_SNAPSHOT_TOOL_NAME,
@@ -29,6 +33,7 @@ from app.agent.tool_policy import (
 )
 import app.agent.tool_routing as tool_routing
 from app.agent.tools import ToolExecutionResult, ToolRegistry
+from app.storage.chat_history import ChatHistoryStore
 from app.llm.api_client import (
     ApiRequestError,
     ChatMessage,
@@ -60,6 +65,8 @@ from app.plugins.models import ContextProviderContribution, PromptPatchContribut
 
 from app.llm.prompts.runtime import PromptRuntime
 from app.llm.prompts.types import (
+    ContextFragment,
+    ContextRequest,
     ContextSnapshot,
     PromptInspection,
     PromptRecipe,
@@ -78,6 +85,7 @@ class AgentRuntime:
         reply_portraits: list[str] | None = None,
         tools: ToolRegistry | None = None,
         memory: MemoryStore | None = None,
+        history_store: ChatHistoryStore | None = None,
         prompt_patches: list[PromptPatchContribution] | None = None,
         context_providers: list[ContextProviderContribution] | None = None,
         runtime_loop_settings: RuntimeLoopSettings | None = None,
@@ -88,6 +96,7 @@ class AgentRuntime:
         self.reply_portraits = [*reply_portraits] if reply_portraits is not None else []
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
+        self.history_store = history_store
         self.prompt_patches = [*prompt_patches] if prompt_patches is not None else []
         self.context_providers = (
             [*context_providers] if context_providers is not None else []
@@ -124,6 +133,37 @@ class AgentRuntime:
         self.context_providers = (
             [*context_providers] if context_providers is not None else []
         )
+
+    def set_history_store(
+        self,
+        history_store: ChatHistoryStore | None,
+    ) -> None:
+        """同步当前角色的聊天历史存储（跨会话续接的数据来源）。"""
+        self.history_store = history_store
+
+    def _session_state_fragments(
+        self,
+        request: ContextRequest,
+    ) -> tuple[ContextFragment, ...]:
+        store = self.history_store
+        if store is None:
+            return ()
+        # 仅在会话刚开始（实时窗口尚浅）时才回看历史，避免每轮全量读盘与重复注入。
+        if len(request.recent_messages) >= SESSION_DIGEST_INJECT_MAX_RECENT_MESSAGES:
+            return ()
+        try:
+            entries = store.load()
+            fragment = build_session_state_fragment(
+                entries,
+                recent_message_count=len(request.recent_messages),
+                freshness=entries[-1].created_at if entries else "",
+                current_input=request.current_input,
+            )
+        except Exception as exc:  # noqa: BLE001
+            debug_log("SessionState", "最近会话状态读取失败，已跳过", {"error": str(exc)})
+            return ()
+        return (fragment,) if fragment is not None else ()
+
     def get_last_prompt_inspection(self) -> dict[str, Any] | None:
         """返回最近一次 Prompt 构建的脱敏检查结果。"""
 
@@ -175,6 +215,7 @@ class AgentRuntime:
         return self.context_orchestrator.build_snapshot(
             request,
             providers=self.context_providers,
+            session_fragments=self._session_state_fragments(request),
             memory_fragments=recall.fragments,
         )
 
@@ -379,6 +420,7 @@ class AgentRuntime:
                 snapshot = self.context_orchestrator.build_snapshot(
                     request,
                     providers=self.context_providers,
+                    session_fragments=self._session_state_fragments(request),
                     memory_fragments=turn_memory_fragments,
                 )
                 prompt_build = (

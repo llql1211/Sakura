@@ -6217,6 +6217,9 @@ class PetWindow(QWidget):
             self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
 
         self.history_store = self._create_history_store(profile)
+        set_history_store = getattr(self.agent_runtime, "set_history_store", None)
+        if callable(set_history_store):
+            set_history_store(self.history_store)
         self.runtime_event_log = self._create_runtime_event_log(profile)
         self.pet_hidden_at = None
         self.visual_observation_store = self._create_visual_observation_store(profile)
