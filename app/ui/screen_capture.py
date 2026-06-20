@@ -18,7 +18,13 @@ def capture_virtual_desktop_pixmap() -> tuple[QPixmap, QRect]:
     if virtual_geometry.isNull():
         raise RuntimeError("无法获取虚拟桌面区域。")
 
-    desktop_pixmap = QPixmap(virtual_geometry.size())
+    # 按物理像素分配缓冲区，避免高 DPI 缩放导致截图模糊。
+    # 逻辑尺寸仍等于 virtual_geometry.size()，下游按逻辑坐标操作无需改动。
+    max_dpr = max(s.devicePixelRatio() for s in screens)
+    phys_w = round(virtual_geometry.width() * max_dpr)
+    phys_h = round(virtual_geometry.height() * max_dpr)
+    desktop_pixmap = QPixmap(phys_w, phys_h)
+    desktop_pixmap.setDevicePixelRatio(max_dpr)
     desktop_pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(desktop_pixmap)
     captured_count = 0
