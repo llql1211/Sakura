@@ -229,25 +229,13 @@ class AppSettingsService:
         work_dir = _optional_path(provider_data.get("work_dir"), self.base_dir)
         python_path = _optional_path(provider_data.get("python_path"), self.base_dir)
         tts_config_path = _optional_path(provider_data.get("tts_config_path"), self.base_dir)
-        ref_lang = str(provider_data.get("ref_lang", gpt_sovits.get("ref_lang", "zh"))).strip()
-        text_lang = str(provider_data.get("text_lang", gpt_sovits.get("text_lang", "zh"))).strip()
+        ref_lang = "ja"
+        text_lang = "ja"
         timeout_seconds = _int_value(provider_data.get("timeout_seconds"), 60)
         onnx_model_dir = _optional_path(genie_tts.get("onnx_model_dir"), self.base_dir)
         if character_profile is not None:
             if provider == TTS_PROVIDER_GENIE and onnx_model_dir is None:
                 onnx_model_dir = StoragePaths(self.base_dir).tts_bundle_onnx_for(character_profile.id)
-            ref_lang = str(
-                provider_data.get(
-                    "ref_lang",
-                    character_profile.voice.ref_lang if character_profile.voice is not None else ref_lang,
-                )
-            ).strip()
-            text_lang = str(
-                provider_data.get(
-                    "text_lang",
-                    character_profile.voice.text_lang if character_profile.voice is not None else text_lang,
-                )
-            ).strip()
             settings = GPTSoVITSTTSSettings.from_character_profile(
                 character_profile=character_profile,
                 enabled=enabled,

@@ -557,14 +557,19 @@ class MemoryStore:
             lines.append(f"- [{memory_id}] {_memory_layer_label(layer)}：{content}")
         return "\n".join(lines)
 
-    def list_memories(self, *, limit: int = DEFAULT_MEMORY_LIMIT) -> list[dict[str, Any]]:
+    def list_memories(self, *, limit: int | None = DEFAULT_MEMORY_LIMIT) -> list[dict[str, Any]]:
         mem = self._get_memory()
-        raw = mem.get_all(filters={"user_id": self.scope_id}, top_k=limit)
-        memories = _normalize_memory_results(raw, default_scope=self.scope_id)
+        top_k = DEFAULT_MEMORY_LIMIT if limit is None else limit
+        while True:
+            raw = mem.get_all(filters={"user_id": self.scope_id}, top_k=top_k)
+            memories = _normalize_memory_results(raw, default_scope=self.scope_id)
+            if limit is not None or len(memories) < top_k:
+                break
+            top_k *= 2
         core_profile = self.core_profile()
         if core_profile is not None:
             memories.insert(0, core_profile)
-        return memories[:limit]
+        return memories if limit is None else memories[:limit]
 
     def core_profile(self) -> dict[str, Any] | None:
         """读取当前角色的常驻档案块；缺失时返回 None。"""
@@ -1457,7 +1462,11 @@ def _format_memory_load_error(exc: Exception, *, embedding_download: bool) -> st
         return f"长期记忆系统初始化失败：{raw_message}"
     return (
         "长期记忆系统初始化失败：本地嵌入模型下载失败，"
-        "请检查 HuggingFace 访问、网络或代理后重试；普通聊天仍可继续。"
+        "请前往项目 Release 下载 models--sentence-transformers--all-MiniLM-L6-v2.zip，"
+        "然后在设置页手动导入：\n"
+        "https://github.com/Rvosy/Sakura/releases/download/v0.9.7/"
+        "models--sentence-transformers--all-MiniLM-L6-v2.zip\n"
+        "也可以尝试开启代理并重启 Sakura 重新下载；普通聊天仍可继续。"
         f"\n\n原始错误：{raw_message}"
     )
 

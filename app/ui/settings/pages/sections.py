@@ -566,8 +566,6 @@ class TtsSettingsPage:
         )
         owner.tts_enabled_check.toggled.connect(owner._sync_tts_enabled_controls)
 
-        owner.ref_lang_edit = QLineEdit(settings.ref_lang, tab)
-        owner.text_lang_edit = QLineEdit(settings.text_lang, tab)
         owner.tts_timeout_spin = _NoWheelSpinBox(tab)
         owner.tts_timeout_spin.setRange(1, 600)
         owner.tts_timeout_spin.setSuffix(" 秒")
@@ -591,8 +589,6 @@ class TtsSettingsPage:
         form_layout.addRow("TTS 工作目录", owner.tts_work_dir_edit)
         form_layout.addRow("TTS Python", owner.tts_python_path_edit)
         form_layout.addRow("推理配置", owner.tts_config_path_edit)
-        form_layout.addRow("参考语言", owner.ref_lang_edit)
-        form_layout.addRow("文本语言", owner.text_lang_edit)
         form_layout.addRow("超时", owner.tts_timeout_spin)
         owner._tts_form_layout = form_layout
         tab.setLayout(form_layout)

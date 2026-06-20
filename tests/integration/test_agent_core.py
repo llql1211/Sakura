@@ -361,6 +361,18 @@ def test_memory_store_builds_local_mem0_config() -> None:
     assert "memory/text" in config["custom_instructions"]
 
 
+def test_memory_download_failure_suggests_manual_import_or_proxy_restart() -> None:
+    message = memory_module._format_memory_load_error(
+        RuntimeError("offline"),
+        embedding_download=True,
+    )
+
+    assert "models--sentence-transformers--all-MiniLM-L6-v2.zip" in message
+    assert "https://github.com/Rvosy/Sakura/releases/download/v0.9.7/" in message
+    assert "设置页手动导入" in message
+    assert "开启代理并重启 Sakura" in message
+
+
 def test_memory_store_reuses_runtime_when_api_settings_unchanged() -> None:
     settings = ApiSettings(
         base_url="https://api.example.com/v1",
@@ -851,6 +863,19 @@ def test_memory_store_create_update_search_and_delete() -> None:
     removed = store.forget_memory({"id": created["id"]})["forgotten"]
     assert removed["content"] == "Sakura 正在实现自动记忆整理和管理页"
     assert store.list_memories() == []
+
+
+def test_memory_store_lists_all_memories_without_limit() -> None:
+    fake = FakeMem0()
+    fake.records = [
+        {"id": str(index), "memory": f"memory-{index}", "user_id": "sakura", "metadata": {}}
+        for index in range(201)
+    ]
+    store = MemoryStore(
+        base_dir=_runtime_root_path("memory_list_all"), scope_id="sakura", memory_client=fake
+    )
+
+    assert len(store.list_memories(limit=None)) == 201
 
 
 def test_memory_store_forget_missing_id_is_idempotent() -> None:
