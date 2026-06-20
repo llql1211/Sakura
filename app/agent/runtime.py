@@ -41,15 +41,14 @@ from app.llm.chat_reply import ChatReply, parse_chat_reply, parse_chat_reply_res
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.debug_log import debug_body_enabled, debug_log, summarize_messages
 from app.agent.runtime_limits import (
-    MAX_AGENT_STEPS_PER_TURN,
     MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS,
     MAX_EVENT_RECENT_CONVERSATION_MESSAGES,
     MAX_PENDING_CONTEXT_MESSAGES,
     MAX_PENDING_CONTEXT_TEXT_CHARS,
-    MAX_TOOL_CALLS_PER_STEP,
-    MAX_TOOL_CALLS_PER_TURN,
     MAX_TOOL_RESULT_CHARS,
     ProgressCallback,
+    RuntimeLoopSettings,
+    normalize_runtime_loop_settings,
 )
 from app.llm.prompt_templates import (
     build_agent_reply_protocol,
@@ -81,6 +80,7 @@ class AgentRuntime:
         memory: MemoryStore | None = None,
         prompt_patches: list[PromptPatchContribution] | None = None,
         context_providers: list[ContextProviderContribution] | None = None,
+        runtime_loop_settings: RuntimeLoopSettings | None = None,
     ) -> None:
         self.api_client = api_client
         self.system_prompt = system_prompt
@@ -92,6 +92,7 @@ class AgentRuntime:
         self.context_providers = (
             [*context_providers] if context_providers is not None else []
         )
+        self.runtime_loop_settings = normalize_runtime_loop_settings(runtime_loop_settings)
         self.prompt_runtime = PromptRuntime()
         self.context_orchestrator = ContextOrchestrator()
         self.memory_recall = MemoryRecallService(self.memory)
@@ -191,6 +192,10 @@ class AgentRuntime:
     def set_autonomous_screen_observation_enabled(self, enabled: bool) -> None:
         """允许模型在对话或主动事件中自主决定是否观察屏幕。"""
         self.autonomous_screen_observation_enabled = enabled
+
+    def set_runtime_loop_settings(self, settings: RuntimeLoopSettings | None) -> None:
+        """同步工具循环限制，后续对话从新设置开始生效。"""
+        self.runtime_loop_settings = normalize_runtime_loop_settings(settings)
 
     def _resolve_dialogue_params(self) -> tuple[float, dict[str, Any]]:
         """读取角色对话生成参数，兼容测试桩和外部传入的旧客户端实现。"""
@@ -322,7 +327,8 @@ class AgentRuntime:
         turn_memory_fragments = ()
         memory_status = "unknown"
         memory_needs_refresh = True
-        for step_index in range(MAX_AGENT_STEPS_PER_TURN):
+        loop_settings = self.runtime_loop_settings
+        for step_index in range(loop_settings.max_agent_steps_per_turn):
             check_cancelled(cancel_checker)
             browser_page_mode = tool_routing._should_prefer_browser_page_tools(working_messages)
             browser_page_guard_active = (
@@ -359,7 +365,7 @@ class AgentRuntime:
                     mode="proactive" if proactive_mode else "normal",
                     event_type=event_type,
                     step_index=step_index,
-                    remaining_steps=MAX_AGENT_STEPS_PER_TURN - step_index - 1,
+                    remaining_steps=loop_settings.max_agent_steps_per_turn - step_index - 1,
                     available_tools=tool_names,
                     event_payload=event_payload,
                     service_status={"memory": memory_status},
@@ -477,8 +483,8 @@ class AgentRuntime:
             should_fast_forward_final_reply = False
             allowed_calls = min(
                 len(turn.tool_calls),
-                MAX_TOOL_CALLS_PER_STEP,
-                max(0, MAX_TOOL_CALLS_PER_TURN - total_tool_calls),
+                loop_settings.max_tool_calls_per_step,
+                max(0, loop_settings.max_tool_calls_per_turn - total_tool_calls),
             )
             for call in turn.tool_calls[:allowed_calls]:
                 check_cancelled(cancel_checker)
@@ -612,14 +618,14 @@ class AgentRuntime:
                         "requested": len(turn.tool_calls),
                         "allowed": allowed_calls,
                         "total_tool_calls": total_tool_calls,
-                        "step_limit": MAX_TOOL_CALLS_PER_STEP,
-                        "turn_limit": MAX_TOOL_CALLS_PER_TURN,
+                        "step_limit": loop_settings.max_tool_calls_per_step,
+                        "turn_limit": loop_settings.max_tool_calls_per_turn,
                     },
                 )
                 for skipped_call in turn.tool_calls[allowed_calls:]:
                     limit_error = (
-                        f"本步骤最多执行 {MAX_TOOL_CALLS_PER_STEP} 个工具调用，"
-                        f"整轮最多执行 {MAX_TOOL_CALLS_PER_TURN} 个工具调用，"
+                        f"本步骤最多执行 {loop_settings.max_tool_calls_per_step} 个工具调用，"
+                        f"整轮最多执行 {loop_settings.max_tool_calls_per_turn} 个工具调用，"
                         f"已跳过后续调用 {skipped_call.name}。"
                     )
                     limit_result = ToolExecutionResult(
@@ -733,7 +739,7 @@ class AgentRuntime:
                     },
                 )
                 break
-            if total_tool_calls >= MAX_TOOL_CALLS_PER_TURN:
+            if total_tool_calls >= loop_settings.max_tool_calls_per_turn:
                 break
 
         try:
@@ -1047,7 +1053,7 @@ class AgentRuntime:
                 web_tool_capability_rule,
                 "- 屏幕：理解当前画面用 observe_screen（仅启用时可用）。",
                 "- 桌面控制：窗口、鼠标、键盘和系统界面操作用 windows__*。",
-                "- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_forget",
+                "- 提醒与记忆：add_reminder、memory_search、memory_remember、memory_update、memory_forget",
             ]
         )
         tool_rules = "\n".join(
@@ -1068,6 +1074,7 @@ class AgentRuntime:
                 "- 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。",
                 "- 需要跨会话信息、用户偏好或项目状态时，优先使用 memory_search。",
                 "- 只有用户明确要求记住，或信息明显长期有用且不包含敏感凭据时，才使用 memory_remember。",
+                "- 需要纠正、补充或合并已有长期记忆时，先用 memory_search 找到 id，再用 memory_update 写入更新后的完整记忆。",
                 "- 只有用户明确要求忘掉信息时，才使用 memory_forget。",
             ]
         )
@@ -1079,7 +1086,7 @@ class AgentRuntime:
             ),
             PromptSection(
                 "agent.loop_limits",
-                f"当前 Agent 循环：\n- 每步最多请求 {MAX_TOOL_CALLS_PER_STEP} 个工具，整轮最多 {MAX_TOOL_CALLS_PER_TURN} 个工具。\n- 工具结果足够、受限、需要确认或同参数失败时，停止循环并自然说明状态。",
+                f"当前 Agent 循环：\n- 每步最多请求 {self.runtime_loop_settings.max_tool_calls_per_step} 个工具，整轮最多 {self.runtime_loop_settings.max_tool_calls_per_turn} 个工具。\n- 工具结果足够、受限、需要确认或同参数失败时，停止循环并自然说明状态。",
             ),
             PromptSection("reply.protocol", reply_protocol),
             PromptSection("context.acquisition", context_strategy),
@@ -1113,8 +1120,8 @@ class AgentRuntime:
             "",
             self.reply_tones,
             self.reply_portraits,
-            max_tool_calls_per_step=MAX_TOOL_CALLS_PER_STEP,
-            max_tool_calls_per_turn=MAX_TOOL_CALLS_PER_TURN,
+            max_tool_calls_per_step=self.runtime_loop_settings.max_tool_calls_per_step,
+            max_tool_calls_per_turn=self.runtime_loop_settings.max_tool_calls_per_turn,
             extra_instructions=self._combine_extra_instructions(extra_instructions),
         )
         sections = [
@@ -1163,6 +1170,16 @@ class AgentRuntime:
 
     def _build_event_reply_prompt(self, event_type: str = "reminder_due") -> str:
         return self._build_event_reply_result(event_type).system_prompt
+
+    def _memory_context(self, messages: list[ChatMessage], *, mode: str) -> str:
+        query = _latest_user_text(messages)
+        try:
+            builder = getattr(self.memory, "build_memory_context", None)
+            if callable(builder):
+                return builder(query, mode=mode)
+            return self.memory.summary()
+        except Exception as exc:
+            return f"长期记忆读取失败：{exc}"
 
 
 def _emit_progress_from_content(
@@ -1267,6 +1284,31 @@ def _groups_from_search_tools_result(result: ToolExecutionResult) -> set[str]:
         if isinstance(group, str) and group.strip():
             groups.add(group.strip())
     return groups
+
+
+def _latest_user_text(messages: list[ChatMessage]) -> str:
+    """提取最近一条用户文本，作为分层记忆检索查询。"""
+
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        return _message_text_content(message.get("content"))
+    return ""
+
+
+def _message_text_content(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts)
 
 
 def _build_tool_role_message(call: NativeToolCall, result: ToolExecutionResult) -> ChatMessage:

@@ -757,6 +757,10 @@ class TTSServiceSupervisor:
         self._weights_ready = False
         self._server_process: _LocalProcessHandle | None = None
         self._process_resource = None
+        # 串行化「启动/采用」与「停止」,避免预热/请求线程探测启动服务时
+        # 主线程 close() 并发终止子进程引发原生闪退。可重入：_start_local_service
+        # 在持锁状态下会回调 _stop_local_service。
+        self._service_lifecycle_lock = threading.RLock()
         if adopt_existing_service:
             self._adopt_existing_configured_service()
 
@@ -901,13 +905,14 @@ class TTSServiceSupervisor:
         return True
 
     def _adopt_existing_local_service(self, host: str, port: int) -> None:
-        current = getattr(self, "_server_process", None)
-        if current is not None and current.poll() is None:
-            return
-        process = _find_running_local_tts_process(self.settings, port)
-        if process is None:
-            return
-        _track_local_process(self, process)
+        with self._service_lifecycle_lock:
+            current = getattr(self, "_server_process", None)
+            if current is not None and current.poll() is None:
+                return
+            process = _find_running_local_tts_process(self.settings, port)
+            if process is None:
+                return
+            _track_local_process(self, process)
         debug_log(
             "TTS",
             "接管已有本地 TTS 服务进程，退出时将一并清理",
@@ -986,9 +991,12 @@ class TTSServiceSupervisor:
             fail_callback(f"GPT-SoVITS 启动脚本不存在：{api_script}")
             return False
 
-        if self._server_process is not None and self._server_process.poll() is None:
-            debug_log("TTS", "本地 GPT-SoVITS 进程已启动，跳过重复启动", {"work_dir": str(work_dir)})
-            return True
+        # 持服务生命周期锁完成「检查是否已启动 → Popen → 登记句柄」整段,避免与
+        # close()/_stop_local_service 并发拆解子进程。_stop_local_service 用同一把可重入锁。
+        with self._service_lifecycle_lock:
+            if self._server_process is not None and self._server_process.poll() is None:
+                debug_log("TTS", "本地 GPT-SoVITS 进程已启动，跳过重复启动", {"work_dir": str(work_dir)})
+                return True
 
         try:
             log_path = _local_tts_service_log_path(self.settings.provider, getattr(self, "_base_dir", None))
@@ -1122,19 +1130,21 @@ class TTSServiceSupervisor:
 
     def detach_local_service(self) -> None:
         """交出本地服务进程所有权，供新的 Provider 在后台接管（不终止进程）。"""
-        resource = getattr(self, "_process_resource", None)
-        if resource is not None:
-            resource.detach()
-            self._process_resource = None
-        self._server_process = None
+        with self._service_lifecycle_lock:
+            resource = getattr(self, "_process_resource", None)
+            if resource is not None:
+                resource.detach()
+                self._process_resource = None
+            self._server_process = None
 
     def _stop_local_service(self) -> None:
-        process = self._server_process
-        if process is None:
-            return
-        if process.poll() is not None:
-            _track_local_process(self, None)
-            return
+        with self._service_lifecycle_lock:
+            process = self._server_process
+            if process is None:
+                return
+            if process.poll() is not None:
+                _track_local_process(self, None)
+                return
         debug_log("TTS", "关闭本地 TTS 服务进程", {"pid": process.pid, "provider": self.settings.provider})
         try:
             _terminate_process_tree(process, timeout=5)
