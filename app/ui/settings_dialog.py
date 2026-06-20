@@ -2563,9 +2563,6 @@ class SettingsDialog(QDialog):
             self.character_registry = CharacterRegistry(self.base_dir)
             self._refresh_character_combo(result.character_id)
             imported_profile = self._selected_character_profile()
-            if imported_profile is not None and imported_profile.voice is not None:
-                self.ref_lang_edit.setText(imported_profile.voice.ref_lang)
-                self.text_lang_edit.setText(imported_profile.voice.text_lang)
             self._sync_voice_import_controls()
         except (CharacterArchiveError, OSError, ValueError) as exc:
             QMessageBox.warning(self, "导入失败", str(exc))
@@ -2777,8 +2774,8 @@ class SettingsDialog(QDialog):
         work_dir = _optional_path(self.tts_work_dir_edit.text(), self.base_dir)
         python_path = None if bundled else _optional_path(self.tts_python_path_edit.text(), self.base_dir)
         tts_config_path = None if bundled else _optional_path(self.tts_config_path_edit.text(), self.base_dir)
-        ref_lang = self.ref_lang_edit.text().strip()
-        text_lang = self.text_lang_edit.text().strip()
+        ref_lang = "ja"
+        text_lang = "ja"
         selected_profile = self._selected_character_profile()
 
         if enabled and selected_profile is not None and selected_profile.voice is None:
