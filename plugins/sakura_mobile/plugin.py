@@ -50,7 +50,7 @@ class SakuraMobilePlugin(PluginBase):
         context = self._require_context()
         config = context.get_config()
         return {
-            "enabled": _as_bool(config.get("enabled"), True),
+            "enabled": _as_bool(config.get("enabled"), False),
             "host": str(config.get("host") or DEFAULT_HOST).strip() or DEFAULT_HOST,
             "port": _safe_port(config.get("port"), DEFAULT_PORT),
             "token": str(config.get("token") or "sakura").strip() or "sakura",

@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 from app.core.debug_log import debug_log
 
 
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 MAX_REQUEST_BYTES = 12 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 30
