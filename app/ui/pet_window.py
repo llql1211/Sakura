@@ -88,7 +88,15 @@ from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.core.debug_log import debug_log, summarize_messages
-from app.config.models import ApiConfigProfile, ModelSelectionSettings
+from app.config.model_slots import ResolvedModelSlot, resolve_model_slot
+from app.config.models import (
+    MODEL_SLOT_CHAT,
+    MODEL_SLOT_MEMORY_CURATION,
+    MODEL_SLOT_VISION_CHAT,
+    MODEL_SLOT_VISUAL_CONTEXT,
+    ApiConfigProfile,
+    ModelSelectionSettings,
+)
 from app.config.settings_service import BackchannelSettings, BubbleSettings, StartupSettings
 from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.backchannel.audio_cache import BackchannelAudioCache, voice_fingerprint
@@ -4963,7 +4971,6 @@ class PetWindow(QWidget):
             on_release_secondary_window=self._release_secondary_window,
             api_profiles=self.settings_service.load_api_profiles(),
             model_selection=self.settings_service.load_model_selection(),
-            global_model_names=self.settings_service.load_global_model_names(),
         )
         self.settings_dialog = dialog
         # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮、不置顶。
@@ -5136,12 +5143,9 @@ class PetWindow(QWidget):
                 self.settings_service.save_api_settings(dialog.result_api_settings)
             # 保存 API 配置集和模型选择（新格式）
             api_profiles = getattr(dialog, "result_api_profiles", None)
-            global_model_names = getattr(dialog, "result_global_model_names", None)
             model_selection = getattr(dialog, "result_model_selection", None)
             if api_profiles is not None:
                 self.settings_service.save_api_profiles(api_profiles)
-            if global_model_names is not None:
-                self.settings_service.save_global_model_names(global_model_names)
             if model_selection is not None:
                 self.settings_service.save_model_selection(model_selection)
             self.settings_service.save_tts_settings(dialog.result_tts_settings)
@@ -5221,7 +5225,7 @@ class PetWindow(QWidget):
                 self,
                 api_profiles=api_profiles,
                 model_selection=model_selection,
-                timeout_seconds=dialog.result_api_settings.timeout_seconds,
+                base_settings=dialog.result_api_settings,
             )
         elif api_changed:
             # 旧格式回退
@@ -6947,55 +6951,58 @@ def _update_runtime_api_clients(
     *,
     api_profiles: list[ApiConfigProfile],
     model_selection: ModelSelectionSettings,
-    timeout_seconds: int,
+    base_settings: ApiSettings,
 ) -> None:
-    """运行时更新主 api_client 和 vision_api_client。
+    """运行时按功能槽位更新 API client。"""
+    chat_slot = resolve_model_slot(api_profiles, model_selection, MODEL_SLOT_CHAT, base_settings)
+    if chat_slot is None:
+        return
 
-    主 api_client 用于不含图片的请求；vision_api_client 用于含图片的请求。
-    - 启用文本模型时：主 client = 文本模型配置，vision client = 视觉模型配置
-    - 未启用文本模型时：主 client = 视觉模型配置，vision client = None
-    """
-    vision_profile = _find_profile(api_profiles, model_selection.vision_profile_id)
+    window.api_client.update_settings(chat_slot.settings)
+    window.memory_store.reload_api_settings(chat_slot.settings, wait=False)
 
-    if model_selection.text_enabled:
-        # 文本 client 作为主 client
-        text_profile = _find_profile(api_profiles, model_selection.text_profile_id)
-        if text_profile:
-            text_settings = ApiSettings(
-                base_url=text_profile.base_url,
-                api_key=text_profile.api_key,
-                model=model_selection.text_model,
-                timeout_seconds=timeout_seconds,
-            )
-            window.api_client.update_settings(text_settings)
-        # 视觉 client 作为 vision_api_client
-        if vision_profile:
-            vision_settings = ApiSettings(
-                base_url=vision_profile.base_url,
-                api_key=vision_profile.api_key,
-                model=model_selection.vision_model,
-                timeout_seconds=timeout_seconds,
-            )
-            vision_client = OpenAICompatibleClient(vision_settings)
-            window.agent_runtime.vision_api_client = vision_client
-        else:
-            window.agent_runtime.vision_api_client = None
-    else:
-        # 未启用文本模型：全部使用视觉模型配置
-        if vision_profile:
-            vision_settings = ApiSettings(
-                base_url=vision_profile.base_url,
-                api_key=vision_profile.api_key,
-                model=model_selection.vision_model,
-                timeout_seconds=timeout_seconds,
-            )
-            window.api_client.update_settings(vision_settings)
-        window.memory_store.reload_api_settings(window.api_client.settings, wait=False)
-        window.agent_runtime.vision_api_client = None
+    vision_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_VISION_CHAT,
+        base_settings,
+    )
+    window.agent_runtime.vision_api_client = _client_for_explicit_slot(
+        vision_slot,
+        MODEL_SLOT_VISION_CHAT,
+    )
+
+    visual_context_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_VISUAL_CONTEXT,
+        base_settings,
+    )
+    window.agent_runtime.visual_context_api_client = _client_for_explicit_slot(
+        visual_context_slot,
+        MODEL_SLOT_VISUAL_CONTEXT,
+    )
+
+    memory_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_MEMORY_CURATION,
+        base_settings,
+    )
+    memory_curator = getattr(window, "memory_curator", None)
+    set_api_client = getattr(memory_curator, "set_api_client", None)
+    if callable(set_api_client):
+        set_api_client(
+            OpenAICompatibleClient(memory_slot.settings)
+            if memory_slot is not None
+            else window.api_client
+        )
 
 
-def _find_profile(profiles: list[ApiConfigProfile], profile_id: str) -> ApiConfigProfile | None:
-    for p in profiles:
-        if p.id == profile_id:
-            return p
-    return None
+def _client_for_explicit_slot(
+    resolved: ResolvedModelSlot | None,
+    slot: str,
+) -> OpenAICompatibleClient | None:
+    if resolved is None or resolved.source_slot != slot:
+        return None
+    return OpenAICompatibleClient(resolved.settings)

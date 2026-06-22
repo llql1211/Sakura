@@ -9,7 +9,13 @@ from app.agent.mcp.settings import MCPRuntimeSettings
 from app.agent.memory_curator import MemoryCurator, MemoryCurationState
 from app.config.settings_service import AppSettingsService
 from app.llm.api_client import ApiSettings, OpenAICompatibleClient
-from app.config.models import ApiConfigProfile, ModelSelectionSettings
+from app.config.model_slots import ResolvedModelSlot, resolve_model_slot
+from app.config.models import (
+    MODEL_SLOT_CHAT,
+    MODEL_SLOT_MEMORY_CURATION,
+    MODEL_SLOT_VISION_CHAT,
+    MODEL_SLOT_VISUAL_CONTEXT,
+)
 from app.core.app_context import AppContext, CoreServices, FeatureServices, StorageServices
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.core.extensions import ExtensionRegistry
@@ -73,25 +79,9 @@ def load_startup_state(base_dir: Path) -> StartupState:
     # 使用新格式配置覆盖单条 settings
     api_profiles = settings_service.load_api_profiles()
     model_selection = settings_service.load_model_selection()
-    if api_profiles:
-        # text_enabled=True 时主 client 用文本模型，否则用视觉模型
-        if model_selection.text_enabled:
-            profile_id = model_selection.text_profile_id
-            model_name = model_selection.text_model
-        else:
-            profile_id = model_selection.vision_profile_id
-            model_name = model_selection.vision_model
-        profile = _find_profile(api_profiles, profile_id)
-        if profile:
-            settings = ApiSettings(
-                base_url=profile.base_url,
-                api_key=profile.api_key,
-                model=model_name,
-                timeout_seconds=settings.timeout_seconds,
-                temperature=settings.temperature,
-                top_p=settings.top_p,
-                max_tokens=settings.max_tokens,
-            )
+    chat_slot = resolve_model_slot(api_profiles, model_selection, MODEL_SLOT_CHAT, settings)
+    if chat_slot is not None:
+        settings = chat_slot.settings
     debug_log(
         "Startup",
         "API 配置已加载",
@@ -146,10 +136,16 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     system_prompt = startup_state.system_prompt
     api_client = OpenAICompatibleClient(settings)
 
-    # 加载 API 配置集和模型选择，构建 vision_api_client
+    # 加载 API 配置集和模型选择，构建按功能分流的 API client。
     api_profiles = settings_service.load_api_profiles()
     model_selection = settings_service.load_model_selection()
-    vision_api_client = _build_vision_api_client(api_profiles, model_selection, settings.timeout_seconds)
+    vision_slot = resolve_model_slot(api_profiles, model_selection, MODEL_SLOT_VISION_CHAT, settings)
+    vision_api_client = _client_for_explicit_slot(vision_slot, MODEL_SLOT_VISION_CHAT)
+    visual_context_slot = resolve_model_slot(api_profiles, model_selection, MODEL_SLOT_VISUAL_CONTEXT, settings)
+    visual_context_api_client = _client_for_explicit_slot(
+        visual_context_slot,
+        MODEL_SLOT_VISUAL_CONTEXT,
+    )
 
     resource_registry = ResourceRegistry()
     memory_store = MemoryStore(
@@ -174,6 +170,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     agent_runtime = AgentRuntime(
         api_client=api_client,
         vision_api_client=vision_api_client,
+        visual_context_api_client=visual_context_api_client,
         system_prompt=system_prompt,
         reply_tones=character_profile.reply_tones,
         reply_portraits=character_profile.portrait_choices,
@@ -190,7 +187,18 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     memory_curation_state = MemoryCurationState(
         StoragePaths(base_dir).memory_curation_state()
     )
-    memory_curator = MemoryCurator(api_client, memory_store, system_prompt=system_prompt)
+    memory_curation_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_MEMORY_CURATION,
+        settings,
+    )
+    memory_curator_client = (
+        OpenAICompatibleClient(memory_curation_slot.settings)
+        if memory_curation_slot is not None
+        else api_client
+    )
+    memory_curator = MemoryCurator(memory_curator_client, memory_store, system_prompt=system_prompt)
     screen_awareness_settings = settings_service.load_screen_awareness_settings()
 
     debug_log(
@@ -397,38 +405,10 @@ def create_visual_observation_store(
     return VisualObservationStore(visual_path)
 
 
-def _build_vision_api_client(
-    api_profiles: list[ApiConfigProfile],
-    model_selection: ModelSelectionSettings,
-    timeout_seconds: int,
+def _client_for_explicit_slot(
+    resolved: ResolvedModelSlot | None,
+    slot: str,
 ) -> OpenAICompatibleClient | None:
-    """根据配置构建 vision_api_client。
-
-    当 text_enabled=True 时，api_client 使用文本模型配置，
-    vision_api_client 使用视觉模型配置。当 text_enabled=False 时，
-    api_client 直接使用视觉模型配置，vision_api_client=None。
-    """
-    if not model_selection.text_enabled:
+    if resolved is None or resolved.source_slot != slot:
         return None
-
-    vision_profile = _find_profile(api_profiles, model_selection.vision_profile_id)
-    if vision_profile is None:
-        return None
-
-    vision_settings = ApiSettings(
-        base_url=vision_profile.base_url,
-        api_key=vision_profile.api_key,
-        model=model_selection.vision_model,
-        timeout_seconds=timeout_seconds,
-    )
-    return OpenAICompatibleClient(vision_settings)
-
-
-def _find_profile(
-    profiles: list[ApiConfigProfile],
-    profile_id: str,
-) -> ApiConfigProfile | None:
-    for p in profiles:
-        if p.id == profile_id:
-            return p
-    return None
+    return OpenAICompatibleClient(resolved.settings)

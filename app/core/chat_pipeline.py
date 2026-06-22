@@ -6,6 +6,7 @@ from typing import Any
 from app.agent import AgentEvent, AgentProgress, AgentResult, AgentRuntime, PendingToolAction
 from app.core.cancellation import CancelChecker, check_cancelled
 from app.core.debug_log import debug_log, summarize_messages
+from app.config.models import MODEL_SLOT_VISUAL_CONTEXT
 from app.storage.visual_observation import (
     VisualObservationJob,
     VisualObservationRecord,
@@ -45,11 +46,10 @@ class ChatPipeline:
         )
         check_cancelled(cancel_checker)
 
-        # 步骤 2: 如果有关联的视觉摘要，剥离图片、注入摘要，交给文本模型做角色扮演
+        # 步骤 2: 视觉摘要只作为额外上下文，原图仍交给最终回复模型。
         if visual_records:
             user_text = _extract_user_text(messages)
             context_message = build_visual_context_message(user_text, visual_records)
-            messages = _strip_images_from_messages(messages)
             if context_message is not None:
                 messages = _inject_context_message(messages, context_message)
 
@@ -143,10 +143,11 @@ class ChatPipeline:
         records: list[VisualObservationRecord] = []
         for job in visual_observation_jobs:
             check_cancelled(cancel_checker)
-            # 视觉预处理优先使用 vision_api_client，没有则回退到主 api_client
+            client_for_slot = getattr(self.agent_runtime, "api_client_for_slot", None)
             vision_client = (
-                self.agent_runtime.vision_api_client
-                or self.agent_runtime.api_client
+                client_for_slot(MODEL_SLOT_VISUAL_CONTEXT)
+                if callable(client_for_slot)
+                else self.agent_runtime.api_client
             )
             record = summarize_visual_observation(
                 vision_client,
@@ -196,26 +197,6 @@ def _extract_user_text(messages: list[dict[str, Any]]) -> str:
                 parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
                 return " ".join(parts)
     return ""
-
-
-def _strip_images_from_messages(
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """从消息列表中移除所有 image_url 内容块，只保留文本部分。"""
-    stripped: list[dict[str, Any]] = []
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            text_parts = [
-                p for p in content
-                if isinstance(p, dict) and p.get("type") != "image_url"
-            ]
-            if text_parts:
-                stripped.append({**msg, "content": text_parts})
-            # 如果所有内容都是图片，则跳过整条消息
-        else:
-            stripped.append(dict(msg))
-    return stripped
 
 
 def _inject_context_message(
