@@ -6,7 +6,7 @@ from typing import Any
 from app.plugins import PluginBase, PluginCapabilityRegistry, PluginContext
 from app.plugins import SettingsPanelContribution
 
-from plugins.sakura_mobile.server import DEFAULT_HOST, DEFAULT_PORT, run_mobile_server
+from plugins.sakura_mobile.server import DEFAULT_HOST, DEFAULT_PORT, mobile_access_urls, run_mobile_server
 
 
 class SakuraMobilePlugin(PluginBase):
@@ -18,6 +18,7 @@ class SakuraMobilePlugin(PluginBase):
         self._server: Any | None = None
         self._thread: threading.Thread | None = None
         self._cleanup_registered = False
+        self._last_error = ""
 
     def initialize(
         self,
@@ -67,10 +68,12 @@ class SakuraMobilePlugin(PluginBase):
         context = self._require_context()
         config = self.config()
         if not config["enabled"]:
+            self._last_error = ""
             context.log("手机端插件已禁用")
             return
         mobile_service = getattr(getattr(context, "services", None), "mobile", None)
         if mobile_service is None:
+            self._last_error = "宿主桥接未就绪"
             context.log("手机端服务启动失败：宿主桥接未就绪")
             return
         try:
@@ -82,6 +85,7 @@ class SakuraMobilePlugin(PluginBase):
                 token=str(config["token"]),
             )
         except OSError as exc:
+            self._last_error = str(exc)
             context.log("手机端服务启动失败", {"error": str(exc)})
             return
         thread = threading.Thread(
@@ -92,6 +96,7 @@ class SakuraMobilePlugin(PluginBase):
         thread.start()
         self._server = server
         self._thread = thread
+        self._last_error = ""
         context.log(
             "手机端服务已启动",
             {"host": config["host"], "port": config["port"]},
@@ -118,6 +123,8 @@ class SakuraMobilePlugin(PluginBase):
         return {
             **config,
             "running": self._server is not None,
+            "error": self._last_error,
+            **mobile_access_urls(str(config["host"]), int(config["port"]), str(config["token"])),
         }
 
     def _require_context(self) -> PluginContext:

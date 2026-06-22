@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import secrets
+import socket
 import threading
 import time
 from collections import deque
@@ -21,6 +23,7 @@ MAX_REQUEST_BYTES = 12 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 30
 MAX_CONCURRENT_REQUESTS = 8
 MAX_REQUESTS_PER_MINUTE = 60
+TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
 class SakuraMobileHTTPServer(ThreadingHTTPServer):
@@ -126,6 +129,46 @@ def run_mobile_server(
         {"host": host, "port": port, "plugin_mode": True},
     )
     return server
+
+
+def mobile_access_urls(host: str, port: int, token: str) -> dict[str, Any]:
+    query = f"?token={token.strip()}"
+    local_url = f"http://127.0.0.1:{int(port)}/{query}"
+    lan_urls = [
+        f"http://{address}:{int(port)}/{query}"
+        for address in local_ipv4_addresses()
+    ]
+    return {
+        "host": host,
+        "local_url": local_url,
+        "lan_urls": lan_urls,
+    }
+
+
+def local_ipv4_addresses() -> list[str]:
+    addresses: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addresses.add(str(info[4][0]))
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            addresses.add(str(sock.getsockname()[0]))
+    except OSError:
+        pass
+    return sorted(address for address in addresses if _is_lan_ipv4(address))
+
+
+def _is_lan_ipv4(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if ip.version != 4 or ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+        return False
+    return ip.is_private or ip in TAILSCALE_CGNAT
 
 
 def _build_handler(service: MobilePluginService, token: str) -> type[BaseHTTPRequestHandler]:

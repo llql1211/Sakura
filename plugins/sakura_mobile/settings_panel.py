@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtWidgets import QCheckBox, QFormLayout, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 
 class SakuraMobileSettingsPanel(QWidget):
@@ -19,6 +19,13 @@ class SakuraMobileSettingsPanel(QWidget):
         self.port.setValue(int(config["port"]))
         self.token = QLineEdit(str(config["token"]), self)
         self.token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.status_label = QLabel("", self)
+        self.local_url = QLineEdit(self)
+        self.local_url.setReadOnly(True)
+        self.lan_url = QLineEdit(self)
+        self.lan_url.setReadOnly(True)
+        self.copy_local_button = QPushButton("复制本机链接", self)
+        self.copy_lan_button = QPushButton("复制内网链接", self)
         self.save_button = QPushButton("保存并重启手机端", self)
 
         form = QFormLayout()
@@ -26,6 +33,9 @@ class SakuraMobileSettingsPanel(QWidget):
         form.addRow("监听地址", self.host)
         form.addRow("端口", self.port)
         form.addRow("访问 token", self.token)
+        form.addRow("运行状态", self.status_label)
+        form.addRow("本机链接", self._link_row(self.local_url, self.copy_local_button))
+        form.addRow("内网链接", self._link_row(self.lan_url, self.copy_lan_button))
 
         layout = QVBoxLayout()
         layout.addLayout(form)
@@ -34,13 +44,25 @@ class SakuraMobileSettingsPanel(QWidget):
         self.setLayout(layout)
 
         self.enabled.toggled.connect(self._sync_controls)
+        self.copy_local_button.clicked.connect(lambda: self._copy(self.local_url.text()))
+        self.copy_lan_button.clicked.connect(lambda: self._copy(self.lan_url.text()))
         self.save_button.clicked.connect(self._save)
         self._sync_controls(self.enabled.isChecked())
+        self._refresh_status()
+
+    def _link_row(self, edit: QLineEdit, button: QPushButton) -> QWidget:
+        row = QWidget(self)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(edit, 1)
+        layout.addWidget(button)
+        return row
 
     def _sync_controls(self, enabled: bool) -> None:
         self.host.setEnabled(enabled)
         self.port.setEnabled(enabled)
         self.token.setEnabled(enabled)
+        self._refresh_status()
 
     def _save(self) -> None:
         token = self.token.text().strip()
@@ -54,3 +76,25 @@ class SakuraMobileSettingsPanel(QWidget):
                 "token": token or "sakura",
             }
         )
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        status = self.plugin.status()
+        if not status["enabled"]:
+            self.status_label.setText("未启动")
+        elif status["running"]:
+            self.status_label.setText("运行中")
+        else:
+            error = str(status.get("error") or "未启动")
+            self.status_label.setText(f"启动失败：{error}" if status.get("error") else error)
+        self.local_url.setText(str(status.get("local_url") or ""))
+        lan_urls = status.get("lan_urls") or []
+        self.lan_url.setText(" ; ".join(lan_urls) if lan_urls else "未发现内网地址")
+        self.local_url.setCursorPosition(0)
+        self.lan_url.setCursorPosition(0)
+
+    def _copy(self, text: str) -> None:
+        clean = text.strip()
+        if not clean or clean == "未发现内网地址":
+            return
+        QApplication.clipboard().setText(clean)
