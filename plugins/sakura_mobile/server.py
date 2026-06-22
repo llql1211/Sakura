@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from app.core.mobile_chat_bridge import MobileChatBusyError
 from app.core.debug_log import debug_log
 
 
@@ -219,6 +220,11 @@ def _build_handler(service: MobilePluginService, token: str) -> type[BaseHTTPReq
                     str(data.get("image") or data.get("image_data_url") or ""),
                 )
                 self._send_json(result)
+            except MobileChatBusyError as exc:
+                self._send_json(
+                    {"ok": False, "busy": True, "error": str(exc)},
+                    HTTPStatus.CONFLICT,
+                )
             except Exception as exc:  # noqa: BLE001
                 self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
@@ -417,6 +423,28 @@ let selectedImageSource = '';
 function api(path) {{ return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN); }}
 function setStatus(value) {{ statusLine.textContent = value || ''; }}
 function sleep(ms) {{ return new Promise(resolve => setTimeout(resolve, ms)); }}
+async function fetchWithTimeout(url, options = {{}}) {{
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
+  try {{
+    return await fetch(url, {{ ...options, signal: controller.signal }});
+  }} finally {{
+    clearTimeout(timer);
+  }}
+}}
+async function fetchJson(path, options = {{}}) {{
+  const res = await fetchWithTimeout(api(path), options);
+  let data = {{}};
+  try {{
+    data = await res.json();
+  }} catch (_err) {{}}
+  if (!res.ok) throw new Error(data.error || '请求失败');
+  return data;
+}}
+function errorText(err) {{
+  if (err && err.name === 'AbortError') return '请求超时，请稍后再试。';
+  return String(err && err.message ? err.message : err);
+}}
 function cleanAssistantText(value) {{
   return String(value || '').trim().replace(/^[.．…]+\\s*/, '').trimStart();
 }}
@@ -476,8 +504,7 @@ async function showAssistantSegments(segments) {{
   }}
 }}
 async function loadCharacters() {{
-  const res = await fetch(api('/api/characters'));
-  const data = await res.json();
+  const data = await fetchJson('/api/characters');
   character.innerHTML = '';
   for (const item of data.characters || []) {{
     const opt = document.createElement('option');
@@ -492,8 +519,7 @@ async function loadHistory() {{
   if (!character.value) return;
   replyQueueToken += 1;
   chat.innerHTML = '';
-  const res = await fetch(api('/api/history?character_id=' + encodeURIComponent(character.value) + '&limit=50'));
-  const data = await res.json();
+  const data = await fetchJson('/api/history?character_id=' + encodeURIComponent(character.value) + '&limit=50');
   for (const item of data.history || []) {{
     if (item.role === 'user' || item.role === 'assistant') addMessage(item.role, item.content);
   }}
@@ -524,7 +550,7 @@ form.addEventListener('submit', async (event) => {{
     image.value = '';
     camera.value = '';
     syncMediaSelection('');
-    const res = await fetch(api('/api/chat'), {{
+    const data = await fetchJson('/api/chat', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify({{
@@ -534,8 +560,6 @@ form.addEventListener('submit', async (event) => {{
         image: imageData
       }})
     }});
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '请求失败');
     const segments = Array.isArray(data.segments) ? data.segments : [];
     if (segments.length) {{
       await showAssistantSegments(segments);
@@ -544,12 +568,12 @@ form.addEventListener('submit', async (event) => {{
     }}
     setStatus('');
   }} catch (err) {{
-    setStatus(String(err.message || err));
+    setStatus(errorText(err));
   }} finally {{
     send.disabled = false;
   }}
 }});
-loadCharacters().catch(err => setStatus(String(err.message || err)));
+loadCharacters().catch(err => setStatus(errorText(err)));
 </script>
 </body>
 </html>"""

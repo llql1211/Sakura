@@ -18,6 +18,10 @@ MAX_MOBILE_HISTORY_MESSAGES = 24
 MOBILE_IMAGE_MARKER = "（手机端发送了一张图片）"
 
 
+class MobileChatBusyError(RuntimeError):
+    """Raised when the desktop chat lane cannot accept a mobile request now."""
+
+
 @dataclass
 class _MobileCharacterSession:
     profile: CharacterProfile

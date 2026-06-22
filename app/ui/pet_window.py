@@ -99,7 +99,7 @@ from app.backchannel.eval_log import BackchannelEvalLogger
 from app.backchannel.models import BackchannelLabel, BackchannelManifest
 from app.backchannel.resolver import BackchannelChoice
 from app.core.interaction import clear_interaction_id, set_interaction_id
-from app.core.mobile_chat_bridge import MobileChatBridge
+from app.core.mobile_chat_bridge import MobileChatBridge, MobileChatBusyError
 from app.core.mobile_chat_worker import MobileChatWorker
 from app.core.resource_manager import ResourceManager
 from app.storage.atomic import atomic_write_text
@@ -245,6 +245,7 @@ LEGACY_PROACTIVE_EVENT_TYPE = "proactive_check"
 SCREEN_AWARENESS_VISUAL_SOURCE = "screen_awareness_context"
 SCREEN_AWARENESS_STATE_FILE = "screen_awareness_state.json"
 SCREEN_AWARENESS_HEALTH_TOPIC = "health_reminder"
+MOBILE_CHAT_BUSY_MESSAGE = "Sakura 正忙，请稍后再试。"
 SCREEN_AWARENESS_HEALTH_KEYWORDS = (
     "休息",
     "休憩",
@@ -4514,10 +4515,14 @@ class PetWindow(QWidget):
 
     def submit_mobile_chat(self, bridge: MobileChatBridge, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
         """Marshal an HTTP request into the single host Agent worker lane."""
-        request: dict[str, Any] = {"bridge": bridge, "character_id": character_id, "text": text, "image_data_url": image_data_url, "done": threading.Event(), "result": None, "error": ""}
+        if self._mobile_chat_busy():
+            raise MobileChatBusyError(MOBILE_CHAT_BUSY_MESSAGE)
+        request: dict[str, Any] = {"bridge": bridge, "character_id": character_id, "text": text, "image_data_url": image_data_url, "done": threading.Event(), "result": None, "error": "", "busy": False}
         self.mobile_chat_requested.emit(request)
         if not request["done"].wait(timeout=300):
             raise TimeoutError("移动端聊天等待超时。")
+        if request["busy"]:
+            raise MobileChatBusyError(str(request["error"] or MOBILE_CHAT_BUSY_MESSAGE))
         if request["error"]:
             raise RuntimeError(str(request["error"]))
         result = request["result"]
@@ -4525,12 +4530,31 @@ class PetWindow(QWidget):
             raise RuntimeError("移动端聊天未返回有效结果。")
         return result
 
+    def _mobile_chat_busy(self) -> bool:
+        return bool(
+            self.worker_thread is not None
+            or self._active_mobile_chat_request is not None
+            or self._mobile_chat_requests
+            or self.active_reminder_id is not None
+            or self.active_event_type
+            or self.pending_tool_action is not None
+            or self.pending_screen_observation_messages is not None
+            or self.screen_observation_followup_in_progress
+            or self.screen_observation_encode_thread is not None
+            or self.active_interaction_id
+        )
+
     @Slot(object)
     def _enqueue_mobile_chat(self, request: object) -> None:
         if not isinstance(request, dict):
             return
         if getattr(self, "_shutdown_in_progress", False):
             request["error"] = "应用正在关闭。"
+            request["done"].set()
+            return
+        if self._mobile_chat_busy():
+            request["busy"] = True
+            request["error"] = MOBILE_CHAT_BUSY_MESSAGE
             request["done"].set()
             return
         self._mobile_chat_requests.append(request)
