@@ -284,6 +284,33 @@ def test_portrait_panel_edits_portrait_description_tags() -> None:
     assert doc.default_portrait == "portraits/A010.png"
 
 
+
+def test_export_step_preview_does_not_write_reference_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _qt_app()
+    _disable_audio_player(monkeypatch)
+
+    from tools.studio.app_studio import StudioWindow
+    from tools.studio.character_doc import VoiceDraft
+
+    project_root = _studio_runtime_root("studio_export_preview")
+    package_dir = project_root / "tools" / "studio" / "workspace" / "characters" / "demo"
+    (package_dir / "voice" / "refs" / "tone_refs").mkdir(parents=True)
+    (package_dir / "voice" / "refs" / "tone_refs" / "neutral.wav").write_bytes(b"wav")
+    window = StudioWindow(project_root=project_root)
+    window._set_doc(
+        CharacterDoc(id="demo", display_name="Demo", voice=VoiceDraft()),
+        package_dir,
+    )
+    ref_panel = window._panels["reference_audio"]
+    ref_panel._add_ref_row("voice/refs/tone_refs/neutral.wav", "JA", "hello", "中性")
+
+    window._go_to_step(7)
+
+    assert not (package_dir / DEFAULT_TONE_REFS).exists()
+    assert "Demo" in window._panels["export"].summary_label.text()
+
 def test_theme_swatches_keep_individual_colors() -> None:
     _qt_app()
 

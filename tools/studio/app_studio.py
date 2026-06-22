@@ -254,7 +254,7 @@ class StudioWindow(QMainWindow):
         if self._doc is None or self._package_dir is None:
             export_panel.set_ready(False)
             return
-        doc = self._write_panels_to_doc()
+        doc = self._write_panels_to_doc(write_files=False)
         if doc is not None:
             export_panel.bind_package_dir(self._package_dir)
             export_panel.load_from(doc)
@@ -310,11 +310,15 @@ class StudioWindow(QMainWindow):
         self._go_to_step(1)
         self._status_label.setText(f"已打开：{package_dir}")
 
-    def _write_panels_to_doc(self) -> CharacterDoc | None:
+    def _write_panels_to_doc(self, *, write_files: bool = True) -> CharacterDoc | None:
         if self._doc is None:
             return None
         for key, _label in STUDIO_STEPS:
-            self._panels[key].write_to(self._doc)
+            panel = self._panels[key]
+            if isinstance(panel, ReferenceAudioPanel):
+                panel.write_to(self._doc, write_files=write_files)
+            else:
+                panel.write_to(self._doc)
         return self._doc
 
     def _collect_validation_errors(self, doc: CharacterDoc) -> list[str]:

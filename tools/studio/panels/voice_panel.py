@@ -269,13 +269,13 @@ class ReferenceAudioPanel(StudioPanel):
                 parts.append("")
             self._add_ref_row(parts[0], parts[1], parts[2], parts[3])
 
-    def write_to(self, doc: CharacterDoc) -> None:
+    def write_to(self, doc: CharacterDoc, *, write_files: bool = True) -> None:
         rows = self._rows()
         tones = self._tone_labels(rows)
         if tones:
             doc.reply_tones = tones
 
-        if self._package_dir is not None and (doc.voice is not None or rows):
+        if write_files and self._package_dir is not None and (doc.voice is not None or rows):
             ref_path = self._package_dir / DEFAULT_TONE_REFS
             ref_path.parent.mkdir(parents=True, exist_ok=True)
             lines = ["|".join(row) for row in rows if any(row)]
