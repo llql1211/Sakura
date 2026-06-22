@@ -190,6 +190,7 @@ def summarize_visual_observation(
                 }
             ],
             temperature=0.2,
+            response_format={"type": "json_object"},
             cancel_checker=cancel_checker,
         )
     except OperationCancelled:
@@ -477,6 +478,10 @@ def _redact_text(text: str) -> tuple[str, bool]:
 
 def _load_json_object(content: str) -> dict[str, Any] | None:
     text = content.strip()
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
     try:
         data = json.loads(text)
     except json.JSONDecodeError:

@@ -84,6 +84,7 @@ from app.config.models import (
     MODEL_SLOT_MEMORY_CURATION,
     MODEL_SLOT_ORDER,
     MODEL_SLOT_THEME_AI,
+    MODEL_SLOT_UI_ORDER,
     MODEL_SLOT_VISION_CHAT,
     MODEL_SLOT_VISUAL_CONTEXT,
     ApiConfigProfile,
@@ -2045,7 +2046,7 @@ class SettingsDialog(QDialog):
             return
 
         sections_to_test: list[str] = []
-        for slot in MODEL_SLOT_ORDER:
+        for slot in MODEL_SLOT_UI_ORDER:
             if self._should_test_model_on_accept(slot):
                 sections_to_test.append(slot)
 

@@ -92,6 +92,43 @@ def test_summarize_visual_observation_uses_high_detail_for_screen_contexts() -> 
     assert record.summary == "屏幕上有一段代码。"
 
 
+def test_summarize_visual_observation_accepts_fenced_json() -> None:
+    class Client:
+        def complete_raw(self, _system_prompt, _messages, **kwargs):  # type: ignore[no-untyped-def]
+            assert kwargs["response_format"] == {"type": "json_object"}
+            return """```json
+{
+  "summary": "桌面上有调试日志。",
+  "visible_texts": ["Debug"],
+  "uncertain_texts": [],
+  "notable_elements": ["终端"],
+  "confidence": 0.8,
+  "sensitive_redacted": false
+}
+```"""
+
+    record = summarize_visual_observation(
+        Client(),
+        VisualObservationJob(
+            id="vis_fenced",
+            source="screen_awareness_context",
+            user_text="看看桌面",
+            screen_contexts=[
+                {
+                    "data_url": "data:image/jpeg;base64,screen",
+                    "width": 1280,
+                    "height": 720,
+                    "captured_at": "2026-05-31T12:00:00+08:00",
+                    "screen_name": "DISPLAY1",
+                }
+            ],
+        ),
+    )
+
+    assert record.summary == "桌面上有调试日志。"
+    assert record.visible_texts == ["Debug"]
+
+
 def test_visual_observation_store_redacts_sensitive_text_and_omits_images() -> None:
     path = Path("data") / f"test_visual_{uuid.uuid4().hex}.jsonl"
     try:
