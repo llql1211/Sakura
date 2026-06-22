@@ -501,6 +501,16 @@ class ApiSettingsPage:
         text_form.setContentsMargins(12, 8, 12, 8)
         text_form.setSpacing(8)
         text_form.addRow("", owner.text_enabled_check)
+
+        text_hint = QLabel(
+            "启用后，纯文本请求改由文本模型处理；"
+            "若关闭，所有请求均由视觉模型处理。",
+            text_group,
+        )
+        text_hint.setWordWrap(True)
+        text_hint.setStyleSheet("color: #888; font-size: 11px; padding-left: 22px;")
+        text_form.addRow("", text_hint)
+
         text_form.addRow("API 配置集", owner.text_profile_combo)
         text_form.addRow("模型名称", owner.text_model_combo)
         text_form.addRow("", text_actions)
