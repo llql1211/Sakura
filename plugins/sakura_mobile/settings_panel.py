@@ -4,6 +4,7 @@ from typing import Any
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QCheckBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget
+import shiboken6
 
 from plugins.sakura_mobile.server import DEFAULT_HOST
 
@@ -116,8 +117,13 @@ class SakuraMobileSettingsPanel(QWidget):
         button.setProperty("originalText", original_text)
         if not clean or clean == "未发现内网地址":
             button.setText("无链接")
-            QTimer.singleShot(1200, lambda: button.setText(original_text))
+            QTimer.singleShot(1200, lambda: _restore_button_text(button, original_text))
             return
         QApplication.clipboard().setText(clean)
         button.setText("已复制")
-        QTimer.singleShot(1200, lambda: button.setText(original_text))
+        QTimer.singleShot(1200, lambda: _restore_button_text(button, original_text))
+
+
+def _restore_button_text(button: QPushButton, text: str) -> None:
+    if shiboken6.isValid(button):
+        button.setText(text)

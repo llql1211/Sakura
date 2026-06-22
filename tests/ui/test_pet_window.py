@@ -3348,11 +3348,11 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert "QSpinBox::up-button:disabled" in dialog.styleSheet()
     assert "QGroupBox QWidget" not in dialog.styleSheet()
     assert isinstance(dialog.character_combo, QComboBox)
-    assert isinstance(dialog.model_edit, QComboBox)
+    assert isinstance(dialog.vision_model_combo, QComboBox)
     assert isinstance(dialog.tts_provider_combo, QComboBox)
     assert isinstance(dialog.theme_visual_effect_combo, QComboBox)
     assert not hasattr(dialog.character_combo, "_popup_frame")
-    assert not hasattr(dialog.model_edit, "_popup_frame")
+    assert not hasattr(dialog.vision_model_combo, "_popup_frame")
     assert app.styleSheet() == app_stylesheet_before
 
     combo_bottom = dialog.character_combo.mapToGlobal(dialog.character_combo.rect().bottomLeft()).y()
@@ -4536,7 +4536,7 @@ def test_settings_dialog_tests_api_when_api_changes(monkeypatch) -> None:  # typ
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
-    dialog.model_edit.setText("new-model")
+    dialog.vision_model_combo.setText("new-model")
     calls: list[str] = []
 
     def fake_start_api_test(settings, accept_values=None):  # type: ignore[no-untyped-def]
@@ -4561,7 +4561,7 @@ def test_settings_dialog_model_combo_saves_manual_input(monkeypatch) -> None:  #
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     dialog, app = _build_api_settings_dialog("api_manual_model")
-    dialog.model_edit.setText("manual-model")
+    dialog.vision_model_combo.setText("manual-model")
     monkeypatch.setattr(dialog, "_start_api_settings_test", lambda settings, accept_values=None: dialog._continue_accept_after_api_test(accept_values))
 
     dialog.accept()
@@ -4589,9 +4589,9 @@ def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monk
 
     dialog._handle_api_model_probe_success(["z-model", "a-model"])
 
-    assert dialog.model_edit.currentText() == "z-model"
-    assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == ["z-model", "a-model"]
-    assert not hasattr(dialog.model_edit, "_popup_list")
+    assert dialog.vision_model_combo.currentText() == "z-model"
+    assert [dialog.vision_model_combo.itemText(index) for index in range(dialog.vision_model_combo.count())] == ["z-model", "a-model"]
+    assert not hasattr(dialog.vision_model_combo, "_popup_list")
     assert infos and "2" in infos[0]
     dialog.deleteLater()
     app.processEvents()
@@ -4627,18 +4627,18 @@ def test_settings_dialog_model_popups_follow_current_theme_stylesheet() -> None:
         theme_settings=themed,
     )
 
-    dialog.model_edit.set_model_names(["alpha-model", "beta-model"])
+    dialog.vision_model_combo.set_model_names(["alpha-model", "beta-model"])
     stylesheet = dialog.styleSheet()
 
     assert "QComboBox QAbstractItemView" in stylesheet
     assert rgba("#102030", 246) in stylesheet
     assert rgba(themed.primary_color, 43) in stylesheet
     assert "#ddeeff" in stylesheet
-    assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == [
+    assert [dialog.vision_model_combo.itemText(index) for index in range(dialog.vision_model_combo.count())] == [
         "alpha-model",
         "beta-model",
     ]
-    assert not hasattr(dialog.model_edit, "_popup_list")
+    assert not hasattr(dialog.vision_model_combo, "_popup_list")
 
     dialog.deleteLater()
     app.processEvents()
@@ -4656,8 +4656,11 @@ def test_settings_dialog_model_probe_keeps_current_input(monkeypatch) -> None:  
 
     dialog._handle_api_model_probe_success(["a-model", "b-model"])
 
-    assert dialog.model_edit.currentText() == "custom-model"
-    assert dialog.model_edit.completer().completionModel().rowCount() == 2
+    assert dialog.vision_model_combo.currentText() == "custom-model"
+    assert [dialog.vision_model_combo.itemText(index) for index in range(dialog.vision_model_combo.count())] == [
+        "a-model",
+        "b-model",
+    ]
     dialog.deleteLater()
     app.processEvents()
 
@@ -4682,7 +4685,7 @@ def test_settings_dialog_model_probe_failure_keeps_current_model(monkeypatch) ->
     assert len(warnings) == 1
     assert "处理建议" in warnings[0]
     assert "诊断信息（截图时请保留）：\n无法连接" in warnings[0]
-    assert dialog.model_edit.currentText() == "current-model"
+    assert dialog.vision_model_combo.currentText() == "current-model"
     assert dialog.result_api_settings is None
     dialog.deleteLater()
     app.processEvents()
@@ -4698,18 +4701,19 @@ def test_settings_dialog_model_probe_busy_state_disables_actions() -> None:
     dialog, app = _build_api_settings_dialog("api_model_probe_busy")
     save_button = dialog.button_box.button(QDialogButtonBox.StandardButton.Save)
 
+    dialog._active_test_section = "vision"
     dialog._set_api_model_probe_busy(True)
 
-    assert not dialog.api_model_probe_button.isEnabled()
-    assert not dialog.api_test_button.isEnabled()
+    assert not dialog.vision_probe_btn.isEnabled()
+    assert not dialog.vision_test_btn.isEnabled()
     assert save_button is not None
     assert not save_button.isEnabled()
     assert save_button.text() == "检测模型..."
 
     dialog._set_api_model_probe_busy(False)
 
-    assert dialog.api_model_probe_button.isEnabled()
-    assert dialog.api_test_button.isEnabled()
+    assert dialog.vision_probe_btn.isEnabled()
+    assert dialog.vision_test_btn.isEnabled()
     assert save_button.isEnabled()
     dialog.deleteLater()
     app.processEvents()
@@ -4738,7 +4742,7 @@ def test_settings_dialog_api_test_failure_blocks_save(monkeypatch) -> None:  # t
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
-    dialog.model_edit.setText("bad-model")
+    dialog.vision_model_combo.setText("bad-model")
     warnings: list[str] = []
     monkeypatch.setattr(
         settings_dialog_module.QMessageBox,
@@ -4787,7 +4791,7 @@ def test_settings_dialog_api_success_continues_to_tts_test(monkeypatch) -> None:
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
-    dialog.model_edit.setText("new-model")
+    dialog.vision_model_combo.setText("new-model")
     dialog.tts_enabled_check.setChecked(True)
     nanami_index = dialog.character_combo.findData("nanami")
     assert nanami_index >= 0
@@ -6768,6 +6772,77 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
     assert calls == {"save_api": 0, "update_api": 0, "reload_memory": 0}
 
 
+def test_update_runtime_api_clients_wires_plugin_emitter_to_slot_clients() -> None:
+    from app.config.models import (
+        ApiConfigProfile,
+        ModelSelectionSettings,
+        ModelSlotSelection,
+    )
+    from app.llm.api_client import OpenAICompatibleClient
+    from app.ui.pet_window import _update_runtime_api_clients
+
+    def emit_event(_event: str, _payload: dict | None = None) -> None:
+        pass
+
+    class MemoryStoreStub:
+        def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+    class MemoryCuratorStub:
+        api_client = None
+
+        def set_api_client(self, client):  # type: ignore[no-untyped-def]
+            self.api_client = client
+
+    window = type("WindowStub", (), {})()
+    window.api_client = OpenAICompatibleClient(
+        ApiSettings("https://base.example.com/v1", "base-key", "base-model")
+    )
+    window.agent_runtime = type(
+        "RuntimeStub",
+        (),
+        {
+            "api_client": window.api_client,
+            "vision_api_client": None,
+            "visual_context_api_client": None,
+        },
+    )()
+    window.memory_store = MemoryStoreStub()
+    window.memory_curator = MemoryCuratorStub()
+    window._llm_event_emitter = emit_event
+
+    profiles = [
+        ApiConfigProfile("chat", "Chat", "https://chat.example.com/v1", "chat-key", ("chat-model",)),
+        ApiConfigProfile(
+            "vision", "Vision", "https://vision.example.com/v1", "vision-key", ("vision-model",)
+        ),
+        ApiConfigProfile(
+            "visual", "Visual", "https://visual.example.com/v1", "visual-key", ("visual-model",)
+        ),
+        ApiConfigProfile(
+            "memory", "Memory", "https://memory.example.com/v1", "memory-key", ("memory-model",)
+        ),
+    ]
+    selection = ModelSelectionSettings(
+        chat=ModelSlotSelection("chat", "chat-model"),
+        vision_chat=ModelSlotSelection("vision", "vision-model"),
+        visual_context=ModelSlotSelection("visual", "visual-model"),
+        memory_curation=ModelSlotSelection("memory", "memory-model"),
+    )
+
+    _update_runtime_api_clients(
+        window,
+        api_profiles=profiles,
+        model_selection=selection,
+        base_settings=window.api_client.settings,
+    )
+
+    assert window.agent_runtime.api_client._event_emit is emit_event
+    assert window.agent_runtime.vision_api_client._event_emit is emit_event
+    assert window.agent_runtime.visual_context_api_client._event_emit is emit_event
+    assert window.memory_curator.api_client._event_emit is emit_event
+
+
 def test_show_settings_saves_and_applies_runtime_loop_settings(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
@@ -8525,6 +8600,36 @@ def test_proactive_care_event_includes_recent_conversation() -> None:
     assert PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER not in str(
         event.payload["recent_conversation"]
     )
+
+
+def test_screen_awareness_visual_job_uses_recent_conversation_as_focus() -> None:
+    from app.ui.pet_window import _build_screen_awareness_visual_observation_jobs
+
+    event = AgentEvent(
+        type="screen_awareness_check",
+        payload={
+            "recent_conversation": [
+                {"role": "user", "content": "第一条太旧"},
+                {"role": "assistant", "content": "我在看设置页。"},
+                {"role": "user", "content": "帮我看看模型配置哪里不对"},
+            ],
+            "screen_contexts": [
+                {
+                    "data_url": "data:image/jpeg;base64,abc",
+                    "width": 800,
+                    "height": 600,
+                    "captured_at": "2026-06-01T08:20:19+08:00",
+                    "screen_name": "DISPLAY1",
+                }
+            ],
+        },
+    )
+
+    jobs = _build_screen_awareness_visual_observation_jobs(event)
+
+    assert len(jobs) == 1
+    assert "最近对话" in jobs[0].user_text
+    assert "帮我看看模型配置哪里不对" in jobs[0].user_text
 
 
 def test_proactive_care_event_reads_recent_conversation_from_history_store() -> None:
@@ -10483,6 +10588,7 @@ def test_tts_test_worker_closes_provider_after_failure(monkeypatch) -> None:  # 
 
 def _minimal_settings_window(pet_window_cls, settings_service, api_client, memory_store):  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
+    from app.config.models import ModelSelectionSettings
 
     class CharacterProfileStub:
         id = "sakura"
@@ -10568,6 +10674,11 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
 
         def _save_system_config_values(self, section, values):  # type: ignore[no-untyped-def]
             self.settings_service.save_system_values(section, values)
+
+    if not hasattr(settings_service, "load_api_profiles"):
+        settings_service.load_api_profiles = lambda: []  # type: ignore[attr-defined]
+    if not hasattr(settings_service, "load_model_selection"):
+        settings_service.load_model_selection = ModelSelectionSettings  # type: ignore[attr-defined]
 
     window = MinimalSettingsWindow()
     window.settings_service = settings_service

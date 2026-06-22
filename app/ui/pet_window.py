@@ -89,7 +89,17 @@ from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.core.debug_log import debug_log, summarize_messages
+from app.config.model_slots import ResolvedModelSlot, resolve_model_slot
+from app.config.models import (
+    MODEL_SLOT_CHAT,
+    MODEL_SLOT_MEMORY_CURATION,
+    MODEL_SLOT_VISION_CHAT,
+    MODEL_SLOT_VISUAL_CONTEXT,
+    ApiConfigProfile,
+    ModelSelectionSettings,
+)
 from app.config.settings_service import BackchannelSettings, BubbleSettings, StartupSettings
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.backchannel.audio_cache import BackchannelAudioCache, voice_fingerprint
 from app.backchannel.classifier import RuleClassifier
 from app.backchannel.controller import BackchannelController
@@ -4436,11 +4446,10 @@ class PetWindow(QWidget):
         self.agent_runtime.set_context_providers(services.plugin_manager.context_providers)
         # 把插件事件总线接到工具执行与 LLM 请求链路，供插件订阅 tool.* / llm.request.*。
         emit_bus_event = getattr(services.plugin_manager, "emit_bus_event", None)
+        self._llm_event_emitter = emit_bus_event if callable(emit_bus_event) else None
         if callable(emit_bus_event):
             services.tool_registry.set_event_emitter(emit_bus_event)
-            api_client = getattr(self.agent_runtime, "api_client", None)
-            if api_client is not None and hasattr(api_client, "set_event_emitter"):
-                api_client.set_event_emitter(emit_bus_event)
+        _wire_runtime_llm_event_emitters(self, self._llm_event_emitter)
         self.mcp_tool_provider = services.mcp_tool_provider
         self.plugin_manager = services.plugin_manager
         self._wire_plugin_service_backends()
@@ -5105,6 +5114,8 @@ class PetWindow(QWidget):
             on_prepare_secondary_window=self._prepare_secondary_window,
             on_present_secondary_window=self._present_registered_secondary_window,
             on_release_secondary_window=self._release_secondary_window,
+            api_profiles=self.settings_service.load_api_profiles(),
+            model_selection=self.settings_service.load_model_selection(),
         )
         self.settings_dialog = dialog
         # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮、不置顶。
@@ -5275,6 +5286,13 @@ class PetWindow(QWidget):
         try:
             if api_changed:
                 self.settings_service.save_api_settings(dialog.result_api_settings)
+            # 保存 API 配置集和模型选择（新格式）
+            api_profiles = getattr(dialog, "result_api_profiles", None)
+            model_selection = getattr(dialog, "result_model_selection", None)
+            if api_profiles is not None:
+                self.settings_service.save_api_profiles(api_profiles)
+            if model_selection is not None:
+                self.settings_service.save_model_selection(model_selection)
             self.settings_service.save_tts_settings(dialog.result_tts_settings)
             if should_write_character_theme:
                 save_character_theme(
@@ -5346,7 +5364,16 @@ class PetWindow(QWidget):
             )
             return
 
-        if api_changed:
+        # 更新 API client（新格式统一处理，替代旧 api_changed 块）
+        if api_profiles is not None and model_selection is not None:
+            _update_runtime_api_clients(
+                self,
+                api_profiles=api_profiles,
+                model_selection=model_selection,
+                base_settings=dialog.result_api_settings,
+            )
+        elif api_changed:
+            # 旧格式回退
             self.api_client.update_settings(dialog.result_api_settings)
             self.memory_store.reload_api_settings(dialog.result_api_settings, wait=False)
         self.agent_runtime.set_runtime_loop_settings(result_runtime_loop_settings)
@@ -6632,7 +6659,7 @@ def _build_screen_awareness_visual_observation_jobs(event: AgentEvent) -> list[V
         VisualObservationJob(
             id=generate_visual_observation_id(),
             source=SCREEN_AWARENESS_VISUAL_SOURCE,
-            user_text="主动屏幕感知上下文批次",
+            user_text=_screen_awareness_visual_user_text(event),
             screen_contexts=[
                 dict(context)
                 for context in screen_contexts
@@ -6640,6 +6667,25 @@ def _build_screen_awareness_visual_observation_jobs(event: AgentEvent) -> list[V
             ],
         )
     ]
+
+
+def _screen_awareness_visual_user_text(event: AgentEvent) -> str:
+    reason = _screen_awareness_text_value(event.payload.get("screen_observation_reason"))
+    if reason:
+        return reason
+    recent = event.payload.get("recent_conversation")
+    if not isinstance(recent, list):
+        return "主动屏幕感知上下文批次"
+    lines = ["主动屏幕感知上下文批次；最近对话："]
+    for item in recent[-4:]:
+        if not isinstance(item, dict):
+            continue
+        role = _screen_awareness_text_value(item.get("role"))
+        content = _screen_awareness_text_value(item.get("content"))
+        if role not in {"user", "assistant"} or not content:
+            continue
+        lines.append(f"- {role}: {_truncate_screen_awareness_recent_conversation_content(content, 160)}")
+    return "\n".join(lines) if len(lines) > 1 else "主动屏幕感知上下文批次"
 
 
 def _build_screen_awareness_recent_conversation(
@@ -7068,3 +7114,91 @@ def _set_macos_window_topmost(window_id: int, enabled: bool) -> None:
         ctypes.c_void_p(selector(b"setCollectionBehavior:")),
         collection_behavior,
     )
+
+
+def _update_runtime_api_clients(
+    window: Any,
+    *,
+    api_profiles: list[ApiConfigProfile],
+    model_selection: ModelSelectionSettings,
+    base_settings: ApiSettings,
+) -> None:
+    """运行时按功能槽位更新 API client。"""
+    chat_slot = resolve_model_slot(api_profiles, model_selection, MODEL_SLOT_CHAT, base_settings)
+    if chat_slot is None:
+        return
+
+    window.api_client.update_settings(chat_slot.settings)
+    window.memory_store.reload_api_settings(chat_slot.settings, wait=False)
+
+    vision_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_VISION_CHAT,
+        base_settings,
+    )
+    window.agent_runtime.vision_api_client = _client_for_explicit_slot(
+        vision_slot,
+        MODEL_SLOT_VISION_CHAT,
+    )
+
+    visual_context_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_VISUAL_CONTEXT,
+        base_settings,
+    )
+    window.agent_runtime.visual_context_api_client = _client_for_explicit_slot(
+        visual_context_slot,
+        MODEL_SLOT_VISUAL_CONTEXT,
+    )
+
+    memory_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_MEMORY_CURATION,
+        base_settings,
+    )
+    memory_curator = getattr(window, "memory_curator", None)
+    set_api_client = getattr(memory_curator, "set_api_client", None)
+    if callable(set_api_client):
+        set_api_client(
+            OpenAICompatibleClient(memory_slot.settings)
+            if memory_slot is not None
+            else window.api_client
+        )
+    _wire_runtime_llm_event_emitters(window, getattr(window, "_llm_event_emitter", None))
+
+
+def _client_for_explicit_slot(
+    resolved: ResolvedModelSlot | None,
+    slot: str,
+) -> OpenAICompatibleClient | None:
+    if resolved is None or resolved.source_slot != slot:
+        return None
+    return OpenAICompatibleClient(resolved.settings)
+
+
+def _wire_runtime_llm_event_emitters(
+    window: Any,
+    emitter: Callable[[str, dict[str, Any] | None], None] | None,
+) -> None:
+    runtime = getattr(window, "agent_runtime", None)
+    if runtime is not None:
+        for client in (
+            getattr(runtime, "api_client", None),
+            getattr(runtime, "vision_api_client", None),
+            getattr(runtime, "visual_context_api_client", None),
+        ):
+            _set_llm_event_emitter(client, emitter)
+    memory_curator = getattr(window, "memory_curator", None)
+    _set_llm_event_emitter(getattr(memory_curator, "api_client", None), emitter)
+
+
+def _set_llm_event_emitter(
+    client: Any,
+    emitter: Callable[[str, dict[str, Any] | None], None] | None,
+) -> None:
+    set_event_emitter = getattr(client, "set_event_emitter", None)
+    if callable(set_event_emitter):
+        set_event_emitter(emitter)
