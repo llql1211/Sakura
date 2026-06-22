@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -22,6 +23,42 @@ from tools.studio.character_doc import CARD_FILENAME, CharacterDoc
 
 class WorkspaceError(RuntimeError):
     """工作区操作失败。"""
+
+
+def _validate_package_local_paths(package_dir: Path) -> None:
+    manifest_path = package_dir / "character.json"
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkspaceError(f"角色清单无法读取：{manifest_path}") from exc
+    if not isinstance(raw, dict):
+        raise WorkspaceError(f"角色清单必须是 JSON 对象：{manifest_path}")
+
+    _check_local_path(package_dir, raw.get("card"), "角色卡")
+    portrait = raw.get("portrait")
+    if isinstance(portrait, dict):
+        _check_local_path(package_dir, portrait.get("default"), "默认立绘")
+        expressions = portrait.get("expressions")
+        if isinstance(expressions, dict):
+            for label, path_text in expressions.items():
+                _check_local_path(package_dir, path_text, f"{label} 表情立绘")
+    voice = raw.get("voice")
+    if isinstance(voice, dict):
+        _check_local_path(package_dir, voice.get("tone_refs"), "语气参考表")
+        _check_local_path(package_dir, voice.get("gpt_model"), "GPT 模型")
+        _check_local_path(package_dir, voice.get("sovits_model"), "SoVITS 模型")
+
+
+def _check_local_path(package_dir: Path, value: object, label: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        return
+    path = Path(value.strip().strip('"').strip("'"))
+    if path.is_absolute():
+        raise WorkspaceError(f"{label}不能使用绝对路径：{value}")
+    try:
+        (package_dir / path).resolve().relative_to(package_dir.resolve())
+    except ValueError as exc:
+        raise WorkspaceError(f"{label}不能指向角色包外：{value}") from exc
 
 
 class Workspace:
@@ -49,6 +86,7 @@ class Workspace:
             raise WorkspaceError(f"目录不是角色包（缺 character.json）：{src_dir}")
         pkg = self._prepare_empty_dir(src_dir.name)
         shutil.copytree(src_dir, pkg, dirs_exist_ok=True)
+        _validate_package_local_paths(pkg)
         return pkg, CharacterDoc.from_package_dir(pkg)
 
     def open_archive(self, archive_path: Path) -> tuple[Path, CharacterDoc]:
@@ -67,7 +105,9 @@ class Workspace:
 
     def validate(self, package_dir: Path) -> CharacterProfile:
         """用主项目的单包加载器校验，返回 CharacterProfile；失败抛 CharacterConfigError。"""
-        return _load_profile(Path(package_dir) / "character.json")
+        package_dir = Path(package_dir)
+        _validate_package_local_paths(package_dir)
+        return _load_profile(package_dir / "character.json")
 
     def export(
         self,

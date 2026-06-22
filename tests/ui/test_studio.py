@@ -28,6 +28,32 @@ def _studio_runtime_root(name: str) -> Path:
     return root
 
 
+
+def test_workspace_rejects_package_paths_outside_directory() -> None:
+    import json
+
+    from tools.studio.workspace import Workspace, WorkspaceError
+
+    root = _studio_runtime_root("studio_workspace_paths")
+    source = root / "source"
+    source.mkdir()
+    (root / "secret.md").write_text("secret", encoding="utf-8")
+    (source / "portrait.png").write_bytes(b"png")
+    (source / "character.json").write_text(
+        json.dumps(
+            {
+                "id": "source",
+                "display_name": "Source",
+                "card": "../secret.md",
+                "portrait": {"default": "portrait.png"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkspaceError, match="角色卡不能指向角色包外"):
+        Workspace(root / "workspace").open_directory(source)
+
 def test_studio_uses_eight_step_wizard_without_toolbar_actions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
