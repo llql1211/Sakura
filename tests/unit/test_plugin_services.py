@@ -6,6 +6,7 @@ from pathlib import Path
 import uuid
 
 from app.agent.tools import ToolRegistry
+from app.plugins.models import PERMISSION_MOBILE_CHAT
 from app.plugins.manager import PluginManager
 from app.plugins.services import PluginInputService, PluginServices
 from app.core.resource_manager import ResourceRegistry
@@ -41,6 +42,13 @@ def test_set_backends_wires_input_text_sink() -> None:
     services.set_backends(input_text_sink=received.append)
     services.input.set_input_text("从 services 进")
     assert received == ["从 services 进"]
+
+
+def test_mobile_service_requires_permission() -> None:
+    services = PluginServices()
+
+    assert services.for_plugin("plain").mobile is None
+    assert services.for_plugin("mobile", (PERMISSION_MOBILE_CHAT,)).mobile is services.mobile
 
 
 def test_plugin_reaches_input_sink_end_to_end() -> None:

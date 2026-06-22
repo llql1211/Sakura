@@ -24,6 +24,7 @@ from app.core.resource_manager import (
     ServiceResource,
     ThreadGroupResource,
 )
+from app.plugins.models import PERMISSION_MOBILE_CHAT
 
 
 class PluginUIService:
@@ -341,12 +342,17 @@ class ScopedPluginResourceService:
 class ScopedPluginServices:
     """单插件视角的宿主服务集合。"""
 
-    def __init__(self, services: "PluginServices", plugin_id: str) -> None:
+    def __init__(
+        self,
+        services: "PluginServices",
+        plugin_id: str,
+        permissions: tuple[str, ...] = (),
+    ) -> None:
         self.ui = services.ui
         self.tts = services.tts
         self.agent = services.agent
         self.input = services.input
-        self.mobile = services.mobile
+        self.mobile = services.mobile if PERMISSION_MOBILE_CHAT in permissions else None
         self.resources = services.resources.for_plugin(plugin_id)
 
 
@@ -391,6 +397,10 @@ class PluginServices:
         """宿主注入 App 级资源域。"""
         self.resources.set_resource_registry(registry)
 
-    def for_plugin(self, plugin_id: str) -> ScopedPluginServices:
+    def for_plugin(
+        self,
+        plugin_id: str,
+        permissions: tuple[str, ...] = (),
+    ) -> ScopedPluginServices:
         """构造绑定插件 ID 的服务视图，避免插件看到全局资源门面。"""
-        return ScopedPluginServices(self, plugin_id)
+        return ScopedPluginServices(self, plugin_id, permissions)

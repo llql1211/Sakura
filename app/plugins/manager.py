@@ -155,7 +155,10 @@ class PluginManager:
                 self.base_dir,
                 manifest,
                 event_bus=self._event_bus,
-                services=self._services.for_plugin(manifest.plugin_id),
+                services=self._services.for_plugin(
+                    manifest.plugin_id,
+                    manifest.permissions,
+                ),
             )
             _initialize_plugin(plugin, capability_registry, context)
             all_tool_contributions = list(capability_registry.tools)

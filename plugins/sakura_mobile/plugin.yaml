@@ -9,3 +9,4 @@ priority: 70
 permissions:
   - settings_panel
   - event.app
+  - mobile_chat
