@@ -281,6 +281,60 @@ def test_voice_model_picker_removes_previous_model(
     assert not old_model.exists()
     assert (models_dir / "new.ckpt").read_bytes() == b"new"
 
+
+def test_voice_model_panel_validates_model_extensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _qt_app()
+    _disable_audio_player(monkeypatch)
+
+    from tools.studio.panels.voice_panel import VoiceModelPanel
+
+    panel = VoiceModelPanel()
+    panel.enable_check.setChecked(True)
+    panel.gpt_edit.setText("voice/models/wrong.pth")
+    panel.sovits_edit.setText("voice/models/wrong.ckpt")
+
+    errors = panel.validate(CharacterDoc(id="test", display_name="测试"))
+
+    assert "GPT 模型 必须是 .ckpt 文件" in errors
+    assert "SoVITS 模型 必须是 .pth 文件" in errors
+
+
+def test_voice_model_picker_rejects_wrong_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _qt_app()
+    _disable_audio_player(monkeypatch)
+
+    from tools.studio.panels import voice_panel
+    from tools.studio.panels.voice_panel import VoiceModelPanel
+
+    package_dir = _studio_runtime_root("studio_voice_wrong_ext") / "character"
+    source_model = _studio_runtime_root("studio_voice_wrong_ext_source") / "bad.pth"
+    source_model.write_bytes(b"bad")
+    warnings = []
+
+    panel = VoiceModelPanel()
+    panel.bind_package_dir(package_dir)
+    monkeypatch.setattr(
+        voice_panel.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(source_model), ""),
+    )
+    monkeypatch.setattr(
+        voice_panel.QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: warnings.append(True),
+    )
+
+    panel._pick_gpt()
+
+    assert warnings == [True]
+    assert panel.gpt_edit.text() == ""
+    assert not (package_dir / "voice" / "models" / "bad.pth").exists()
+
+
 def test_portrait_panel_edits_portrait_description_tags() -> None:
     _qt_app()
 
