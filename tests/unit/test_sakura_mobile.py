@@ -52,6 +52,13 @@ def test_mobile_page_scrolls_to_bottom_after_history_load() -> None:
     assert "scrollChatToBottom();" in html[html.index("async function loadHistory()") : html.index("function readImage")]
 
 
+def test_mobile_page_refreshes_history_before_submit_message() -> None:
+    html = mobile_server._mobile_html("secret")
+    submit_handler = html[html.index("form.addEventListener('submit'") : html.index("loadCharacters().catch")]
+
+    assert submit_handler.index("await loadHistory();") < submit_handler.index("addMessage('user'")
+
+
 def test_mobile_page_writes_theme_variables() -> None:
     theme = ThemeSettings(
         primary_color="#112233",

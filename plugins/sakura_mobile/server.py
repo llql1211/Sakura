@@ -626,8 +626,9 @@ form.addEventListener('submit', async (event) => {{
   if (!value && !file) return;
   send.disabled = true;
   setStatus(thinkingText());
-  addMessage('user', value + (file ? '\\n（已附加图片）' : ''));
   try {{
+    await loadHistory();
+    addMessage('user', value + (file ? '\\n（已附加图片）' : ''));
     const imageData = await readImage(file);
     text.value = '';
     image.value = '';

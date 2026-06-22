@@ -4564,18 +4564,20 @@ class PetWindow(QWidget):
         return result
 
     def _mobile_chat_busy(self) -> bool:
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        is_reply_sequence_active = getattr(subtitle_controller, "is_reply_sequence_active", None)
+        reply_sequence_active = callable(is_reply_sequence_active) and bool(is_reply_sequence_active())
         return bool(
             self.worker_thread is not None
             or self._active_mobile_chat_request is not None
             or self._mobile_chat_requests
-            or self.memory_curation_thread is not None
             or self.active_reminder_id is not None
             or self.active_event_type
             or self.pending_tool_action is not None
             or self.pending_screen_observation_messages is not None
             or self.screen_observation_followup_in_progress
             or self.screen_observation_encode_thread is not None
-            or self.active_interaction_id
+            or reply_sequence_active
         )
 
     @Slot(object)
