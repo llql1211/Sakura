@@ -4657,7 +4657,10 @@ def test_settings_dialog_model_probe_keeps_current_input(monkeypatch) -> None:  
     dialog._handle_api_model_probe_success(["a-model", "b-model"])
 
     assert dialog.vision_model_combo.currentText() == "custom-model"
-    assert dialog.vision_model_combo.completer().completionModel().rowCount() == 2
+    assert [dialog.vision_model_combo.itemText(index) for index in range(dialog.vision_model_combo.count())] == [
+        "a-model",
+        "b-model",
+    ]
     dialog.deleteLater()
     app.processEvents()
 

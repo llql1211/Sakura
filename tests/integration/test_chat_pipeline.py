@@ -113,3 +113,70 @@ def test_chat_pipeline_injects_event_visual_contexts() -> None:
         assert "data:image" not in json.dumps(visual_context, ensure_ascii=False)
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_chat_pipeline_keeps_images_when_visual_context_is_added() -> None:
+    class Client:
+        def complete_raw(self, _system_prompt, _messages, **_kwargs):  # type: ignore[no-untyped-def]
+            return json.dumps(
+                {
+                    "summary": "截图里有一张设置页。",
+                    "visible_texts": ["模型设置"],
+                    "uncertain_texts": [],
+                    "notable_elements": ["设置卡片"],
+                    "confidence": 0.9,
+                    "sensitive_redacted": False,
+                },
+                ensure_ascii=False,
+            )
+
+    class Runtime(RuntimeStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.api_client = Client()
+            self.last_messages = []
+
+        def handle_user_message(self, messages, progress_callback=None, cancel_checker=None):  # type: ignore[no-untyped-def]
+            self.last_messages = messages
+            return super().handle_user_message(messages, progress_callback, cancel_checker)
+
+    runtime = Runtime()
+    path = Path("__pycache__") / "test_runtime" / f"visual_chat_{uuid.uuid4().hex}.jsonl"
+    try:
+        pipeline = ChatPipeline(
+            runtime,  # type: ignore[arg-type]
+            visual_observation_store=VisualObservationStore(path),
+        )
+        pipeline.run_user_message(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看看这张图"},
+                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,manual"}},
+                    ],
+                }
+            ],
+            visual_observation_jobs=[
+                VisualObservationJob(
+                    id="vis_chat",
+                    source="manual_selection",
+                    user_text="看看这张图",
+                    screen_contexts=[
+                        {
+                            "data_url": "data:image/jpeg;base64,manual",
+                            "width": 800,
+                            "height": 600,
+                            "captured_at": "2026-06-01T08:20:19+08:00",
+                            "screen_name": "manual-selection",
+                        }
+                    ],
+                )
+            ],
+        )
+
+        serialized = json.dumps(runtime.last_messages, ensure_ascii=False)
+        assert "data:image/jpeg;base64,manual" in serialized
+        assert "截图里有一张设置页" in serialized
+    finally:
+        path.unlink(missing_ok=True)
