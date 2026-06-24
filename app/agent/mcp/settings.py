@@ -26,6 +26,9 @@ _DESKTOP_MCP_BY_PLATFORM: dict[str, DesktopMCP] = {
     "win32": DesktopMCP(server_name="windows", label="Windows MCP"),
     "darwin": DesktopMCP(server_name="macos", label="macOS MCP"),
 }
+_DESKTOP_MCP_SERVER_NAMES = frozenset(
+    desktop.server_name for desktop in _DESKTOP_MCP_BY_PLATFORM.values()
+)
 
 
 def resolve_desktop_mcp(platform: str | None = None) -> DesktopMCP | None:
@@ -74,11 +77,16 @@ def apply_mcp_runtime_settings(
 
     normalized_settings = normalize_mcp_runtime_settings(settings)
     desktop = resolve_desktop_mcp()
-    if desktop is None:
-        return config
     servers = [
-        replace(server, enabled=normalized_settings.windows_enabled)
-        if server.name == desktop.server_name
+        replace(
+            server,
+            enabled=(
+                normalized_settings.windows_enabled
+                if desktop is not None and server.name == desktop.server_name
+                else False
+            ),
+        )
+        if server.name in _DESKTOP_MCP_SERVER_NAMES
         else server
         for server in config.servers
     ]

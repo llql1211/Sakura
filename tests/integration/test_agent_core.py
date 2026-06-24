@@ -1433,6 +1433,40 @@ servers:
     assert config.servers[0].enabled
 
 
+def test_mcp_runtime_settings_disables_builtin_desktop_servers_on_unsupported_platform(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr("app.agent.mcp.settings.resolve_desktop_mcp", lambda platform=None: None)
+
+    config_path = _runtime_root_path("mcp_runtime_unsupported_desktop") / "mcp.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        """
+enabled: true
+servers:
+  windows:
+    enabled: true
+    transport: stdio
+    command: python
+  macos:
+    enabled: true
+    transport: stdio
+    command: python
+  custom:
+    enabled: true
+    transport: stdio
+    command: python
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = apply_mcp_runtime_settings(
+        load_mcp_config(config_path),
+        MCPRuntimeSettings(windows_enabled=True),
+    )
+
+    enabled_by_name = {server.name: server.enabled for server in config.servers}
+    assert enabled_by_name == {"windows": False, "macos": False, "custom": True}
+
+
 def test_settings_service_saves_and_loads_experimental_windows_mcp() -> None:
     service = AppSettingsService(_runtime_root_path("mcp_runtime_save"))
 

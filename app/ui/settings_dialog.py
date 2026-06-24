@@ -206,6 +206,7 @@ class SettingsDialog(QDialog):
         self.bubble_settings = bubble_settings or BubbleSettings()
         self.backchannel_settings = (backchannel_settings or BackchannelSettings()).normalized()
         self.runtime_loop_settings = normalize_runtime_loop_settings(runtime_loop_settings)
+        self._initial_mcp_settings = mcp_settings or MCPRuntimeSettings()
         # 延迟导入避免与 app.agent 形成导入环（与 settings_service 一致）。
         from app.agent.memory_curator import MemoryCurationSettings as _MemoryCurationSettings
 
@@ -349,7 +350,7 @@ class SettingsDialog(QDialog):
                 "工具",
                 self._build_scrollable_tab(
                     ToolsSettingsPage(self).build(
-                        mcp_settings or MCPRuntimeSettings(),
+                        self._initial_mcp_settings,
                         self.runtime_loop_settings,
                         tools_tab_contributions or [],
                     )
@@ -2296,7 +2297,7 @@ class SettingsDialog(QDialog):
                 windows_enabled=(
                     self.windows_mcp_enabled_check.isChecked()
                     if getattr(self, "windows_mcp_enabled_check", None) is not None
-                    else False
+                    else self._initial_mcp_settings.windows_enabled
                 ),
             ),
             "runtime_loop_settings": RuntimeLoopSettings(

@@ -3620,7 +3620,7 @@ def test_settings_dialog_hides_desktop_mcp_option_when_platform_unsupported(monk
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
-    # 模拟无内置桌面控制 MCP 的平台（如 Linux）：不展示该选项，开关回落为 False。
+    # 模拟无内置桌面控制 MCP 的平台（如 Linux）：不展示该选项，保存时保留原偏好。
     monkeypatch.setattr(
         "app.ui.settings.pages.sections.resolve_desktop_mcp",
         lambda platform=None: None,
@@ -3641,12 +3641,12 @@ def test_settings_dialog_hides_desktop_mcp_option_when_platform_unsupported(monk
         base_dir=root,
         **_settings_dialog_character_kwargs(root),
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
-        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=True),
     )
 
     assert dialog.windows_mcp_enabled_check is None
     dialog.accept()
-    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=False)
+    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=True)
     dialog.deleteLater()
     app.processEvents()
 
