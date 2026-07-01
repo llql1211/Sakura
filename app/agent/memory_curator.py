@@ -142,6 +142,21 @@ class MemoryCurator:
         # 人格卡文本，作为第一人称整理 prompt 的基底；缺省时只用整理任务说明。
         self.system_prompt = (system_prompt or "").strip()
 
+    def set_system_prompt(self, system_prompt: str) -> None:
+        self.system_prompt = (system_prompt or "").strip()
+
+    def snapshot(
+        self,
+        *,
+        memory_store: MemoryStore | None = None,
+        system_prompt: str | None = None,
+    ) -> "MemoryCurator":
+        return MemoryCurator(
+            self.api_client,
+            memory_store or self.memory_store,
+            system_prompt=self.system_prompt if system_prompt is None else system_prompt,
+        )
+
     def curate_entries(
         self,
         entries: list[ChatHistoryEntry],
