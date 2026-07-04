@@ -41,7 +41,13 @@ class PetUiStateStore(QObject):
     def set_state(self, new_state: PetUiState, reason: str = "") -> None:
         if new_state == self._state:
             return
+        old_state = self._state
         self._state = new_state
+        log_event(
+            "UI",
+            "ui.state",
+            {"from": old_state.value, "to": new_state.value, "reason": reason},
+        )
         self.state_changed.emit(new_state)
 
     # ---- 语义化转移入口：调用点表达意图而不是状态值 ----
