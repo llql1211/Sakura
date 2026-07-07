@@ -145,6 +145,21 @@ class MemoryCurator:
     def set_api_client(self, api_client: Any) -> None:
         self.api_client = api_client
 
+    def set_system_prompt(self, system_prompt: str) -> None:
+        self.system_prompt = (system_prompt or "").strip()
+
+    def snapshot(
+        self,
+        *,
+        memory_store: MemoryStore | None = None,
+        system_prompt: str | None = None,
+    ) -> "MemoryCurator":
+        return MemoryCurator(
+            self.api_client,
+            memory_store or self.memory_store,
+            system_prompt=self.system_prompt if system_prompt is None else system_prompt,
+        )
+
     def curate_entries(
         self,
         entries: list[ChatHistoryEntry],

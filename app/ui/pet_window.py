@@ -4358,7 +4358,11 @@ class PetWindow(QWidget):
         self.memory_curation_mode = mode
         self.memory_curation_target_history_count = target_history_count
         self.memory_curation_consumed_turns = consumed_turns
-        worker = MemoryCurationWorker(self.memory_curator, entries)
+        worker_curator = self.memory_curator.snapshot(
+            memory_store=self.memory_store.scoped(self.character_profile.id),
+            system_prompt=self.system_prompt,
+        )
+        worker = MemoryCurationWorker(worker_curator, entries)
         self.resource_manager.spawn_qt_worker(
             worker,
             parent=self,
@@ -6364,6 +6368,7 @@ class PetWindow(QWidget):
         previous_character_id = self.character_profile.id
         self.character_profile = profile
         self.system_prompt = load_character_system_prompt(profile)
+        self.memory_curator.set_system_prompt(self.system_prompt)
         self.memory_store.set_scope(profile.id)
         self.agent_runtime.update_character(
             self.system_prompt,

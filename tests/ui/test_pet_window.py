@@ -75,6 +75,237 @@ class _DummyPortraitLabel:
         self.visible = True
 
 
+def test_apply_character_syncs_memory_curator_prompt(monkeypatch) -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    events: list[tuple[str, object]] = []
+
+    class ProfileStub:
+        id = "new-character"
+        display_name = "New Character"
+        initial_message = "你好"
+        reply_tones = ["calm"]
+        portrait_choices = ["default"]
+
+    class PreviousProfileStub:
+        id = "old-character"
+
+    class MemoryCuratorStub:
+        def set_system_prompt(self, system_prompt: str) -> None:
+            events.append(("curator_prompt", system_prompt))
+
+    class MemoryStoreStub:
+        def set_scope(self, scope: str) -> None:
+            events.append(("memory_scope", scope))
+
+    class AgentRuntimeStub:
+        def update_character(  # type: ignore[no-untyped-def]
+            self,
+            system_prompt,
+            reply_tones,
+            portrait_choices,
+            *,
+            character_id=None,
+            character_name=None,
+        ):
+            events.append(
+                (
+                    "runtime_character",
+                    (system_prompt, reply_tones, portrait_choices, character_id, character_name),
+                )
+            )
+
+        def set_history_store(self, history_store):  # type: ignore[no-untyped-def]
+            events.append(("history_store", history_store))
+
+    class TextSink:
+        def setText(self, text: str) -> None:
+            events.append(("label", text))
+
+        def setPlaceholderText(self, text: str) -> None:
+            events.append(("placeholder", text))
+
+    class PortraitControllerStub:
+        def set_profile(self, profile):  # type: ignore[no-untyped-def]
+            events.append(("portrait", profile.id))
+
+    class SubtitleControllerStub:
+        def cancel_reply_flow(self, initial_message: str) -> None:
+            events.append(("subtitle", initial_message))
+
+    class MinimalWindow:
+        _apply_character = PetWindow._apply_character
+
+        def setWindowTitle(self, title: str) -> None:
+            events.append(("title", title))
+
+        def _normal_input_placeholder_text(self, profile):  # type: ignore[no-untyped-def]
+            return f"Message {profile.display_name}"
+
+        def _portrait_anchor_global(self):  # type: ignore[no-untyped-def]
+            return "anchor"
+
+        def updatesEnabled(self) -> bool:
+            return True
+
+        def setUpdatesEnabled(self, enabled: bool) -> None:
+            events.append(("updates", enabled))
+
+        def _apply_pet_layout(self, *, anchor_global):  # type: ignore[no-untyped-def]
+            events.append(("layout", anchor_global))
+
+        def _load_backchannel_manifest_for(self, profile):  # type: ignore[no-untyped-def]
+            events.append(("backchannel", profile.id))
+
+        def _create_history_store(self, profile):  # type: ignore[no-untyped-def]
+            return f"history:{profile.id}"
+
+        def _create_runtime_event_log(self, profile):  # type: ignore[no-untyped-def]
+            return f"events:{profile.id}"
+
+        def _create_visual_observation_store(self, profile):  # type: ignore[no-untyped-def]
+            return f"visual:{profile.id}"
+
+        def _load_reply_history_from_store(self) -> None:
+            events.append(("reply_history", None))
+
+        def _collapse_auto_fit_bubble_height(self) -> None:
+            events.append(("collapse", None))
+
+        def _emit_plugin_event(self, event_type, payload, *, source):  # type: ignore[no-untyped-def]
+            events.append(("plugin", (event_type, payload, source)))
+
+    monkeypatch.setattr(
+        pet_window_module,
+        "load_character_system_prompt",
+        lambda _profile: "新角色人格卡",
+    )
+
+    window = MinimalWindow()
+    window.character_profile = PreviousProfileStub()
+    window.memory_curator = MemoryCuratorStub()
+    window.memory_store = MemoryStoreStub()
+    window.agent_runtime = AgentRuntimeStub()
+    window.name_label = TextSink()
+    window.input_edit = TextSink()
+    window.portrait_controller = PortraitControllerStub()
+    window.history_window = None
+    window.subtitle_controller = SubtitleControllerStub()
+    window.messages = ["旧消息"]
+
+    window._apply_character(ProfileStub())
+
+    assert window.system_prompt == "新角色人格卡"
+    assert ("curator_prompt", "新角色人格卡") in events
+    assert ("memory_scope", "new-character") in events
+    assert (
+        "runtime_character",
+        ("新角色人格卡", ["calm"], ["default"], "new-character", "New Character"),
+    ) in events
+
+
+def test_start_memory_curation_snapshots_prompt_and_scope() -> None:
+    from app.storage.chat_history import ChatHistoryEntry
+    from app.ui.pet_window import PetWindow
+
+    captured: dict[str, object] = {}
+
+    class ProfileStub:
+        id = "old-character"
+
+    class ScopedStoreStub:
+        def __init__(self, scope_id: str) -> None:
+            self.scope_id = scope_id
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.scope_id = "old-character"
+            self.scoped_calls: list[str] = []
+
+        def scoped(self, scope_id: str) -> ScopedStoreStub:
+            self.scoped_calls.append(scope_id)
+            return ScopedStoreStub(scope_id)
+
+        def set_scope(self, scope_id: str) -> None:
+            self.scope_id = scope_id
+
+    class CuratorStub:
+        def __init__(self, *, system_prompt: str, memory_store) -> None:  # type: ignore[no-untyped-def]
+            self.system_prompt = system_prompt
+            self.memory_store = memory_store
+
+        def snapshot(self, *, memory_store, system_prompt):  # type: ignore[no-untyped-def]
+            return CuratorStub(system_prompt=system_prompt, memory_store=memory_store)
+
+        def set_system_prompt(self, system_prompt: str) -> None:
+            self.system_prompt = system_prompt
+
+    class WorkerStub:
+        finished = object()
+        failed = object()
+        cancelled = object()
+
+        def __init__(self, curator, entries):  # type: ignore[no-untyped-def]
+            self.curator = curator
+            self.entries = entries
+            captured["worker"] = self
+
+    class ResourceManagerStub:
+        def spawn_qt_worker(self, worker, **kwargs):  # type: ignore[no-untyped-def]
+            captured["spawned_worker"] = worker
+            captured["spawn_kwargs"] = kwargs
+
+    class MinimalWindow:
+        _start_memory_curation = PetWindow._start_memory_curation
+
+        def _handle_memory_curation_finished(self, _result):  # type: ignore[no-untyped-def]
+            pass
+
+        def _handle_memory_curation_failed(self, _message):  # type: ignore[no-untyped-def]
+            pass
+
+        def _handle_memory_curation_cancelled(self):  # type: ignore[no-untyped-def]
+            pass
+
+        def _cleanup_memory_curation_worker(self):  # type: ignore[no-untyped-def]
+            pass
+
+    memory_store = MemoryStoreStub()
+    window = MinimalWindow()
+    window.memory_curation_thread = None
+    window.memory_curator = CuratorStub(
+        system_prompt="旧角色人格卡",
+        memory_store=memory_store,
+    )
+    window.memory_store = memory_store
+    window.character_profile = ProfileStub()
+    window.system_prompt = "旧角色人格卡"
+    window.resource_manager = ResourceManagerStub()
+
+    import app.ui.pet_window as pet_window_module
+
+    original_worker = pet_window_module.MemoryCurationWorker
+    pet_window_module.MemoryCurationWorker = WorkerStub
+    try:
+        window._start_memory_curation(
+            [ChatHistoryEntry("2026-06-01T10:00:00+08:00", "user", "旧角色对话")],
+            mode="auto",
+            target_history_count=1,
+            consumed_turns=1,
+        )
+    finally:
+        pet_window_module.MemoryCurationWorker = original_worker
+
+    memory_store.set_scope("new-character")
+    window.memory_curator.set_system_prompt("新角色人格卡")
+
+    worker = captured["worker"]
+    assert memory_store.scoped_calls == ["old-character"]
+    assert worker.curator.system_prompt == "旧角色人格卡"  # type: ignore[attr-defined]
+    assert worker.curator.memory_store.scope_id == "old-character"  # type: ignore[attr-defined]
+
+
 def test_renderer_replaces_default_portrait_suppresses_png_labels() -> None:
     from app.ui.pet_window import PetWindow
 
