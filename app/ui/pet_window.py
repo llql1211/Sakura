@@ -607,6 +607,7 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
+        self.memory_curation_character_id = ""
         self._auto_memory_curation_failure_attempts = 0
         self._suppress_auto_memory_curation_restart = False
         self.drag_anchor: QPoint | None = None
@@ -4384,11 +4385,13 @@ class PetWindow(QWidget):
     ) -> None:
         if not entries or self.memory_curation_thread is not None:
             return
+        character_id = self.character_profile.id
         log_event(
             "Memory",
             "启动记忆整理",
             {
                 "mode": mode,
+                "character_id": character_id,
                 "entry_count": len(entries),
                 "target_history_count": target_history_count,
                 "consumed_turns": consumed_turns,
@@ -4403,8 +4406,9 @@ class PetWindow(QWidget):
         self.memory_curation_mode = mode
         self.memory_curation_target_history_count = target_history_count
         self.memory_curation_consumed_turns = consumed_turns
+        self.memory_curation_character_id = character_id
         worker_curator = self.memory_curator.snapshot(
-            memory_store=self.memory_store.scoped(self.character_profile.id),
+            memory_store=self.memory_store.scoped(character_id),
             system_prompt=self.system_prompt,
         )
         worker = MemoryCurationWorker(worker_curator, entries)
@@ -4439,6 +4443,13 @@ class PetWindow(QWidget):
                 "consumed_turns": self.memory_curation_consumed_turns,
             },
         )
+        if _memory_curation_character_changed(self):
+            log_event(
+                "Memory",
+                "记忆整理完成但角色已切换，跳过进度写入",
+                _memory_curation_character_payload(self),
+            )
+            return
         self.memory_curation_state.mark_processed(
             self.memory_curation_target_history_count,
             consumed_turns=self.memory_curation_consumed_turns,
@@ -4466,6 +4477,20 @@ class PetWindow(QWidget):
         )
         if mode == "auto" and attempt >= MAX_AUTO_RETRY_ATTEMPTS:
             consumed_turns = max(0, int(self.memory_curation_consumed_turns))
+            if _memory_curation_character_changed(self):
+                log_event(
+                    "Memory",
+                    "自动记忆整理连续失败但角色已切换，跳过当前角色进度消费",
+                    {
+                        **_memory_curation_character_payload(self),
+                        "attempt": attempt,
+                        "max_attempts": MAX_AUTO_RETRY_ATTEMPTS,
+                        "consumed_turns": consumed_turns,
+                        "error": message,
+                    },
+                )
+                self._auto_memory_curation_failure_attempts = 0
+                return
             self.memory_curation_state.consume_pending_turns(consumed_turns)
             self._suppress_auto_memory_curation_restart = True
             self._auto_memory_curation_failure_attempts = 0
@@ -4487,6 +4512,7 @@ class PetWindow(QWidget):
         self.memory_curation_mode = ""
         self.memory_curation_target_history_count = 0
         self.memory_curation_consumed_turns = 0
+        self.memory_curation_character_id = ""
         if getattr(self, "_shutdown_in_progress", False):
             return
         if getattr(self, "_suppress_auto_memory_curation_restart", False):
@@ -6518,6 +6544,25 @@ class PetWindow(QWidget):
         from app.core.bootstrap import create_visual_observation_store
 
         return create_visual_observation_store(self.base_dir, profile)
+
+
+def _memory_curation_character_changed(window: object) -> bool:
+    started_character_id = str(getattr(window, "memory_curation_character_id", "") or "")
+    current_profile = getattr(window, "character_profile", None)
+    current_character_id = str(getattr(current_profile, "id", "") or "")
+    return bool(
+        started_character_id
+        and current_character_id
+        and started_character_id != current_character_id
+    )
+
+
+def _memory_curation_character_payload(window: object) -> dict[str, str]:
+    current_profile = getattr(window, "character_profile", None)
+    return {
+        "curation_character_id": str(getattr(window, "memory_curation_character_id", "") or ""),
+        "current_character_id": str(getattr(current_profile, "id", "") or ""),
+    }
 
 
 def _build_screen_observation_disabled_result() -> AgentResult:

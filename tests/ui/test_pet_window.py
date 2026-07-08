@@ -1028,6 +1028,64 @@ def test_auto_memory_curation_success_resets_failure_count(tmp_path) -> None:  #
     assert snapshot["pending_turns"] == 0
 
 
+def test_auto_memory_curation_finish_after_character_switch_skips_progress(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from app.agent.memory_curator import MemoryCurationResult
+
+    window = _build_memory_retry_window(tmp_path)
+    window.memory_curation_state.mark_processed(12)
+    for _ in range(3):
+        window.memory_curation_state.increment_pending_turns()
+    window._auto_memory_curation_failure_attempts = 2
+    window._suppress_auto_memory_curation_restart = True
+    window.memory_curation_mode = "auto"
+    window.memory_curation_target_history_count = 8
+    window.memory_curation_consumed_turns = 3
+    window.memory_curation_character_id = "character-a"
+    window.character_profile = type("Profile", (), {"id": "character-b"})()
+
+    window._handle_memory_curation_finished(MemoryCurationResult(processed_entries=3))
+
+    snapshot = window.memory_curation_state.snapshot()
+    assert window._auto_memory_curation_failure_attempts == 0
+    assert window._suppress_auto_memory_curation_restart is False
+    assert snapshot["processed_history_count"] == 12
+    assert snapshot["pending_turns"] == 3
+
+
+def test_auto_memory_curation_third_failure_after_character_switch_keeps_pending(
+    monkeypatch,
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+
+    timers = []
+    monkeypatch.setattr(
+        pet_window_module.QTimer,
+        "singleShot",
+        lambda delay, callback: timers.append((delay, callback)),
+    )
+    window = _build_memory_retry_window(tmp_path)
+    window.memory_curation_state.mark_processed(12)
+    for _ in range(9):
+        window.memory_curation_state.increment_pending_turns()
+    window._auto_memory_curation_failure_attempts = 2
+    window.memory_curation_mode = "auto"
+    window.memory_curation_consumed_turns = 9
+    window.memory_curation_character_id = "character-a"
+    window.character_profile = type("Profile", (), {"id": "character-b"})()
+
+    window._handle_memory_curation_failed("insufficient_user_quota")
+    window._cleanup_memory_curation_worker()
+
+    snapshot = window.memory_curation_state.snapshot()
+    assert snapshot["processed_history_count"] == 12
+    assert snapshot["pending_turns"] == 9
+    assert window._auto_memory_curation_failure_attempts == 0
+    assert window.memory_curation_character_id == ""
+    assert window.subtitle_controller.messages == []
+    assert len(timers) == 1
+
+
 def test_auto_memory_curation_can_start_after_next_trigger_turns(
     monkeypatch,
     tmp_path,

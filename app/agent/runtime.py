@@ -540,6 +540,7 @@ class AgentRuntime:
                 browser_page_mode=browser_page_guard_active,
                 visible_browser_mode=visible_browser_guard_active,
             )
+            request_client = self._client_for_messages(working_messages)
             try:
                 planning_started_at = time.perf_counter()
                 tool_names = [
@@ -590,7 +591,7 @@ class AgentRuntime:
                 )
                 self._record_prompt_inspection(prompt_build.inspection)
                 dialogue_temperature, dialogue_extra_params = self._resolve_dialogue_params()
-                turn = self._client_for_messages(working_messages).complete_with_tools(
+                turn = request_client.complete_with_tools(
                     prompt_build.system_prompt,
                     working_messages,
                     tools=tool_defs,
@@ -616,7 +617,7 @@ class AgentRuntime:
                         actions=emitted_actions,
                     )
                 if execution_results and _is_function_response_name_missing_error(exc):
-                    model = _api_client_model(self.api_client)
+                    model = _api_client_model(request_client)
                     if model:
                         self._native_tool_results_blocked_models.add(model)
                     log_event(
@@ -624,13 +625,11 @@ class AgentRuntime:
                         "原生工具结果回填不被端点接受，改用文本工具结果总结",
                         {"error": str(exc), "tool_result_count": len(execution_results)},
                     )
-                    working_messages = [
-                        *messages,
-                        _build_tool_results_message(
-                            execution_results,
-                            include_images=self.model_vision_enabled,
-                        ),
-                    ]
+                    working_messages = _build_text_tool_summary_messages(
+                        messages,
+                        execution_results,
+                        include_images=self.model_vision_enabled,
+                    )
                     use_text_tool_summary = True
                     break
                 raise
@@ -917,20 +916,19 @@ class AgentRuntime:
             if not step_results:
                 break
 
-            model = _api_client_model(self.api_client)
+            next_working_messages = [*working_messages, turn.message, *tool_messages]
+            next_request_client = self._client_for_messages(next_working_messages)
+            model = _api_client_model(next_request_client)
             if model and model in self._native_tool_results_blocked_models:
-                working_messages = [
-                    *messages,
-                    _build_tool_results_message(
-                        execution_results,
-                        include_images=self.model_vision_enabled,
-                    ),
-                ]
+                working_messages = _build_text_tool_summary_messages(
+                    messages,
+                    execution_results,
+                    include_images=self.model_vision_enabled,
+                )
                 use_text_tool_summary = True
                 break
 
-            working_messages.append(turn.message)
-            working_messages.extend(tool_messages)
+            working_messages = next_working_messages
             # 本步若写过记忆，下一步重新执行相关记忆召回。
             if any(
                 getattr(result, "tool_name", "") in {"memory_remember", "memory_forget"}
@@ -980,7 +978,11 @@ class AgentRuntime:
                 try:
                     final_reply, final_visual_observation = self._complete_final_reply_with_chat(
                         self._build_final_reply_prompt(),
-                        working_messages,
+                        _build_text_tool_summary_messages(
+                            messages,
+                            execution_results,
+                            include_images=self.model_vision_enabled,
+                        ),
                         cancel_checker=cancel_checker,
                     )
                 except OperationCancelled:
@@ -1801,6 +1803,18 @@ def _build_tool_results_message(
         for image_url in images
     )
     return {"role": "user", "content": content}
+
+
+def _build_text_tool_summary_messages(
+    messages: list[ChatMessage],
+    results: list[ToolExecutionResult],
+    *,
+    include_images: bool = False,
+) -> list[ChatMessage]:
+    return [
+        *messages,
+        _build_tool_results_message(results, include_images=include_images),
+    ]
 
 
 def _build_confirmed_action_result_message(

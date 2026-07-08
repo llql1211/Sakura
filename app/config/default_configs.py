@@ -144,14 +144,14 @@ def _backfill_mcp_config(path: Path) -> None:
     try:
         import yaml
     except ImportError as exc:
-        debug_log("Config", "默认 MCP 配置补齐失败", {"path": str(path), "error": str(exc)})
+        log_event("Config", "默认 MCP 配置补齐失败", {"path": str(path), "error": str(exc)})
         return
 
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
         defaults = yaml.safe_load(_DEFAULT_MCP_YAML)
     except (OSError, yaml.YAMLError) as exc:
-        debug_log("Config", "默认 MCP 配置补齐失败", {"path": str(path), "error": str(exc)})
+        log_event("Config", "默认 MCP 配置补齐失败", {"path": str(path), "error": str(exc)})
         return
     if not isinstance(data, dict) or not isinstance(defaults, dict):
         return
@@ -173,4 +173,4 @@ def _backfill_mcp_config(path: Path) -> None:
             backup=True,
         )
     except OSError as exc:
-        debug_log("Config", "默认 MCP 配置补齐失败", {"path": str(path), "error": str(exc)})
+        log_event("Config", "默认 MCP 配置补齐失败", {"path": str(path), "error": str(exc)})

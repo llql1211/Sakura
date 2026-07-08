@@ -193,7 +193,7 @@ class PluginMobileService:
         try:
             return _theme_mapping(self._theme_sink())
         except Exception as exc:  # noqa: BLE001
-            debug_log("PluginMobileService", "读取移动端主题失败，使用默认主题", {"error": str(exc)})
+            log_event("PluginMobileService", "读取移动端主题失败，使用默认主题", {"error": str(exc)})
             return _default_theme_mapping()
 
 
