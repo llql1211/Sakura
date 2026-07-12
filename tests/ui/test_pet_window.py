@@ -2306,6 +2306,10 @@ def test_pet_window_context_menu_opens_on_right_release_not_press() -> None:
 
         def __init__(self) -> None:
             self.context_menu_positions: list[object] = []
+            self._using_system_drag = False
+
+        def windowHandle(self):  # type: ignore[no-untyped-def]
+            return None
 
         def _show_context_menu(self, position) -> None:  # type: ignore[no-untyped-def]
             self.context_menu_positions.append(position)
@@ -2428,11 +2432,15 @@ def test_pet_window_drag_uses_window_local_anchor_not_frame_geometry() -> None:
         def __init__(self) -> None:
             self.drag_anchor = None
             self._dragging = False
+            self._using_system_drag = False
             self.input_bar_animator = _DragAnimatorStub()
             self.move_positions: list[object] = []
 
         def frameGeometry(self):  # type: ignore[no-untyped-def]
             raise AssertionError("拖拽不应依赖 frameGeometry")
+
+        def windowHandle(self):  # type: ignore[no-untyped-def]
+            return None  # 非 QWidget 环境，回退 self.move 路径
 
         def move(self, position) -> None:  # type: ignore[no-untyped-def]
             self.move_positions.append(position)
@@ -2504,8 +2512,12 @@ def test_pet_window_drag_maps_child_widget_anchor_to_window_coordinates() -> Non
         def __init__(self) -> None:
             self.drag_anchor = None
             self._dragging = False
+            self._using_system_drag = False
             self.input_bar_animator = _DragAnimatorStub()
             self.move_positions: list[object] = []
+
+        def windowHandle(self):  # type: ignore[no-untyped-def]
+            return None
 
         def mapFromGlobal(self, position):  # type: ignore[no-untyped-def]
             return position - qtcore.QPoint(100, 80)
@@ -2523,6 +2535,243 @@ def test_pet_window_drag_maps_child_widget_anchor_to_window_coordinates() -> Non
 
     assert window._handle_mouse_move(move_event) is True
     assert window.move_positions == [qtcore.QPoint(240, 165)]
+
+
+def test_pet_window_drag_uses_start_system_move_when_window_handle_supports() -> None:  # type: ignore[no-untyped-def]
+    """验证当 windowHandle 支持 startSystemMove 时优先走系统拖拽、不调用 self.move()."""
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    from app.ui.pet_window import PetWindow
+
+    class MouseEventStub:
+        accepted = False
+
+        def __init__(self, position, global_position, buttons=None):  # type: ignore[no-untyped-def]
+            self._position = qtcore.QPointF(*position)
+            self._global_position = qtcore.QPointF(*global_position)
+            self._buttons = buttons or qtcore.Qt.MouseButton.LeftButton
+
+        def button(self):  # type: ignore[no-untyped-def]
+            return qtcore.Qt.MouseButton.LeftButton
+
+        def buttons(self):  # type: ignore[no-untyped-def]
+            return self._buttons
+
+        def position(self):  # type: ignore[no-untyped-def]
+            return self._position
+
+        def globalPosition(self):  # type: ignore[no-untyped-def]
+            return self._global_position
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    class _WindowHandleStub:
+        def __init__(self) -> None:
+            self.system_move_called = False
+
+        def startSystemMove(self) -> bool:
+            self.system_move_called = True
+            return True
+
+    class _DragAnimatorStub:
+        def __init__(self) -> None:
+            self.suspend_called = False
+
+        def suspend_for_drag(self) -> None:
+            self.suspend_called = True
+
+        def resume_after_drag(self) -> None:
+            pass
+
+    class MinimalWindow:
+        _handle_mouse_press = PetWindow._handle_mouse_press
+        _handle_mouse_move = PetWindow._handle_mouse_move
+        _drag_anchor_from_event = PetWindow._drag_anchor_from_event
+        _clear_input_focus_for_pet_interaction = PetWindow._clear_input_focus_for_pet_interaction
+
+        def __init__(self) -> None:
+            self.drag_anchor = None
+            self._dragging = False
+            self._using_system_drag = False
+            self.input_bar_animator = _DragAnimatorStub()
+            self.window_handle = _WindowHandleStub()
+            self.move_positions: list[object] = []
+
+        def windowHandle(self):  # type: ignore[no-untyped-def]
+            return self.window_handle
+
+        def move(self, position) -> None:  # type: ignore[no-untyped-def]
+            self.move_positions.append(position)
+
+        def _finish_drag_resume(self) -> None:
+            pass
+
+        def _check_system_drag_timeout(self) -> None:
+            """测试桩：不依赖 QTimer，直接清理。"""
+            if not self._using_system_drag:
+                return
+            self._using_system_drag = False
+            self._dragging = False
+            self._finish_drag_resume()
+
+    window = MinimalWindow()
+    press_event = MouseEventStub(position=(40, 60), global_position=(240, 160))
+    move_event = MouseEventStub(position=(45, 65), global_position=(300, 220))
+    second_move = MouseEventStub(position=(50, 70), global_position=(320, 260))
+
+    # Press → anchor 正确记录
+    assert window._handle_mouse_press(press_event) is True
+    assert window.drag_anchor == qtcore.QPoint(40, 60)
+    assert not window.window_handle.system_move_called
+    assert not window._using_system_drag
+    assert not window._dragging
+    assert window.input_bar_animator.suspend_called is False
+
+    # 首次 Move → 触发 startSystemMove，不调用 self.move()
+    assert window._handle_mouse_move(move_event) is True
+    assert window.window_handle.system_move_called
+    assert window._using_system_drag
+    assert window._dragging
+    assert window.input_bar_animator.suspend_called
+    assert window.move_positions == []
+
+    # 后续 Move（_using_system_drag 已置位）→ 跳过 self.move()
+    assert window._handle_mouse_move(second_move) is True
+    assert window.move_positions == []
+
+
+def test_pet_window_new_press_recovers_stale_system_drag_suspension() -> None:  # type: ignore[no-untyped-def]
+    """验证旧系统拖拽缺失 release 时，新交互会先恢复挂起的输入栏。"""
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    from app.ui.pet_window import PetWindow
+
+    class MouseEventStub:
+        accepted = False
+
+        def button(self):  # type: ignore[no-untyped-def]
+            return qtcore.Qt.MouseButton.LeftButton
+
+        def position(self):  # type: ignore[no-untyped-def]
+            return qtcore.QPointF(12, 18)
+
+        def globalPosition(self):  # type: ignore[no-untyped-def]
+            return qtcore.QPointF(112, 118)
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self._suspended = True
+            self.resume_calls = 0
+
+        def resume_after_drag(self) -> None:
+            if not self._suspended:
+                return
+            self._suspended = False
+            self.resume_calls += 1
+
+    class MinimalWindow:
+        _handle_mouse_press = PetWindow._handle_mouse_press
+        _drag_anchor_from_event = PetWindow._drag_anchor_from_event
+        _clear_input_focus_for_pet_interaction = PetWindow._clear_input_focus_for_pet_interaction
+        _finish_drag_resume = PetWindow._finish_drag_resume
+
+        def __init__(self) -> None:
+            self.drag_anchor = qtcore.QPoint(1, 1)
+            self._dragging = True
+            self._using_system_drag = True
+            self._drag_release_pending = True
+            self.input_bar_animator = AnimatorStub()
+
+    window = MinimalWindow()
+    event = MouseEventStub()
+
+    assert window._handle_mouse_press(event) is True
+    assert window.input_bar_animator.resume_calls == 1
+    assert window.input_bar_animator._suspended is False
+    assert window._using_system_drag is False
+    assert window._dragging is False
+    assert window._drag_release_pending is False
+    assert window.drag_anchor == qtcore.QPoint(12, 18)
+
+
+def test_pet_window_late_release_after_system_drag_timeout_is_not_click(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """验证看门狗完成拖拽后补发的 release 不会被误判为单击。"""
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    scheduled_callbacks: list[tuple[int, object]] = []
+
+    class ApplicationStub:
+        @staticmethod
+        def instance():  # type: ignore[no-untyped-def]
+            return None
+
+    class MouseEventStub:
+        accepted = False
+
+        def button(self):  # type: ignore[no-untyped-def]
+            return qtcore.Qt.MouseButton.LeftButton
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self._suspended = True
+            self.resume_calls = 0
+
+        def resume_after_drag(self) -> None:
+            if not self._suspended:
+                return
+            self._suspended = False
+            self.resume_calls += 1
+
+    class MinimalWindow:
+        _check_system_drag_timeout = PetWindow._check_system_drag_timeout
+        _handle_mouse_release = PetWindow._handle_mouse_release
+        _finish_drag_resume = PetWindow._finish_drag_resume
+
+        def __init__(self) -> None:
+            self.drag_anchor = qtcore.QPoint(20, 30)
+            self._dragging = True
+            self._using_system_drag = True
+            self._drag_release_pending = True
+            self.input_bar_animator = AnimatorStub()
+            self.pet_clicks = 0
+
+        def _handle_pet_click(self) -> None:
+            self.pet_clicks += 1
+
+    monkeypatch.setattr(pet_window_module, "QApplication", ApplicationStub)
+    monkeypatch.setattr(
+        pet_window_module.QTimer,
+        "singleShot",
+        lambda delay, callback: scheduled_callbacks.append((delay, callback)),
+    )
+
+    window = MinimalWindow()
+    window._check_system_drag_timeout()
+
+    assert window._dragging is False
+    assert window._using_system_drag is False
+    assert window._drag_release_pending is True
+    assert window.drag_anchor is None
+    assert len(scheduled_callbacks) == 1
+
+    event = MouseEventStub()
+    assert window._handle_mouse_release(event) is True
+    assert event.accepted
+    assert window.pet_clicks == 0
+    assert window._drag_release_pending is False
+
+    for _delay, callback in scheduled_callbacks:
+        callback()  # type: ignore[operator]
+    assert window.input_bar_animator.resume_calls == 1
 
 
 def test_pet_window_screen_change_restores_stage_geometry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -10005,6 +10254,7 @@ def test_cursor_in_pet_region_requires_exposed_pet_window(monkeypatch) -> None: 
         _cursor_in_pet_region = PetWindow._cursor_in_pet_region
         _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
         _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
+        _cursor_in_window = True
         always_on_top_enabled = True
 
         def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
@@ -10038,6 +10288,7 @@ def test_cursor_in_pet_region_accepts_exposed_child_widget(monkeypatch) -> None:
         _cursor_in_pet_region = PetWindow._cursor_in_pet_region
         _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
         _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
+        _cursor_in_window = True
         always_on_top_enabled = True
         settings_dialog = object()
         history_window = None
@@ -10081,6 +10332,7 @@ def test_cursor_in_pet_region_blocks_non_topmost_background_window(monkeypatch) 
         _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
         _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
         _is_pet_foreground_window = PetWindow._is_pet_foreground_window
+        _cursor_in_window = True
         always_on_top_enabled = False
 
         def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
@@ -10123,6 +10375,7 @@ def test_cursor_in_pet_region_allows_non_topmost_foreground_window(monkeypatch) 
         _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
         _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
         _is_pet_foreground_window = PetWindow._is_pet_foreground_window
+        _cursor_in_window = True
         always_on_top_enabled = False
 
         def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
