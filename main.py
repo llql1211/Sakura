@@ -32,6 +32,8 @@ from app.core.instance import SingleInstanceGuard
 from app.core.selfcheck import run_startup_self_check
 from app.storage.paths import StoragePaths
 from app.config.character_loader import CharacterConfigError, CharacterRegistry
+from app.config.model_slots import resolve_model_slot
+from app.config.models import MODEL_SLOT_CHAT
 from app.config.settings_service import AppSettingsService, StartupSettings
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
@@ -40,6 +42,16 @@ from app.platforms.launch_at_login import (
     set_launch_at_login_enabled,
 )
 from app.ui.pet_window import PetWindow
+from app.ui.control_panel_layout import (
+    DEFAULT_BUBBLE_HEIGHT,
+    DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+    DEFAULT_CONTROL_PANEL_WIDTH,
+    DEFAULT_INPUT_BAR_OFFSET,
+    normalize_bubble_height,
+    normalize_control_panel_vertical_offset,
+    normalize_control_panel_width,
+    normalize_input_bar_offset,
+)
 from app.ui.error_messages import format_failure_message
 from app.ui.tauri_settings import (
     TauriSettingsProcess,
@@ -48,8 +60,15 @@ from app.ui.tauri_settings import (
     tts_settings_from_tauri_result,
 )
 from app.ui.tauri_studio import TauriStudioProcess, resolve_tauri_studio_binary
-from app.ui.portrait_controller import PORTRAIT_SCALE_DEFAULT_PERCENT
-from app.ui.subtitle_controller import normalize_subtitle_display_speed
+from app.ui.portrait_controller import (
+    PORTRAIT_SCALE_DEFAULT_PERCENT,
+    normalize_portrait_scale_percent,
+)
+from app.ui.subtitle_controller import (
+    REPLY_SEGMENT_PAUSE_MS,
+    SPEECH_TYPING_INTERVAL_MS,
+    normalize_subtitle_display_speed,
+)
 from app.voice.tts_settings import TTSConfigError
 from app.voice.tts_bundle import (
     TTSBundleMigration,
@@ -434,31 +453,28 @@ def main() -> int:
             _format_data_migration_failure(migration_report),
         )
 
+    initial_setup = False
     try:
-        context = build_initial_app_context(BASE_DIR)
-    except CharacterConfigError as exc:
-        if not _character_packages_missing(BASE_DIR):
-            _write_startup_error("Character", f"配置无效：{exc}")
-            return 1
-        try:
+        initial_setup = _initial_setup_required(BASE_DIR)
+        if initial_setup:
             context = _open_first_run_settings(BASE_DIR)
-        except (CharacterConfigError, OSError, TTSConfigError, ValueError) as first_run_exc:
+        else:
+            context = build_initial_app_context(BASE_DIR)
+    except (CharacterConfigError, OSError, RuntimeError, TTSConfigError, ValueError) as exc:
+        if initial_setup:
             QMessageBox.critical(
                 None,
                 "启动失败",
                 format_failure_message(
                     "首次启动配置没有完成，Sakura 无法继续启动。",
                     "请检查角色包、TTS 配置和 data 目录权限后重试。",
-                    first_run_exc,
+                    exc,
                 ),
             )
-            _write_startup_error("Character", f"配置无效：{first_run_exc}")
-            return 1
-        if context is None:
-            return 0
-    except (OSError, ValueError) as exc:
         _write_startup_error("Character", f"配置无效：{exc}")
         return 1
+    if context is None:
+        return 0
 
     character_issues = getattr(context.character_registry, "load_errors", ())
     if character_issues:
@@ -495,6 +511,22 @@ def _character_packages_missing(base_dir: Path) -> bool:
         return not any(characters_dir.glob("*/character.json"))
     except OSError:
         return False
+
+
+def _initial_setup_required(base_dir: Path) -> bool:
+    if _character_packages_missing(base_dir):
+        return True
+    settings_service = AppSettingsService(base_dir=base_dir)
+    settings = settings_service.load_api_settings()
+    chat = resolve_model_slot(
+        settings_service.load_api_profiles(),
+        settings_service.load_model_selection(),
+        MODEL_SLOT_CHAT,
+        settings,
+    )
+    return chat is None or not all(
+        (chat.settings.base_url, chat.settings.api_key, chat.settings.model)
+    )
 
 
 def _ensure_launch_at_login_state(
@@ -572,6 +604,18 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         character_profile=None,
     )
     startup_settings = settings_service.load_startup_settings()
+    ui_settings = settings_service.load_system_values("ui")
+    subtitle_typing_interval_ms, reply_segment_pause_ms = normalize_subtitle_display_speed(
+        ui_settings.get("subtitle_typing_interval_ms", SPEECH_TYPING_INTERVAL_MS),
+        ui_settings.get("reply_segment_pause_ms", REPLY_SEGMENT_PAUSE_MS),
+    )
+    character_registry = None
+    current_character = None
+    if not _character_packages_missing(base_dir):
+        character_registry = CharacterRegistry(base_dir)
+        current_character = character_registry.get(
+            settings_service.load_current_character_id(character_registry)
+        )
 
     process = TauriSettingsProcess(
         base_dir=base_dir,
@@ -580,9 +624,28 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         runtime_loop_settings=settings_service.load_runtime_loop_settings(),
         debug_log_settings=settings_service.load_debug_log_settings(),
         theme_settings=settings_service.load_theme_settings(),
-        character_registry=None,
-        current_character=None,
-        portrait_scale_percent=PORTRAIT_SCALE_DEFAULT_PERCENT,
+        character_registry=character_registry,
+        current_character=current_character,
+        portrait_scale_percent=normalize_portrait_scale_percent(
+            ui_settings.get("portrait_scale_percent", PORTRAIT_SCALE_DEFAULT_PERCENT)
+        ),
+        control_panel_width=normalize_control_panel_width(
+            ui_settings.get("control_panel_width", DEFAULT_CONTROL_PANEL_WIDTH)
+        ),
+        bubble_height=normalize_bubble_height(
+            ui_settings.get("bubble_height", DEFAULT_BUBBLE_HEIGHT)
+        ),
+        control_panel_vertical_offset=normalize_control_panel_vertical_offset(
+            ui_settings.get(
+                "control_panel_vertical_offset",
+                DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+            )
+        ),
+        input_bar_offset=normalize_input_bar_offset(
+            ui_settings.get("input_bar_offset", DEFAULT_INPUT_BAR_OFFSET)
+        ),
+        subtitle_typing_interval_ms=subtitle_typing_interval_ms,
+        reply_segment_pause_ms=reply_segment_pause_ms,
         api_settings=api_settings,
         api_profiles=settings_service.load_api_profiles(),
         model_selection=settings_service.load_model_selection(),
@@ -591,6 +654,7 @@ def _open_first_run_settings(base_dir: Path) -> AppContext | None:
         launch_at_login_supported=is_launch_at_login_supported(),
         studio_launcher=lambda character_id: _open_first_run_studio(base_dir, character_id),
         model=getattr(api_settings, "model", None),
+        onboarding=True,
     )
 
     loop = QEventLoop()
