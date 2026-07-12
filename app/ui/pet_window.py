@@ -149,6 +149,7 @@ from app.ui.state import PetUiState, PetUiStateStore
 from app.ui.error_messages import format_failure_message
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
+    is_launch_at_login_enabled,
     is_launch_at_login_supported,
     set_launch_at_login_enabled,
 )
@@ -719,6 +720,7 @@ class PetWindow(QWidget):
         self.pet_hidden_at: float | None = None
         self._runtime_app_closed_logged = False
         self._shutdown_in_progress = False
+        self._quit_approved = False
         # 后台线程生命周期、lingering 线程与退役 wrapper 统一由资源管理器治理。
         self.resource_manager = ResourceManager(self, registry=context.resource_registry)
         self._register_runtime_service_resources()
@@ -1335,6 +1337,16 @@ class PetWindow(QWidget):
             suppress()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if getattr(self, "_quit_approved", False):
+            event.accept()
+            super().closeEvent(event)
+            return
+        event.ignore()
+        if self.request_quit():
+            event.accept()
+
+    @Slot()
+    def request_quit(self) -> bool:
         migration_thread = getattr(self, "tts_migration_thread", None)
         try:
             migration_running = bool(
@@ -1348,8 +1360,7 @@ class PetWindow(QWidget):
                 "TTS 数据迁移中",
                 "请等待 TTS 数据迁移完成后再退出 Sakura。",
             )
-            event.ignore()
-            return
+            return False
         if has_active_tts_bundle_download():
             reply = QMessageBox.question(
                 self,
@@ -1359,18 +1370,22 @@ class PetWindow(QWidget):
                 QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
+                return False
             if not cancel_active_tts_bundle_downloads_for_shutdown():
                 QMessageBox.information(
                     self,
                     "TTS 下载中",
                     "下载线程仍在停止，请稍后再退出 Sakura。",
                 )
-                event.ignore()
-                return
+                return False
+        self._quit_approved = True
         self.close_external_tools()
-        super().closeEvent(event)
+        application = QApplication.instance()
+        if application is not None:
+            application.quit()
+        else:
+            self.close()
+        return True
 
     @Slot()
     def close_external_tools(self) -> None:
@@ -1941,10 +1956,20 @@ class PetWindow(QWidget):
     ) -> Path | None:
         if not audio:
             return None
-        path = Path(audio)
-        if not path.is_absolute() and manifest is not None and manifest.source_path is not None:
-            path = manifest.source_path.parent / path
-        return path if path.exists() else None
+        raw_path = Path(audio)
+        if raw_path.is_absolute() or str(audio).startswith(("\\\\", "//")):
+            return None
+        if manifest is None or manifest.source_path is None:
+            return None
+        try:
+            profile = getattr(self, "character_profile", None)
+            package_dir = getattr(profile, "package_dir", manifest.source_path.parent)
+            package_root = Path(package_dir).resolve(strict=True)
+            path = (manifest.source_path.parent / raw_path).resolve(strict=True)
+            path.relative_to(package_root)
+        except (OSError, ValueError):
+            return None
+        return path if path.is_file() else None
 
     def _copy_backchannel_audio_for_playback(self, source: Path) -> Path | None:
         suffix = source.suffix or ".wav"
@@ -2687,6 +2712,7 @@ class PetWindow(QWidget):
             on_show_history=self.show_history,
             on_show_runtime_log=self.show_runtime_log,
             on_show_settings=self.show_settings,
+            on_quit=getattr(self, "request_quit", QApplication.quit),
         )
 
     def _refresh_tray_menu(self) -> None:
@@ -3052,6 +3078,8 @@ class PetWindow(QWidget):
         subtitle_controller = getattr(self, "subtitle_controller", None)
         if subtitle_controller is None:
             return
+        if subtitle_controller.is_reply_sequence_active():
+            subtitle_controller.cancel_reply_flow()
         start_waiting_indicator = getattr(subtitle_controller, "start_waiting_indicator", None)
         if callable(start_waiting_indicator):
             start_waiting_indicator()
@@ -3181,8 +3209,15 @@ class PetWindow(QWidget):
         self._apply_pending_action_from_result(result)
 
     def _queue_screen_observation_followup(self, result: AgentResult) -> bool:
-        if not any(action.type == SCREEN_OBSERVATION_REQUEST_ACTION for action in result.actions):
+        screen_action = next(
+            (action for action in result.actions if action.type == SCREEN_OBSERVATION_REQUEST_ACTION),
+            None,
+        )
+        if screen_action is None:
             return False
+        continuation_messages = screen_action.payload.get("continuation_messages", [])
+        if not isinstance(continuation_messages, list):
+            continuation_messages = []
         if (
             not self.screen_observation_enabled
             or not self.model_vision_enabled
@@ -3230,6 +3265,7 @@ class PetWindow(QWidget):
                 "kind": "chat_followup",
                 "user_message_index": user_message_index,
                 "text": text,
+                "continuation_messages": continuation_messages,
             },
         ):
             self.screen_observation_followup_in_progress = False
@@ -3244,6 +3280,9 @@ class PetWindow(QWidget):
     ) -> None:
         user_message_index = int(context.get("user_message_index", -1))
         text = str(context.get("text", ""))
+        continuation_messages = context.get("continuation_messages", [])
+        if not isinstance(continuation_messages, list):
+            continuation_messages = []
         if user_message_index < 0 or user_message_index >= len(self.messages):
             self.screen_observation_followup_in_progress = False
             self._consume_agent_result(_build_screen_observation_failed_result("缺少可关联的用户消息。"))
@@ -3268,8 +3307,9 @@ class PetWindow(QWidget):
         ]
         # 截图消息包含 base64，必须作为本次 follow-up 的最后一条消息保留。
         # 中间进度回复已经展示给用户，不再放入这次入模上下文，避免字符裁剪丢掉截图。
+        continuation_base = continuation_messages or self.messages[:user_message_index]
         self.pending_screen_observation_messages = trim_messages_for_model(
-            [*self.messages[:user_message_index], observed_message]
+            [*continuation_base, observed_message]
         )
         self.screen_observation_followup_in_progress = False
         log_event(
@@ -4145,13 +4185,14 @@ class PetWindow(QWidget):
             return
         if not self._memory_curation_can_start():
             return
-        entries = self.memory_curation_state.unprocessed_entries(self.history_store.load())
+        history_entries = self.history_store.load()
+        entries = self.memory_curation_state.unprocessed_entries(history_entries)
         if not entries:
             return
         self._start_memory_curation(
             entries,
             mode="auto",
-            target_history_count=len(self.history_store.load()),
+            target_history_count=len(history_entries),
             consumed_turns=self.memory_curation_state.pending_turns(),
         )
 
@@ -5250,6 +5291,13 @@ class PetWindow(QWidget):
             else current_startup_settings
         )
         startup_settings_changed = result_startup_settings != current_startup_settings
+        startup_external_before = current_startup_settings.launch_at_login
+        if startup_settings_changed:
+            try:
+                startup_external_before = is_launch_at_login_enabled(self.base_dir)
+            except (OSError, RuntimeError):
+                startup_external_before = current_startup_settings.launch_at_login
+        startup_external_attempted = False
         api_changed = result.api.settings != self.api_client.settings
         plugin_enabled_changed = False
         plugin_settings_changed = False
@@ -5332,13 +5380,14 @@ class PetWindow(QWidget):
                 persist=True,
                 raise_on_persist_error=True,
             )
-            if startup_settings_changed:
-                self.settings_service.save_startup_settings(result_startup_settings)
-                self._apply_launch_at_login_settings(result_startup_settings)
             plugin_settings_changed = apply_tauri_plugin_settings(
                 getattr(getattr(self, "plugin_manager", None), "plugin_settings", []),
                 result.plugins.settings_by_id,
             )
+            if startup_settings_changed:
+                self.settings_service.save_startup_settings(result_startup_settings)
+                startup_external_attempted = True
+                self._apply_launch_at_login_settings(result_startup_settings)
         except (CharacterConfigError, OSError, ValueError, RuntimeError) as exc:
             try:
                 _restore_config_files(config_snapshot)
@@ -5348,6 +5397,15 @@ class PetWindow(QWidget):
                     "Tauri 设置保存失败后回滚配置失败",
                     {"error": str(rollback_exc)},
                 )
+            if startup_external_attempted:
+                try:
+                    set_launch_at_login_enabled(self.base_dir, startup_external_before)
+                except (OSError, RuntimeError) as rollback_exc:
+                    debug_log(
+                        "Settings",
+                        "Tauri 设置保存失败后回滚登录自启动失败",
+                        {"error": str(rollback_exc)},
+                    )
             show_themed_critical(
                 self,
                 "保存失败",

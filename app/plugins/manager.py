@@ -43,7 +43,7 @@ from app.plugins.models import (
     ToolContribution,
 )
 from app.plugins.services import PluginServices
-from app.storage.paths import StoragePaths
+from app.storage.paths import StoragePaths, sanitize_file_stem
 
 
 OPENAI_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -86,6 +86,8 @@ class PluginManager:
     _active_plugins: list[tuple[PluginBase, PluginManifest]] = field(default_factory=list)
     _event_bus: PluginEventBus = field(default_factory=PluginEventBus)
     _services: PluginServices = field(default_factory=PluginServices)
+    _registered_tool_registry: ToolRegistry | None = None
+    _registered_tools: dict[str, Tool] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.resource_registry = self.resource_registry or ResourceRegistry()
@@ -111,14 +113,22 @@ class PluginManager:
 
     def load_all(self, tool_registry: ToolRegistry | None = None) -> list[PluginLoadResult]:
         """加载所有启用插件；传入 ToolRegistry 时同步注册工具贡献。"""
+        self.shutdown_all()
         specs = PluginDiscovery(self.base_dir).discover_enabled()
         results: list[PluginLoadResult] = []
         known_tool_names = _tool_names_from_registry(tool_registry)
         known_renderer_types: set[str] = set()
+        known_plugin_keys: dict[str, str] = {}
         self._plugins = []
         self._active_plugins = []
         for spec in specs:
-            result = self._load_one(spec, tool_registry, known_tool_names, known_renderer_types)
+            result = self._load_one(
+                spec,
+                tool_registry,
+                known_tool_names,
+                known_renderer_types,
+                known_plugin_keys,
+            )
             results.append(result)
             if result.loaded and result.capabilities is not None:
                 known_renderer_types.update(
@@ -141,6 +151,7 @@ class PluginManager:
         tool_registry: ToolRegistry | None,
         known_tool_names: set[str],
         known_renderer_types: set[str],
+        known_plugin_keys: dict[str, str],
     ) -> PluginLoadResult:
         result = PluginLoadResult(spec=spec)
         plugin: PluginBase | None = None
@@ -148,6 +159,12 @@ class PluginManager:
             plugin = _import_plugin(self.base_dir, spec)
             manifest = _build_manifest(plugin, spec)
             _validate_manifest(manifest)
+            plugin_key = sanitize_file_stem(manifest.plugin_id).casefold()
+            existing_plugin_id = known_plugin_keys.get(plugin_key)
+            if existing_plugin_id is not None:
+                raise ValueError(
+                    f"插件 id 与已加载插件发生冲突：{manifest.plugin_id} / {existing_plugin_id}"
+                )
             result.manifest = manifest
 
             capability_registry = PluginCapabilityRegistry()
@@ -188,7 +205,10 @@ class PluginManager:
             )
             if tool_registry is not None:
                 for contribution in capabilities.tools:
-                    tool_registry.register(_contribution_to_app_tool(contribution))
+                    app_tool = _contribution_to_app_tool(contribution)
+                    tool_registry.register(app_tool)
+                    self._registered_tool_registry = tool_registry
+                    self._registered_tools[contribution.name] = app_tool
                     known_tool_names.add(contribution.name)
             else:
                 known_tool_names.update(contribution.name for contribution in capabilities.tools)
@@ -196,6 +216,7 @@ class PluginManager:
             result.loaded = True
             self._plugins.append(plugin)
             self._active_plugins.append((plugin, manifest))
+            known_plugin_keys[plugin_key] = manifest.plugin_id
             log_event(
                 "PluginManager",
                 "插件已加载",
@@ -342,6 +363,13 @@ class PluginManager:
             )
             _shutdown_quietly(plugin)
             self._event_bus.remove_plugin(manifest.plugin_id)
+        registry = self._registered_tool_registry
+        if registry is not None:
+            for name, tool in list(self._registered_tools.items()):
+                registry.unregister(name, expected=tool)
+        self._registered_tool_registry = None
+        self._registered_tools.clear()
+        self._plugins = []
 
     @property
     def loaded_count(self) -> int:

@@ -118,7 +118,13 @@ class TTSPlaybackEndpoint(QObject):
         self._clear_pending_audio()
         if self._current_audio is not None:
             self._finish_current_audio("provider_closed")
+        self._release_sink_player()
         self._release_player_source()
+
+    def cancel_playback(self) -> None:
+        self._clear_pending_audio()
+        if self._current_audio is not None:
+            self._finish_current_audio("cancelled")
 
     def discard_prepared(self, handle: TTSPreparedAudio) -> None:
         """从播放队列移除指定预生成句柄并清理其临时音频。"""
@@ -264,7 +270,7 @@ class TTSPlaybackEndpoint(QObject):
 
     @Slot(object)
     def _run_callback(self, callback: TTSCallback | None) -> None:
-        if callback is None or _provider_is_closed(self):
+        if callback is None:
             return
         try:
             callback()
@@ -400,15 +406,7 @@ class TTSPlaybackEndpoint(QObject):
         if audio_path is None:
             return
 
-        # 销毁旧 sink player
-        if self._sink_player is not None:
-            try:
-                self._sink_player.finished.disconnect()
-                self._sink_player.started.disconnect()
-                self._sink_player.error.disconnect()
-            except Exception:
-                pass
-            self._sink_player = None
+        self._release_sink_player()
 
         self._sink_player = _create_audio_sink_player(self)
         self._sink_player.started.connect(self._on_sink_started)
@@ -426,7 +424,7 @@ class TTSPlaybackEndpoint(QObject):
                     "audio_path": str(audio_path),
                 },
             )
-            self._sink_player = None
+            self._release_sink_player()
             self._play_next_with_media_player()
             return
 
@@ -435,6 +433,30 @@ class TTSPlaybackEndpoint(QObject):
             audio_path,
             playback_finish_token,
         )
+
+    def _release_sink_player(self) -> None:
+        player = self._sink_player
+        self._sink_player = None
+        if player is None:
+            return
+        for signal_name in ("finished", "started", "error"):
+            signal = getattr(player, signal_name, None)
+            disconnect = getattr(signal, "disconnect", None)
+            if callable(disconnect):
+                try:
+                    disconnect()
+                except Exception:
+                    pass
+        try:
+            player.stop()
+        except Exception:
+            pass
+        delete_later = getattr(player, "deleteLater", None)
+        if callable(delete_later):
+            try:
+                delete_later()
+            except RuntimeError:
+                pass
 
     @Slot()
     def _on_sink_started(self) -> None:
@@ -652,8 +674,10 @@ class TTSPlaybackEndpoint(QObject):
     def _clear_pending_audio(self) -> None:
         pending_audio = self._pending_audio
         self._pending_audio = []
-        for audio_path, _on_started, _on_finished, _prepared_audio, _text in pending_audio:
+        for audio_path, on_started, on_finished, _prepared_audio, _text in pending_audio:
             self._schedule_audio_cleanup(audio_path)
+            self._started.emit(on_started)
+            self._finished.emit(on_finished)
 
     def speak_prepared(
         self,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -187,6 +188,9 @@ def _migrate_dotenv(context: MigrationContext) -> None:
         context.paths.api_config(),
         context.paths.system_config(),
     )
+    errors = [str(error) for error in result.get("errors", []) if str(error)]
+    if errors:
+        raise ValueError("；".join(errors))
     # 已知未映射键（如 GPT_SOVITS_REF_AUDIO_PATH，参考音频现由角色包接管）：
     # 显式记录跳过，不静默丢弃
     migrated = set(result.get("migrated", []))
@@ -199,7 +203,7 @@ def _migrate_dotenv(context: MigrationContext) -> None:
     log_event(
         "Migration",
         "migration.v0_to_v1.env.applied",
-        {"migrated": sorted(migrated), "skipped": skipped_keys, "errors": result.get("errors", [])},
+        {"migrated": sorted(migrated), "skipped": skipped_keys, "errors": []},
     )
 
 
@@ -329,7 +333,14 @@ def _merge_jsonl(source: Path, target: Path) -> None:
     """把 source 的行并入 target：能解析出时间戳则整体按时间归并，否则保序拼接。"""
     source_lines = _read_jsonl_lines(source)
     target_lines = _read_jsonl_lines(target)
-    merged = target_lines + source_lines
+    target_counts = Counter(target_lines)
+    seen_source: Counter[str] = Counter()
+    additions: list[str] = []
+    for line in source_lines:
+        seen_source[line] += 1
+        if seen_source[line] > target_counts[line]:
+            additions.append(line)
+    merged = target_lines + additions
     timestamps = [_line_timestamp(line) for line in merged]
     if all(ts is not None for ts in timestamps):
         merged = [line for _, line in sorted(zip(timestamps, merged), key=lambda p: p[0])]

@@ -11,7 +11,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 
 from app.core.cancellation import CancelChecker, cancellable_sleep, check_cancelled
-from app.core.http_client import urlopen_direct_for_loopback
+from app.core.http_client import read_url_cancellable, urlopen_direct_for_loopback
 from app.llm.chat_reply import ChatReply, parse_chat_reply, sanitize_reply_tones
 from app.core.retry_policy import MAX_AUTO_RETRY_ATTEMPTS
 from app.core.runtime_log import log_event, summarize_messages
@@ -63,6 +63,7 @@ class NativeToolCall:
     name: str
     arguments: dict[str, Any]
     arguments_json: str = "{}"
+    arguments_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -300,8 +301,6 @@ class OpenAICompatibleClient:
         except (KeyError, IndexError, TypeError) as exc:
             raise ApiRequestError(f"API 返回格式无法解析：{json.dumps(data, ensure_ascii=False)}") from exc
 
-        reasoning = data["choices"][0]["message"].get("reasoning_content", "")
-        content = (str(reasoning) + "\n" + str(content)).strip()
         result = str(content).strip()
         log_event(
             "API",
@@ -540,23 +539,25 @@ class OpenAICompatibleClient:
             check_cancelled(cancel_checker)
             started_at = time.perf_counter()
             try:
-                with urlopen_direct_for_loopback(
+                response_bytes, response_status = read_url_cancellable(
+                    urlopen_direct_for_loopback,
                     request,
                     timeout=self.settings.timeout_seconds,
-                ) as response:
-                    response_body = response.read().decode("utf-8")
-                    log_event(
-                        "API",
-                        "HTTP 请求成功",
-                        {
-                            "attempt": attempt,
-                            "endpoint_host": urlparse(request.full_url).netloc,
-                            "status": getattr(response, "status", None),
-                            "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
-                            "response_body": response_body,
-                        },
-                    )
-                    return response_body
+                    cancel_checker=cancel_checker,
+                )
+                response_body = response_bytes.decode("utf-8")
+                log_event(
+                    "API",
+                    "HTTP 请求成功",
+                    {
+                        "attempt": attempt,
+                        "endpoint_host": urlparse(request.full_url).netloc,
+                        "status": response_status,
+                        "elapsed_ms": int((time.perf_counter() - started_at) * 1000),
+                        "response_body": response_body,
+                    },
+                )
+                return response_body
             except urllib.error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace")
                 log_event(
@@ -882,15 +883,25 @@ def _parse_native_tool_calls(raw_tool_calls: Any) -> list[NativeToolCall]:
         name = function.get("name")
         if not isinstance(name, str) or not name.strip():
             continue
-        arguments_json = function.get("arguments")
-        if not isinstance(arguments_json, str):
-            arguments_json = "{}"
-        try:
-            arguments = json.loads(arguments_json or "{}")
-        except json.JSONDecodeError:
+        raw_arguments = function.get("arguments")
+        arguments_error = ""
+        if not isinstance(raw_arguments, str):
+            arguments_json = json.dumps(raw_arguments, ensure_ascii=False)
             arguments = {}
-        if not isinstance(arguments, dict):
-            arguments = {}
+            arguments_error = "工具参数必须是 JSON object 字符串。"
+        else:
+            arguments_json = raw_arguments
+            try:
+                decoded_arguments = json.loads(arguments_json or "{}")
+            except json.JSONDecodeError as exc:
+                arguments = {}
+                arguments_error = f"工具参数不是有效 JSON：{exc.msg}。"
+            else:
+                if isinstance(decoded_arguments, dict):
+                    arguments = decoded_arguments
+                else:
+                    arguments = {}
+                    arguments_error = "工具参数必须解码为 JSON object。"
         call_id = raw_call.get("id")
         if not isinstance(call_id, str) or not call_id.strip():
             call_id = f"tool_call_{index}"
@@ -900,6 +911,7 @@ def _parse_native_tool_calls(raw_tool_calls: Any) -> list[NativeToolCall]:
                 name=name.strip(),
                 arguments=arguments,
                 arguments_json=arguments_json,
+                arguments_error=arguments_error,
             )
         )
     return parsed
@@ -957,10 +969,18 @@ def _parse_pseudo_tool_call(item: Any, index: int) -> NativeToolCall | None:
     if isinstance(arguments, str):
         try:
             decoded = json.loads(arguments or "{}")
-        except json.JSONDecodeError:
-            decoded = {}
+        except json.JSONDecodeError as exc:
+            return NativeToolCall(
+                id=str(item.get("id") or f"pseudo_tool_call_{index}"),
+                name=name.strip(),
+                arguments={},
+                arguments_json=arguments,
+                arguments_error=f"工具参数不是有效 JSON：{exc.msg}。",
+            )
         arguments = decoded
+    arguments_error = ""
     if not isinstance(arguments, dict):
+        arguments_error = "工具参数必须是 JSON object。"
         arguments = {}
     arguments_json = json.dumps(arguments, ensure_ascii=False)
     call_id = item.get("id")
@@ -971,6 +991,7 @@ def _parse_pseudo_tool_call(item: Any, index: int) -> NativeToolCall | None:
         name=name.strip(),
         arguments=dict(arguments),
         arguments_json=arguments_json,
+        arguments_error=arguments_error,
     )
 
 
