@@ -376,8 +376,9 @@ def _format_data_migration_failure(report: MigrationReport) -> str:
         if result.status == "failed"
     )
     return format_failure_message(
-        "部分旧数据迁移失败，Sakura 将以兼容模式继续运行，原数据没有被修改。",
-        "请保留原数据，查看 data/logs/sakura-runtime.log；下次启动会再次尝试迁移。",
+        "部分旧数据迁移失败，原数据没有被覆盖。",
+        "受影响功能本次可能使用默认值或暂不可用；请保留原数据并查看 "
+        "data/logs/sakura-runtime.log，下次启动会继续重试迁移。",
         errors,
     )
 
@@ -689,7 +690,7 @@ def _start_tts_migration_or_deferred(base_dir: Path, pet_window: PetWindow) -> N
     worker = TTSBundleMigrationWorker(migrations)
     pet_window.tts_migration_dialog = dialog
     dialog.show()
-    # register=False：迁移是启动期一次性任务，退出时不应被 stop_all 打断。
+    # register=False：迁移不被 stop_all 打断；PetWindow 在运行期间拒绝关闭。
     pet_window.resource_manager.spawn_qt_worker(
         worker,
         parent=pet_window,

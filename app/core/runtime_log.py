@@ -207,23 +207,12 @@ class LogEvent:
 
 def console_log_enabled() -> bool:
     """判断是否开启终端运行日志。"""
-    values = _load_debug_values()
-    logging_values = _load_logging_values()
-    value = logging_values.get("console_enabled", values.get("enabled"))
-    return _bool_value(value, False)
+    return _bool_value(_load_debug_values().get("enabled"), False)
 
 
 def file_log_enabled() -> bool:
     """判断是否开启文件运行日志。默认落盘，显式配置可关闭。"""
-    values = _load_debug_values()
-    logging_values = _load_logging_values()
-    value = logging_values.get("file_enabled", values.get("file_enabled"))
-    return _bool_value(value, True)
-
-
-def gui_log_enabled() -> bool:
-    logging_values = _load_logging_values()
-    return _bool_value(logging_values.get("gui_enabled"), True)
+    return _bool_value(_load_debug_values().get("file_enabled"), True)
 
 
 def log_body_enabled() -> bool:
@@ -235,23 +224,14 @@ def log_body_enabled() -> bool:
     )
 
 
-def raw_tts_service_log_enabled() -> bool:
-    """兼容旧调用方；TTS 服务原始 stdout/stderr 现在始终落盘。"""
-    return True
-
-
 def log_level() -> str:
     """返回当前日志级别 (error / warn / info / debug / trace)，默认 info。
 
-    优先从 logging 配置节读取，其次 debug 配置节；同时兼容旧 profile 键名，
-    并将旧值 (support/normal/verbose) 归一化为新级别名称。
+    读取 debug 配置节，同时兼容旧 profile 键名，并将旧值
+    (support/normal/verbose) 归一化为新级别名称。
     """
-    logging_values = _load_logging_values()
     debug_values = _load_debug_values()
-    # 新键名优先：logging.level > debug.level
-    raw = logging_values.get("level")
-    if raw is None:
-        raw = debug_values.get("level", debug_values.get("profile"))
+    raw = debug_values.get("level", debug_values.get("profile"))
     value = str(raw or LOG_LEVEL_INFO).strip().lower()
     if value in LOG_LEVELS:
         return value
@@ -300,7 +280,7 @@ def log_event(
         attributes=attributes,
     )
 
-    if gui_log_enabled() and _event_visible(record, sink="gui"):
+    if _event_visible(record, sink="gui"):
         try:
             record_log_event_for_gui(record)
         except Exception:
@@ -1204,15 +1184,8 @@ def _load_debug_values() -> dict[str, Any]:
     return dict(debug_config) if isinstance(debug_config, dict) else {}
 
 
-def _load_logging_values() -> dict[str, Any]:
-    from app.config.yaml_config import load_yaml_mapping
-    config_path = StoragePaths(Path(__file__).resolve().parents[2]).system_config()
-    try:
-        system_config = load_yaml_mapping(config_path)
-    except (OSError, ValueError):
-        return {}
-    logging_config = system_config.get("logging")
-    return dict(logging_config) if isinstance(logging_config, dict) else {}
+def _file_log_path() -> Path:
+    return _FILE_LOG_PATH
 
 
 def _write_file_log(record_event: LogEvent) -> None:
@@ -1260,12 +1233,3 @@ def _rotate_file_log_if_needed(path: Path, pending_bytes: int) -> None:
         target.write_bytes(source.read_bytes())
     path.with_name(f"{path.name}.1").write_bytes(path.read_bytes())
     path.write_text("", encoding="utf-8")
-
-
-def _file_log_path() -> Path:
-    return _FILE_LOG_PATH
-
-
-def _close_file_logger_for_tests() -> None:
-    """兼容测试清理入口；文件日志现在每次写入都会立即关闭。"""
-    return

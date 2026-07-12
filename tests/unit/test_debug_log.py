@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
+import app.core.runtime_log as runtime_log_module
 from app.core.gui_log import GUI_LOG_SCOPE_PROGRAM, clear_gui_logs, get_gui_log_buffer
 from app.core.runtime_log import (
-    _close_file_logger_for_tests,
     LogEvent,
     format_console_event,
     format_log_attributes,
@@ -18,12 +18,23 @@ from app.core.runtime_log import (
 )
 
 
+def test_runtime_log_has_one_persisted_config_source() -> None:
+    assert not hasattr(runtime_log_module, "_load_logging_values")
+    assert not hasattr(runtime_log_module, "gui_log_enabled")
+
+
+def test_legacy_debug_log_facades_are_removed() -> None:
+    root = Path(__file__).resolve().parents[2]
+    assert not (root / "app/core/debug_log.py").exists()
+    assert not hasattr(runtime_log_module, "raw_tts_service_log_enabled")
+    assert not hasattr(runtime_log_module, "_close_file_logger_for_tests")
+
+
 @pytest.fixture(autouse=True)
 def close_file_logger_after_test():  # type: ignore[no-untyped-def]
     clear_gui_logs()
     yield
     clear_gui_logs()
-    _close_file_logger_for_tests()
 
 
 def test_warn_level_filters_info_noise(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -117,7 +128,6 @@ def test_file_log_enabled_by_default(monkeypatch) -> None:  # type: ignore[no-un
     log_path = _runtime_log_path("file_enabled_by_default")
     monkeypatch.setattr("app.core.runtime_log._FILE_LOG_PATH", log_path)
     monkeypatch.setattr("app.core.runtime_log._load_debug_values", lambda: {})
-    monkeypatch.setattr("app.core.runtime_log._load_logging_values", lambda: {})
 
     log_event("API", "HTTP 请求成功", {"status": 200})
 
@@ -128,25 +138,10 @@ def test_file_log_can_be_disabled_explicitly(monkeypatch) -> None:  # type: igno
     log_path = _runtime_log_path("file_disabled_explicitly")
     monkeypatch.setattr("app.core.runtime_log._FILE_LOG_PATH", log_path)
     monkeypatch.setattr("app.core.runtime_log._load_debug_values", lambda: {"file_enabled": False})
-    monkeypatch.setattr("app.core.runtime_log._load_logging_values", lambda: {})
 
     log_event("API", "HTTP 请求成功", {"status": 200})
 
     assert not log_path.exists()
-
-
-def test_debug_log_shim_forwards_to_runtime_log(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
-    import app.core.debug_log as debug_log_module
-
-    monkeypatch.setattr(
-        "app.core.runtime_log._load_debug_values",
-        lambda: {"enabled": True, "file_enabled": False, "profile": "info"},
-    )
-
-    debug_log_module.debug_log("API", "HTTP 请求成功", {"status": 200})
-
-    assert "[API] 模型请求成功" in capsys.readouterr().out
-    assert debug_log_module.debug_enabled()
 
 
 def test_file_log_never_writes_full_private_text(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]

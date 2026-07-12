@@ -371,7 +371,6 @@ class AppSettingsService:
         character_profile: CharacterProfile | None = None,
     ) -> GPTSoVITSTTSSettings:
         data = self._api_section("tts")
-        playback_backend = str(data.get("playback_backend", "")).strip()
         gpt_sovits = _mapping(data.get("gpt_sovits"))
         genie_tts = _mapping(data.get("genie_tts"))
         provider = str(data.get("provider", "")).strip().lower()
@@ -431,8 +430,6 @@ class AppSettingsService:
                 onnx_model_dir=onnx_model_dir,
                 validate_enabled=validate_enabled,
             )
-            if playback_backend:
-                settings = replace(settings, playback_backend=playback_backend)
         else:
             if provider == TTS_PROVIDER_GENIE and onnx_model_dir is None:
                 onnx_model_dir = StoragePaths(self.base_dir).tts_bundle_onnx_for("default")
@@ -452,8 +449,6 @@ class AppSettingsService:
                 text_lang=text_lang,
                 timeout_seconds=timeout_seconds,
             )
-            if playback_backend:
-                settings = replace(settings, playback_backend=playback_backend)
         if settings.enabled and validate_enabled:
             settings.validate()
         return settings
@@ -654,8 +649,6 @@ class AppSettingsService:
 
     def load_screen_awareness_settings(self) -> ScreenAwarenessSettings:
         screen_awareness = self._system_section("screen_awareness")
-        if not screen_awareness:
-            screen_awareness = self._system_section("proactive_care")
         return ScreenAwarenessSettings(
             enabled=_bool_value(screen_awareness.get("enabled"), True),
             screen_context_enabled=_bool_value(
@@ -694,14 +687,6 @@ class AppSettingsService:
             "screen_context_resolution": normalized.screen_context_resolution,
         }
         save_yaml_mapping(self.system_config_path, data)
-
-    def load_proactive_care_settings(self) -> ScreenAwarenessSettings:
-        """兼容旧调用点；新代码请使用 load_screen_awareness_settings。"""
-        return self.load_screen_awareness_settings()
-
-    def save_proactive_care_settings(self, settings: ScreenAwarenessSettings) -> None:
-        """兼容旧调用点；新代码请使用 save_screen_awareness_settings。"""
-        self.save_screen_awareness_settings(settings)
 
     def load_bubble_settings(self) -> BubbleSettings:
         ui = self._system_section("ui")
